@@ -3,6 +3,8 @@ use serde_json::{Value, json};
 use crate::domain::model::*;
 use crate::domain::to_snake;
 use crate::mcp::protocol::*;
+use crate::reasoning::ReasoningKernel;
+use crate::store::cozo::{PersistedReasoningClaim, ReasoningFactRef};
 use crate::store::Store;
 
 /// Returns the list of write tools the Dendrites server exposes.
@@ -221,7 +223,7 @@ fn dispatch_write_tool(
                 .and_then(|v| v.as_str())
                 .unwrap_or("upsert");
 
-            match (kind.as_str(), action) {
+            let result = match (kind.as_str(), action) {
                 ("bounded_context", "upsert") => {
                     upsert_bounded_context(store, workspace_path, args)
                 }
@@ -260,6 +262,22 @@ fn dispatch_write_tool(
                 ("module", "remove") => remove_module_handler(store, workspace_path, args),
                 ("", _) => error_result("'kind' is required"),
                 (_, action) => error_result(format!("Unknown action '{action}' for kind '{kind}'")),
+            };
+
+            if result.is_error.unwrap_or(false) {
+                result
+            } else {
+                let fact_refs = reasoning_fact_refs_for_define(args);
+                let invalidate_result = if fact_refs.is_empty() {
+                    invalidate_and_refresh_dependency(store, workspace_path, "desired")
+                } else {
+                    invalidate_and_refresh_facts(store, workspace_path, &fact_refs)
+                };
+
+                match invalidate_result {
+                    Ok(()) => result,
+                    Err(e) => error_result(format!("Model mutation succeeded but {e}")),
+                }
             }
         }
 
@@ -296,29 +314,99 @@ fn dispatch_write_tool(
                         .iter()
                         .map(|bc| bc.events.len())
                         .sum();
+                    let counts = SyncCounts {
+                        contexts_scanned: actual.bounded_contexts.len(),
+                        entities: entity_count,
+                        value_objects: vo_count,
+                        services: svc_count,
+                        repositories: repo_count,
+                        events: event_count,
+                    };
 
                     match store.save_actual(workspace_path, &actual) {
                         Ok(()) => {
-                            if store.load_desired(workspace_path).ok().flatten().is_none() {
-                                let _ = store.save_desired(workspace_path, &actual);
+                            let had_desired = desired.is_some();
+                            let mut follow_on_failures = Vec::new();
+                            let mut desired_bootstrapped = false;
+
+                            if !had_desired {
+                                match store.save_desired(workspace_path, &actual) {
+                                    Ok(()) => desired_bootstrapped = true,
+                                    Err(e) => follow_on_failures
+                                        .push(format!("desired bootstrap failed: {e}")),
+                                }
                             }
-                            let _ = store.compute_drift(workspace_path);
-                            text_result(
-                                json!({
-                                    "status": "scanned",
-                                    "message": format!(
-                                        "Scanned {} contexts → {} entities, {} VOs, {} services, {} repos, {} events. Actual model updated.",
-                                        actual.bounded_contexts.len(), entity_count, vo_count, svc_count, repo_count, event_count
-                                    ),
-                                    "contexts_scanned": actual.bounded_contexts.len(),
-                                    "entities": entity_count,
-                                    "value_objects": vo_count,
-                                    "services": svc_count,
-                                    "repositories": repo_count,
-                                    "events": event_count,
-                                })
-                                .to_string(),
-                            )
+
+                            let drift_entry_count = match store.compute_drift(workspace_path) {
+                                Ok(count) => Some(count),
+                                Err(e) => {
+                                    follow_on_failures
+                                        .push(format!("drift recomputation failed: {e}"));
+                                    None
+                                }
+                            };
+
+                            let mut refresh_states = vec!["actual"];
+                            if desired_bootstrapped {
+                                refresh_states.push("desired");
+                            }
+                            if drift_entry_count.is_some() {
+                                refresh_states.push("drift");
+                            }
+                            if let Err(e) = eager_refresh_dependencies(
+                                store,
+                                workspace_path,
+                                &refresh_states,
+                            ) {
+                                follow_on_failures.push(e);
+                            }
+
+                            let payload = build_sync_report(
+                                counts,
+                                had_desired,
+                                desired_bootstrapped,
+                                drift_entry_count,
+                                &follow_on_failures,
+                            );
+                            let proof = json!({
+                                "rule": "sync succeeds only when scan extraction, actual persistence, and follow-on synchronization steps complete without error",
+                                "derived_from": ["scan_actual_model", "save_actual", "save_desired", "compute_drift"],
+                                "witness_count": counts.contexts_scanned,
+                            });
+                            let evidence = json!({
+                                "counts": {
+                                    "contexts_scanned": counts.contexts_scanned,
+                                    "entities": counts.entities,
+                                    "value_objects": counts.value_objects,
+                                    "services": counts.services,
+                                    "repositories": counts.repositories,
+                                    "events": counts.events,
+                                },
+                                "follow_on_failures": follow_on_failures,
+                            });
+                            let limitations = sync_limitations(!had_desired, drift_entry_count.is_none());
+
+                            if payload["status"] == "partial_failure" {
+                                reasoning_error_result(
+                                    store,
+                                    workspace_path,
+                                    payload,
+                                    Some(proof),
+                                    Some(evidence),
+                                    limitations,
+                                    json!({"source": "scan_pipeline", "state": "actual"}),
+                                )
+                            } else {
+                                reasoning_result(
+                                    store,
+                                    workspace_path,
+                                    payload,
+                                    Some(proof),
+                                    Some(evidence),
+                                    limitations,
+                                    json!({"source": "scan_pipeline", "state": "actual"}),
+                                )
+                            }
                         }
                         Err(e) => error_result(format!("Scan succeeded but save failed: {e}")),
                     }
@@ -339,39 +427,91 @@ fn dispatch_write_tool(
                 }
 
                 "plan" => {
-                    // PHASE 3 GRAPH MIGRATION: Delegate diffing into Datalog
-                    match store.diff_graph(workspace_path) {
-                        Ok(diff_data) => {
-                            let changes = diff_data["pending_changes"].as_array().unwrap();
-                            if changes.is_empty() {
-                                text_result(
-                                    json!({
-                                        "status": "in_sync",
-                                        "message": "Current and planned architecture are in sync. Nothing to refactor."
-                                    })
-                                    .to_string(),
-                                )
-                            } else {
-                                // Enrich diff with module paths, file suggestions, and priorities
-                                let enriched = enrich_plan(store, workspace_path, changes);
-                                text_result(serde_json::to_string_pretty(&enriched).unwrap())
-                            }
-                        }
-                        Err(e) => error_result(format!("Diff generation failed: {e}")),
+                    let kernel = ReasoningKernel::new(store);
+                    match kernel.refactor_plan(workspace_path) {
+                        Ok(claim) => stored_claim_result(store, workspace_path, &claim),
+                        Err(e) => error_result(format!("Refactor plan failed: {e}")),
                     }
                 }
 
                 "accept" => {
                     match store.accept(workspace_path) {
                         Ok(()) => {
-                            let _ = store.compute_drift(workspace_path);
-                            text_result(
-                                json!({
-                                    "status": "accepted",
-                                    "message": "Planned architecture promoted to current. Architecture is now in sync."
-                                })
-                                .to_string(),
-                            )
+                            let mut follow_on_failures = Vec::new();
+                            let drift_entry_count = match store.compute_drift(workspace_path) {
+                                Ok(count) => Some(count),
+                                Err(e) => {
+                                    follow_on_failures
+                                        .push(format!("drift recomputation failed: {e}"));
+                                    None
+                                }
+                            };
+                            let mut refresh_states = vec!["actual"];
+                            if drift_entry_count.is_some() {
+                                refresh_states.push("drift");
+                            }
+                            if let Err(e) = eager_refresh_dependencies(
+                                store,
+                                workspace_path,
+                                &refresh_states,
+                            ) {
+                                follow_on_failures.push(e);
+                            }
+                            let payload = json!({
+                                "status": if follow_on_failures.is_empty() { "accepted" } else { "partial_failure" },
+                                "message": if follow_on_failures.is_empty() {
+                                    "Planned architecture promoted to current. Architecture is now in sync."
+                                } else {
+                                    "Planned architecture promoted to current, but follow-on synchronization is incomplete."
+                                },
+                                "actual_promoted_from_desired": true,
+                                "drift_recomputed": drift_entry_count.is_some(),
+                                "drift_entry_count": drift_entry_count,
+                                "follow_on_failures": follow_on_failures,
+                            });
+                            let proof = json!({
+                                "rule": "accept promotes desired state to actual and requires drift recomputation to refresh desired-vs-actual truth state",
+                                "derived_from": ["accept", "compute_drift"],
+                                "witness_count": drift_entry_count.unwrap_or(0),
+                            });
+                            let evidence = json!({
+                                "actual_promoted_from_desired": true,
+                                "drift_entry_count": drift_entry_count,
+                            });
+                            let limitations = vec![
+                                "Accept copies persisted planned facts into the current model; it does not verify source code already matches the accepted architecture.".into(),
+                                "Dynamic runtime behavior and unmodeled code paths remain outside the stored architecture graph.".into(),
+                                if drift_entry_count.is_none() {
+                                    "Desired-vs-actual drift may be stale until drift recomputation succeeds.".into()
+                                } else {
+                                    String::new()
+                                },
+                            ]
+                            .into_iter()
+                            .filter(|item| !item.is_empty())
+                            .collect::<Vec<_>>();
+
+                            if payload["status"] == "partial_failure" {
+                                reasoning_error_result(
+                                    store,
+                                    workspace_path,
+                                    payload,
+                                    Some(proof),
+                                    Some(evidence),
+                                    limitations,
+                                    json!({"source": "refactor_lifecycle", "state": "desired_to_actual"}),
+                                )
+                            } else {
+                                reasoning_result(
+                                    store,
+                                    workspace_path,
+                                    payload,
+                                    Some(proof),
+                                    Some(evidence),
+                                    limitations,
+                                    json!({"source": "refactor_lifecycle", "state": "desired_to_actual"}),
+                                )
+                            }
                         }
                         Err(e) => error_result(format!("Failed to accept: {e}")),
                     }
@@ -379,14 +519,103 @@ fn dispatch_write_tool(
 
                 "reset" => {
                     match store.reset(workspace_path) {
-                        Ok(Some(_)) => text_result(
+                        Ok(Some(_)) => {
+                            let mut follow_on_failures = Vec::new();
+                            let drift_entry_count = match store.compute_drift(workspace_path) {
+                                Ok(count) => Some(count),
+                                Err(e) => {
+                                    follow_on_failures
+                                        .push(format!("drift recomputation failed: {e}"));
+                                    None
+                                }
+                            };
+                            let mut refresh_states = vec!["desired"];
+                            if drift_entry_count.is_some() {
+                                refresh_states.push("drift");
+                            }
+                            if let Err(e) = eager_refresh_dependencies(
+                                store,
+                                workspace_path,
+                                &refresh_states,
+                            ) {
+                                follow_on_failures.push(e);
+                            }
+                            let payload = json!({
+                                "status": if follow_on_failures.is_empty() { "reset" } else { "partial_failure" },
+                                "message": if follow_on_failures.is_empty() {
+                                    "Planned architecture reverted to current. All pending changes discarded."
+                                } else {
+                                    "Planned architecture reverted to current, but follow-on synchronization is incomplete."
+                                },
+                                "desired_reset_from_actual": true,
+                                "drift_recomputed": drift_entry_count.is_some(),
+                                "drift_entry_count": drift_entry_count,
+                                "follow_on_failures": follow_on_failures,
+                            });
+                            let proof = json!({
+                                "rule": "reset replaces desired state with actual state and requires drift recomputation to refresh desired-vs-actual truth state",
+                                "derived_from": ["reset", "compute_drift"],
+                                "witness_count": drift_entry_count.unwrap_or(0),
+                            });
+                            let evidence = json!({
+                                "desired_reset_from_actual": true,
+                                "drift_entry_count": drift_entry_count,
+                            });
+                            let limitations = vec![
+                                "Reset discards planned-only changes by copying the persisted current model back into desired state.".into(),
+                                "Runtime-only behavior and unmodeled dependencies remain outside the stored architecture graph.".into(),
+                                if drift_entry_count.is_none() {
+                                    "Desired-vs-actual drift may be stale until drift recomputation succeeds.".into()
+                                } else {
+                                    String::new()
+                                },
+                            ]
+                            .into_iter()
+                            .filter(|item| !item.is_empty())
+                            .collect::<Vec<_>>();
+
+                            if payload["status"] == "partial_failure" {
+                                reasoning_error_result(
+                                    store,
+                                    workspace_path,
+                                    payload,
+                                    Some(proof),
+                                    Some(evidence),
+                                    limitations,
+                                    json!({"source": "refactor_lifecycle", "state": "actual_to_desired"}),
+                                )
+                            } else {
+                                reasoning_result(
+                                    store,
+                                    workspace_path,
+                                    payload,
+                                    Some(proof),
+                                    Some(evidence),
+                                    limitations,
+                                    json!({"source": "refactor_lifecycle", "state": "actual_to_desired"}),
+                                )
+                            }
+                        }
+                        Ok(None) => reasoning_error_result(
+                            store,
+                            workspace_path,
                             json!({
-                                "status": "reset",
-                                "message": "Planned architecture reverted to current. All pending changes discarded."
-                            })
-                            .to_string(),
+                                "status": "reset_unavailable",
+                                "message": "No current architecture to reset to."
+                            }),
+                            Some(json!({
+                                "rule": "reset requires an existing actual model to copy into desired state",
+                                "derived_from": ["load_actual"],
+                                "witness_count": 0,
+                            })),
+                            Some(json!({
+                                "has_actual_model": false,
+                            })),
+                            vec![
+                                "Reset cannot restore desired state when no current snapshot has been stored.".into(),
+                            ],
+                            json!({"source": "refactor_lifecycle", "state": "actual"}),
                         ),
-                        Ok(None) => error_result("No current architecture to reset to"),
                         Err(e) => error_result(format!("Failed to reset: {e}")),
                     }
                 }
@@ -412,9 +641,18 @@ fn dispatch_write_tool(
                         return error_result("'layer' is required for assign_layer");
                     }
                     match store.upsert_layer_assignment(workspace_path, &context, &layer) {
-                        Ok(()) => text_result(json!({
-                            "message": format!("Assigned context '{}' to layer '{}'", context, layer),
-                        }).to_string()),
+                        Ok(()) => match invalidate_and_refresh_facts(
+                            store,
+                            workspace_path,
+                            &[fact_ref("layer_assignment", &context, "desired")],
+                        ) {
+                            Ok(()) => text_result(json!({
+                                "message": format!("Assigned context '{}' to layer '{}'", context, layer),
+                            }).to_string()),
+                            Err(e) => error_result(format!(
+                                "Layer assignment succeeded but {e}"
+                            )),
+                        },
                         Err(e) => error_result(format!("Failed to assign layer: {e}")),
                     }
                 }
@@ -425,9 +663,18 @@ fn dispatch_write_tool(
                         return error_result("'context' is required for remove_layer");
                     }
                     match store.remove_layer_assignment(workspace_path, &context) {
-                        Ok(true) => {
-                            text_result(format!("Removed layer assignment for context '{context}'"))
-                        }
+                        Ok(true) => match invalidate_and_refresh_facts(
+                            store,
+                            workspace_path,
+                            &[fact_ref("layer_assignment", &context, "desired")],
+                        ) {
+                            Ok(()) => {
+                                text_result(format!("Removed layer assignment for context '{context}'"))
+                            }
+                            Err(e) => error_result(format!(
+                                "Layer removal succeeded but {e}"
+                            )),
+                        },
                         Ok(false) => error_result(format!(
                             "No layer assignment found for context '{context}'"
                         )),
@@ -455,9 +702,22 @@ fn dispatch_write_tool(
                         return error_result("'rule' must be 'forbidden' or 'allowed'");
                     }
                     match store.upsert_dependency_constraint(workspace_path, &constraint_kind, &source, &target, rule) {
-                        Ok(()) => text_result(json!({
-                            "message": format!("{} dependency: {} → {} ({})", rule, source, target, constraint_kind),
-                        }).to_string()),
+                        Ok(()) => match invalidate_and_refresh_facts(
+                            store,
+                            workspace_path,
+                            &[fact_ref(
+                                "dependency_constraint",
+                                &format!("{}:{}->{}", constraint_kind, source, target),
+                                "desired",
+                            )],
+                        ) {
+                            Ok(()) => text_result(json!({
+                                "message": format!("{} dependency: {} → {} ({})", rule, source, target, constraint_kind),
+                            }).to_string()),
+                            Err(e) => error_result(format!(
+                                "Constraint update succeeded but {e}"
+                            )),
+                        },
                         Err(e) => error_result(format!("Failed to add constraint: {e}")),
                     }
                 }
@@ -477,11 +737,26 @@ fn dispatch_write_tool(
                         &source,
                         &target,
                     ) {
-                        Ok(true) => text_result(format!(
-                            "Removed {constraint_kind} constraint: {source} → {target}"
-                        )),
+                        Ok(true) => match invalidate_and_refresh_facts(
+                            store,
+                            workspace_path,
+                            &[fact_ref(
+                                "dependency_constraint",
+                                &format!("{}:{}->{}", constraint_kind, source, target),
+                                "desired",
+                            )],
+                        ) {
+                            Ok(()) => text_result(format!(
+                                "Removed {} constraint {} -> {}",
+                                constraint_kind, source, target
+                            )),
+                            Err(e) => error_result(format!(
+                                "Constraint removal succeeded but {e}"
+                            )),
+                        },
                         Ok(false) => error_result(format!(
-                            "No {constraint_kind} constraint found: {source} → {target}"
+                            "No {} constraint found for {} -> {}",
+                            constraint_kind, source, target
                         )),
                         Err(e) => error_result(format!("Failed to remove constraint: {e}")),
                     }
@@ -1169,17 +1444,184 @@ fn remove_architectural_decision(
 // ─── Helpers ───────────────────────────────────────────────────────────────
 
 fn text_result(text: impl Into<String>) -> ToolCallResult {
-    ToolCallResult {
-        content: vec![ContentBlock::Text { text: text.into() }],
-        is_error: None,
-    }
+    text_tool_result(text)
 }
 
 fn error_result(msg: impl Into<String>) -> ToolCallResult {
-    ToolCallResult {
-        content: vec![ContentBlock::Text { text: msg.into() }],
-        is_error: Some(true),
+    error_tool_result(msg)
+}
+
+fn json_result(payload: Value) -> ToolCallResult {
+    json_tool_result(payload)
+}
+
+fn truth_maintenance_json(store: &Store, workspace_path: &str) -> Value {
+    store
+        .truth_maintenance_report(workspace_path)
+        .ok()
+        .and_then(|report| serde_json::to_value(report).ok())
+        .unwrap_or_else(|| {
+            json!({
+                "asserted": {
+                    "knowledge_kind": "asserted",
+                    "state": "desired",
+                    "available": false,
+                    "snapshot_timestamp_us": null,
+                    "context_count": 0,
+                    "entity_count": 0,
+                    "value_object_count": 0,
+                    "service_count": 0,
+                    "repository_count": 0,
+                    "event_count": 0
+                },
+                "scanned": {
+                    "knowledge_kind": "scanned",
+                    "state": "actual",
+                    "available": false,
+                    "snapshot_timestamp_us": null,
+                    "context_count": 0,
+                    "entity_count": 0,
+                    "value_object_count": 0,
+                    "service_count": 0,
+                    "repository_count": 0,
+                    "event_count": 0
+                },
+                "drift": {
+                    "available": false,
+                    "status": "unavailable",
+                    "computed_at_us": null,
+                    "basis_timestamp_us": null,
+                    "entry_count": 0
+                },
+                "assumptions": [
+                    "Truth maintenance report could not be loaded from the store."
+                ]
+            })
+        })
+}
+
+fn reasoning_result(
+    store: &Store,
+    workspace_path: &str,
+    payload: Value,
+    proof: Option<Value>,
+    evidence: Option<Value>,
+    limitations: Vec<String>,
+    provenance: Value,
+) -> ToolCallResult {
+    let mut envelope = with_reasoning_context(
+        payload,
+        proof,
+        evidence,
+        limitations,
+        Some(provenance),
+    );
+    if let Some(object) = envelope.as_object_mut() {
+        object.insert(
+            "truth_maintenance".into(),
+            truth_maintenance_json(store, workspace_path),
+        );
     }
+    json_result(envelope)
+}
+
+fn reasoning_error_result(
+    store: &Store,
+    workspace_path: &str,
+    payload: Value,
+    proof: Option<Value>,
+    evidence: Option<Value>,
+    limitations: Vec<String>,
+    provenance: Value,
+) -> ToolCallResult {
+    let mut envelope = with_reasoning_context(
+        payload,
+        proof,
+        evidence,
+        limitations,
+        Some(provenance),
+    );
+    if let Some(object) = envelope.as_object_mut() {
+        object.insert(
+            "truth_maintenance".into(),
+            truth_maintenance_json(store, workspace_path),
+        );
+    }
+    json_error_tool_result(envelope)
+}
+
+fn stored_claim_result(
+    store: &Store,
+    workspace_path: &str,
+    claim: &PersistedReasoningClaim,
+) -> ToolCallResult {
+    let mut envelope = with_reasoning_context(
+        claim.payload.clone(),
+        claim.proof_json(),
+        claim.evidence_json(),
+        claim.limitation_texts(),
+        serde_json::to_value(&claim.provenance).ok(),
+    );
+
+    if let Some(object) = envelope.as_object_mut() {
+        object.insert("claim_id".into(), json!(claim.claim_id));
+        object.insert("claim_kind".into(), json!(claim.claim_kind));
+        object.insert("claim_stale".into(), json!(claim.stale));
+        let assumptions = claim.assumption_texts();
+        if !assumptions.is_empty() {
+            object.insert("assumptions".into(), json!(assumptions));
+        }
+        object.insert(
+            "truth_maintenance".into(),
+            truth_maintenance_json(store, workspace_path),
+        );
+    }
+
+    json_result(envelope)
+}
+
+fn invalidate_and_refresh_dependency(
+    store: &Store,
+    workspace_path: &str,
+    dependency_state: &str,
+) -> Result<(), String> {
+    store
+        .invalidate_reasoning_claims_for_dependency(workspace_path, dependency_state)
+        .map_err(|e| format!("reasoning invalidation failed: {e}"))?;
+    eager_refresh_dependencies(store, workspace_path, &[dependency_state])
+}
+
+fn invalidate_and_refresh_facts(
+    store: &Store,
+    workspace_path: &str,
+    fact_refs: &[ReasoningFactRef],
+) -> Result<(), String> {
+    store
+        .invalidate_reasoning_claims_for_facts(workspace_path, fact_refs)
+        .map_err(|e| format!("reasoning fact invalidation failed: {e}"))?;
+    let kernel = ReasoningKernel::new(store);
+    kernel
+        .eager_refresh_stale_claims(workspace_path)
+        .map_err(|e| format!("reasoning eager refresh failed after fact invalidation: {e}"))?;
+    Ok(())
+}
+
+fn eager_refresh_dependencies(
+    store: &Store,
+    workspace_path: &str,
+    dependency_states: &[&str],
+) -> Result<(), String> {
+    let kernel = ReasoningKernel::new(store);
+    for dependency_state in dependency_states {
+        kernel
+            .eager_refresh_for_dependency(workspace_path, dependency_state)
+            .map_err(|e| {
+                format!(
+                    "reasoning eager refresh failed for dependency '{dependency_state}': {e}"
+                )
+            })?;
+    }
+    Ok(())
 }
 
 fn arg_str(args: &Value, key: &str) -> String {
@@ -1187,6 +1629,103 @@ fn arg_str(args: &Value, key: &str) -> String {
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string()
+}
+
+fn fact_ref(fact_kind: &str, fact_key: &str, fact_state: &str) -> ReasoningFactRef {
+    ReasoningFactRef {
+        fact_kind: fact_kind.into(),
+        fact_key: fact_key.into(),
+        fact_state: fact_state.into(),
+    }
+}
+
+fn reasoning_fact_refs_for_define(args: &Value) -> Vec<ReasoningFactRef> {
+    let kind = arg_str(args, "kind");
+    let context = arg_str(args, "context");
+    let name = arg_str(args, "name");
+    let mut refs = Vec::new();
+
+    match kind.as_str() {
+        "bounded_context" => {
+            if !name.is_empty() {
+                refs.push(fact_ref("context", &name, "desired"));
+            }
+            refs.push(fact_ref("context_dep", "*", "desired"));
+        }
+        "entity" => {
+            if !context.is_empty() && !name.is_empty() {
+                refs.push(fact_ref("entity", &format!("{context}/{name}"), "desired"));
+            }
+            refs.push(fact_ref("field", "*", "desired"));
+            refs.push(fact_ref("method", "*", "desired"));
+            refs.push(fact_ref("invariant", "*", "desired"));
+        }
+        "service" => {
+            if !context.is_empty() && !name.is_empty() {
+                refs.push(fact_ref("service", &format!("{context}/{name}"), "desired"));
+            }
+            refs.push(fact_ref("service_dep", "*", "desired"));
+            refs.push(fact_ref("method", "*", "desired"));
+        }
+        "event" => {
+            if !context.is_empty() && !name.is_empty() {
+                refs.push(fact_ref("event", &format!("{context}/{name}"), "desired"));
+            }
+            refs.push(fact_ref("field", "*", "desired"));
+        }
+        "value_object" => {
+            if !context.is_empty() && !name.is_empty() {
+                refs.push(fact_ref("value_object", &format!("{context}/{name}"), "desired"));
+            }
+            refs.push(fact_ref("field", "*", "desired"));
+            refs.push(fact_ref("vo_rule", "*", "desired"));
+        }
+        "repository" => {
+            if !context.is_empty() && !name.is_empty() {
+                refs.push(fact_ref("repository", &format!("{context}/{name}"), "desired"));
+            }
+            refs.push(fact_ref("method", "*", "desired"));
+        }
+        "aggregate" => {
+            if !context.is_empty() && !name.is_empty() {
+                refs.push(fact_ref("aggregate", &format!("{context}/{name}"), "desired"));
+            }
+            refs.push(fact_ref("aggregate_member", "*", "desired"));
+        }
+        "policy" => {
+            if !context.is_empty() && !name.is_empty() {
+                refs.push(fact_ref("policy", &format!("{context}/{name}"), "desired"));
+            }
+            refs.push(fact_ref("policy_link", "*", "desired"));
+        }
+        "read_model" => {
+            if !context.is_empty() && !name.is_empty() {
+                refs.push(fact_ref("read_model", &format!("{context}/{name}"), "desired"));
+            }
+            refs.push(fact_ref("field", "*", "desired"));
+        }
+        "module" => {
+            if !context.is_empty() && !name.is_empty() {
+                refs.push(fact_ref("module", &format!("{context}/{name}"), "desired"));
+            }
+        }
+        "external_system" => {
+            if !name.is_empty() {
+                refs.push(fact_ref("external_system", &name, "desired"));
+            }
+            refs.push(fact_ref("external_system_context", "*", "desired"));
+        }
+        "architectural_decision" => {
+            if !name.is_empty() {
+                refs.push(fact_ref("architectural_decision", &name, "desired"));
+            }
+            refs.push(fact_ref("decision_context", "*", "desired"));
+            refs.push(fact_ref("decision_consequence", "*", "desired"));
+        }
+        _ => {}
+    }
+
+    refs
 }
 
 fn parse_ownership(val: Option<&Value>) -> Ownership {
@@ -1401,359 +1940,108 @@ fn merge_methods(existing: &mut Vec<Method>, new_methods: &[Value]) {
     }
 }
 
-// ── Refactor Plan Enrichment ──────────────────────────────────────────────
-
-/// Priority ordering for change kinds. Lower = do first.
-fn kind_priority(kind: &str) -> u8 {
-    match kind {
-        "context" => 0,
-        "entity" => 1,
-        "service" => 2,
-        "repository" => 3,
-        "value_object" => 4,
-        "event" => 5,
-        "invariant" | "field" | "method" => 6,
-        _ => 7,
-    }
+#[derive(Clone, Copy)]
+struct SyncCounts {
+    contexts_scanned: usize,
+    entities: usize,
+    value_objects: usize,
+    services: usize,
+    repositories: usize,
+    events: usize,
 }
 
-/// Suggest a file path for a pending change based on context module_path and kind.
-fn suggest_file(module_path: &str, kind: &str, name: &str) -> String {
-    if module_path.is_empty() {
-        return String::new();
-    }
-    let snake = to_snake(name);
-    match kind {
-        "context" => format!("{}/mod.rs", module_path),
-        "entity" | "value_object" => format!("{}/model.rs", module_path),
-        "service" => format!("{}/{}.rs", module_path, snake),
-        "repository" => format!("{}/{}.rs", module_path, snake),
-        "event" => format!("{}/events.rs", module_path),
-        "field" | "method" | "invariant" => {
-            // These belong to their owner; owner_kind determines the file
-            format!("{}/mod.rs", module_path)
+fn build_sync_report(
+    counts: SyncCounts,
+    had_desired: bool,
+    desired_bootstrapped: bool,
+    drift_entry_count: Option<usize>,
+    follow_on_failures: &[String],
+) -> Value {
+    let status = if follow_on_failures.is_empty() {
+        "scanned"
+    } else {
+        "partial_failure"
+    };
+    let drift_recomputed = drift_entry_count.is_some();
+    let message = if follow_on_failures.is_empty() {
+        if had_desired {
+            format!(
+                "Scanned {} contexts -> {} entities, {} VOs, {} services, {} repos, {} events. Actual model updated and drift recomputed.",
+                counts.contexts_scanned,
+                counts.entities,
+                counts.value_objects,
+                counts.services,
+                counts.repositories,
+                counts.events
+            )
+        } else {
+            format!(
+                "Scanned {} contexts -> {} entities, {} VOs, {} services, {} repos, {} events. Actual model updated, desired bootstrapped from actual, and drift recomputed.",
+                counts.contexts_scanned,
+                counts.entities,
+                counts.value_objects,
+                counts.services,
+                counts.repositories,
+                counts.events
+            )
         }
-        _ => String::new(),
-    }
-}
-
-/// Enrich raw Datalog diff with suggested files, priorities, rationale, and health score.
-/// Runs the full architectural analysis pipeline in one call.
-///
-/// Returns health, all invariant checks, actual-vs-desired drift, AST edge
-/// statistics, and prioritized `next_actions` so the calling agent knows
-/// exactly what to do next. This is the orchestrator for the self-improvement loop.
-fn diagnose_pipeline(store: &Store, workspace_path: &str) -> ToolCallResult {
-    let canonical = crate::store::cozo::canonicalize_path(workspace_path);
-
-    // ── 1. Check if actual model exists ────────────────────────────────
-    let has_actual = store
-        .load_actual(workspace_path)
-        .ok()
-        .flatten()
-        .is_some_and(|m| !m.bounded_contexts.is_empty());
-
-    let has_desired = store
-        .load_desired(workspace_path)
-        .ok()
-        .flatten()
-        .is_some_and(|m| !m.bounded_contexts.is_empty());
-
-    // ── 2. Health check ────────────────────────────────────────────────
-    let health = store.model_health(&canonical).ok();
-    let health_json = health.as_ref().map(|h| {
-        json!({
-            "score": h.score,
-            "circular_deps": h.circular_deps,
-            "layer_violations": h.layer_violations.iter().map(|v| json!({
-                "context": v.context,
-                "domain_service": v.domain_service,
-                "infra_dependency": v.infra_dependency,
-            })).collect::<Vec<_>>(),
-            "missing_invariants": h.missing_invariants,
-            "orphan_contexts": h.orphan_contexts,
-            "god_contexts": h.god_contexts,
-            "unsourced_events": h.unsourced_events,
-        })
-    });
-
-    // ── 3. Invariant checks ────────────────────────────────────────────
-    let circular = store.circular_deps(&canonical).unwrap_or_default();
-    let layers = store.layer_violations(&canonical).unwrap_or_default();
-    let agg_quality = store
-        .aggregate_roots_without_invariants(&canonical)
-        .unwrap_or_default();
-    let policy = store.evaluate_policy_violations(&canonical).ok();
-
-    let invariants = json!({
-        "circular_deps": {
-            "status": if circular.is_empty() { "pass" } else { "fail" },
-            "count": circular.len(),
-            "cycles": circular.iter().map(|(a, b)| json!({"from": a, "to": b})).collect::<Vec<_>>(),
-        },
-        "layer_violations": {
-            "status": if layers.is_empty() { "pass" } else { "fail" },
-            "count": layers.len(),
-            "violations": layers.iter().map(|(ctx, svc, dep)| json!({
-                "context": ctx, "service": svc, "dependency": dep,
-            })).collect::<Vec<_>>(),
-        },
-        "aggregate_quality": {
-            "status": if agg_quality.is_empty() { "pass" } else { "fail" },
-            "count": agg_quality.len(),
-            "roots_without_invariants": agg_quality.iter().map(|(ctx, ent)| json!({
-                "context": ctx, "entity": ent,
-            })).collect::<Vec<_>>(),
-        },
-        "policy_violations": policy.as_ref().map(|p| json!({
-            "status": p["status"],
-            "count": p["count"],
-            "violations": p["violations"],
-        })),
-    });
-
-    // ── 4. Actual vs desired drift ─────────────────────────────────────
-    let drift = store.diff_graph(workspace_path).ok().map(|diff| {
-        let changes = diff["pending_changes"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
-        json!({
-            "status": if changes.is_empty() { "in_sync" } else { "drifted" },
-            "pending_change_count": changes.len(),
-            "pending_changes": changes,
-        })
-    });
-
-    // ── 5. AST edge statistics ─────────────────────────────────────────
-    let ast_stats = store.load_actual(workspace_path).ok().flatten().map(|m| {
-        let total = m.ast_edges.len();
-        let mut by_type: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-        for edge in &m.ast_edges {
-            *by_type.entry(edge.edge_type.as_str()).or_default() += 1;
-        }
-        let breakdown: serde_json::Map<String, Value> = by_type
-            .into_iter()
-            .map(|(k, v)| (k.to_string(), json!(v)))
-            .collect();
-        json!({
-            "total": total,
-            "by_type": breakdown,
-        })
-    });
-
-    // ── 6. Compute prioritized next actions ────────────────────────────
-    let mut next_actions: Vec<Value> = Vec::new();
-    let mut priority = 0u32;
-
-    if !has_actual {
-        next_actions.push(json!({
-            "priority": priority,
-            "tool": "sync",
-            "reason": "No current model exists. Scan the workspace to extract architecture from source code.",
-        }));
-        priority += 1;
-    }
-
-    // Critical: cycles must be broken first
-    if !circular.is_empty() {
-        next_actions.push(json!({
-            "priority": priority,
-            "tool": "define",
-            "reason": format!(
-                "{} circular dependency cycle(s) detected. Break cycles by extracting shared concepts or using events.",
-                circular.len()
-            ),
-            "evidence": circular.iter().map(|(a, b)| format!("{a} ⇄ {b}")).collect::<Vec<_>>(),
-        }));
-        priority += 1;
-    }
-
-    // Critical: layer violations
-    if !layers.is_empty() {
-        next_actions.push(json!({
-            "priority": priority,
-            "tool": "define",
-            "reason": format!(
-                "{} layer violation(s). Domain services depend on infrastructure directly. Invert via ports/adapters.",
-                layers.len()
-            ),
-            "evidence": layers.iter().map(|(ctx, svc, dep)| format!("{ctx}.{svc} → {dep}")).collect::<Vec<_>>(),
-        }));
-        priority += 1;
-    }
-
-    // Warning: policy violations
-    if let Some(ref p) = policy {
-        let pcount = p["count"].as_u64().unwrap_or(0);
-        if pcount > 0 {
-            next_actions.push(json!({
-                "priority": priority,
-                "tool": "constrain",
-                "action": "evaluate",
-                "reason": format!("{pcount} policy violation(s). Declared constraints are not met."),
-            }));
-            priority += 1;
-        }
-    }
-
-    // Warning: aggregate quality
-    if !agg_quality.is_empty() {
-        next_actions.push(json!({
-            "priority": priority,
-            "tool": "define",
-            "reason": format!(
-                "{} aggregate root(s) without invariants. Add business rules to protect consistency.",
-                agg_quality.len()
-            ),
-            "evidence": agg_quality.iter().map(|(ctx, ent)| format!("{ctx}.{ent}")).collect::<Vec<_>>(),
-        }));
-        priority += 1;
-    }
-
-    // Warning: unsourced events
-    if let Some(ref h) = health {
-        if !h.unsourced_events.is_empty() {
-            next_actions.push(json!({
-                "priority": priority,
-                "tool": "define",
-                "reason": format!(
-                    "{} event(s) without a source entity. Link them to their originating aggregate.",
-                    h.unsourced_events.len()
-                ),
-                "evidence": h.unsourced_events.iter().map(|[ctx, evt]| format!("{ctx}.{evt}")).collect::<Vec<_>>(),
-            }));
-            priority += 1;
-        }
-    }
-
-    // Info: orphan contexts
-    if let Some(ref h) = health {
-        if !h.orphan_contexts.is_empty() {
-            next_actions.push(json!({
-                "priority": priority,
-                "tool": "define",
-                "reason": format!(
-                    "{} orphan context(s) with no dependencies. Add dependencies or verify they are intentionally standalone.",
-                    h.orphan_contexts.len()
-                ),
-                "evidence": &h.orphan_contexts,
-            }));
-        }
-    }
-
-    // Info: drift between current and planned
-    if let Some(ref d) = drift {
-        let dcount = d["pending_change_count"].as_u64().unwrap_or(0);
-        if dcount > 0 {
-            next_actions.push(json!({
-                "priority": priority,
-                "tool": "refactor",
-                "action": "plan",
-                "reason": format!("{dcount} pending change(s) between planned and current. Run 'plan' for detailed refactoring steps."),
-            }));
-        }
-    }
-
-    // If nothing else needed, suggest re-scan to verify
-    if next_actions.is_empty() && has_actual {
-        next_actions.push(json!({
-            "priority": 0,
-            "tool": "sync",
-            "reason": "Architecture is healthy (score 100). Re-scan periodically to verify after code changes.",
-        }));
-    }
-
-    let score = health.as_ref().map(|h| h.score).unwrap_or(0);
-
-    text_result(
-        json!({
-            "status": if score == 100 { "healthy" } else if score >= 70 { "needs_improvement" } else { "unhealthy" },
-            "health_score": score,
-            "health": health_json,
-            "invariants": invariants,
-            "drift": drift,
-            "ast_edges": ast_stats,
-            "has_actual_model": has_actual,
-            "has_desired_model": has_desired,
-            "next_actions": next_actions,
-            "loop_hint": "After implementing fixes, call sync then diagnose again to verify improvement.",
-        })
-        .to_string(),
-    )
-}
-
-fn enrich_plan(store: &Store, workspace_path: &str, changes: &[Value]) -> Value {
-    // Build context → module_path lookup from desired state
-    let module_paths: std::collections::HashMap<String, String> = store
-        .run_datalog(
-            "?[name, module_path] := *context{workspace: $ws, name, module_path, state: 'desired' @ 'NOW'}",
-            workspace_path,
+    } else {
+        format!(
+            "Scanned {} contexts -> {} entities, {} VOs, {} services, {} repos, {} events. Actual model updated, but {} follow-on synchronization step(s) failed.",
+            counts.contexts_scanned,
+            counts.entities,
+            counts.value_objects,
+            counts.services,
+            counts.repositories,
+            counts.events,
+            follow_on_failures.len()
         )
-        .unwrap_or_default()
-        .into_iter()
-        .map(|row| (row[0].clone(), row[1].clone()))
-        .collect();
-
-    // Enrich each change
-    let mut enriched: Vec<Value> = changes
-        .iter()
-        .map(|change| {
-            let kind = change["kind"].as_str().unwrap_or("");
-            let action = change["action"].as_str().unwrap_or("");
-            let name = change["name"].as_str().unwrap_or("");
-            let ctx = change.get("context").and_then(|v| v.as_str()).unwrap_or("");
-
-            let mp = if kind == "context" {
-                module_paths.get(name).cloned().unwrap_or_default()
-            } else {
-                module_paths.get(ctx).cloned().unwrap_or_default()
-            };
-
-            let suggested_file = suggest_file(&mp, kind, name);
-            let priority = kind_priority(kind);
-
-            let rationale = match (action, kind) {
-                ("add", "context") => format!("Create bounded context '{name}' module structure"),
-                ("remove", "context") => format!("Remove bounded context '{name}' and its module"),
-                ("add", "entity") => format!("Add entity '{name}' to context '{ctx}'"),
-                ("remove", "entity") => format!("Remove entity '{name}' from context '{ctx}'"),
-                ("add", "service") => format!("Implement service '{name}' in context '{ctx}'"),
-                ("remove", "service") => format!("Remove service '{name}' from context '{ctx}'"),
-                ("add", k) => format!("Add {k} '{name}' in context '{ctx}'"),
-                ("remove", k) => format!("Remove {k} '{name}' from context '{ctx}'"),
-                _ => String::new(),
-            };
-
-            let mut entry = change.clone();
-            entry["priority"] = json!(priority);
-            entry["suggested_file"] = json!(suggested_file);
-            entry["rationale"] = json!(rationale);
-            entry
-        })
-        .collect();
-
-    // Sort by priority (structural changes first)
-    enriched.sort_by_key(|e| e["priority"].as_u64().unwrap_or(99));
-
-    // Include model health score
-    let health_score = store
-        .model_health(workspace_path)
-        .map(|h| h.score)
-        .unwrap_or(0);
+    };
 
     json!({
-        "status": "pending_changes",
-        "pending_changes": enriched,
-        "change_count": enriched.len(),
-        "health_score": health_score,
-        "migration_notes": [
-            "Apply changes in priority order (0 = highest).",
-            "Context-level changes should be done before entity/service changes.",
-            "Run `sync` after implementing to update the current model.",
-            "Run `refactor accept` when implementation matches the planned architecture."
-        ]
+        "status": status,
+        "message": message,
+        "contexts_scanned": counts.contexts_scanned,
+        "entities": counts.entities,
+        "value_objects": counts.value_objects,
+        "services": counts.services,
+        "repositories": counts.repositories,
+        "events": counts.events,
+        "actual_state_saved": true,
+        "desired_bootstrap_attempted": !had_desired,
+        "desired_bootstrapped": desired_bootstrapped,
+        "drift_recomputed": drift_recomputed,
+        "drift_entry_count": drift_entry_count,
+        "follow_on_failures": follow_on_failures,
     })
+}
+
+fn sync_limitations(desired_bootstrap_attempted: bool, drift_failed: bool) -> Vec<String> {
+    let mut limitations = vec![
+        "Scan coverage is limited to statically extracted facts from supported languages.".into(),
+        "Dynamic dispatch, reflection, generated code, and runtime-only dependencies are not modeled.".into(),
+    ];
+
+    if desired_bootstrap_attempted {
+        limitations.push(
+            "Desired-state bootstrap is best-effort and only runs when no planned model exists yet.".into(),
+        );
+    }
+    if drift_failed {
+        limitations.push(
+            "Desired-vs-actual drift may be stale until drift recomputation succeeds.".into(),
+        );
+    }
+
+    limitations
+}
+
+fn diagnose_pipeline(store: &Store, workspace_path: &str) -> ToolCallResult {
+    let kernel = ReasoningKernel::new(store);
+    match kernel.diagnose(workspace_path) {
+        Ok(claim) => stored_claim_result(store, workspace_path, &claim),
+        Err(e) => error_result(format!("diagnose failed: {e}")),
+    }
 }
 
 #[cfg(test)]
@@ -1834,6 +2122,62 @@ mod tests {
     #[test]
     fn test_list_write_tools_count() {
         assert_eq!(list_write_tools().len(), 4);
+    }
+
+    #[test]
+    fn test_build_sync_report_success_after_bootstrap() {
+        let report = build_sync_report(
+            SyncCounts {
+                contexts_scanned: 2,
+                entities: 4,
+                value_objects: 3,
+                services: 1,
+                repositories: 1,
+                events: 2,
+            },
+            false,
+            true,
+            Some(5),
+            &[],
+        );
+
+        assert_eq!(report["status"], "scanned");
+        assert_eq!(report["actual_state_saved"], true);
+        assert_eq!(report["desired_bootstrap_attempted"], true);
+        assert_eq!(report["desired_bootstrapped"], true);
+        assert_eq!(report["drift_recomputed"], true);
+        assert_eq!(report["drift_entry_count"], 5);
+        assert!(report["follow_on_failures"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_build_sync_report_marks_follow_on_failures() {
+        let failures = vec![
+            "desired bootstrap failed: db unavailable".to_string(),
+            "drift recomputation failed: stale state".to_string(),
+        ];
+        let report = build_sync_report(
+            SyncCounts {
+                contexts_scanned: 1,
+                entities: 1,
+                value_objects: 0,
+                services: 0,
+                repositories: 0,
+                events: 0,
+            },
+            false,
+            false,
+            None,
+            &failures,
+        );
+
+        assert_eq!(report["status"], "partial_failure");
+        assert_eq!(report["actual_state_saved"], true);
+        assert_eq!(report["desired_bootstrap_attempted"], true);
+        assert_eq!(report["desired_bootstrapped"], false);
+        assert_eq!(report["drift_recomputed"], false);
+        assert_eq!(report["drift_entry_count"], serde_json::Value::Null);
+        assert_eq!(report["follow_on_failures"].as_array().unwrap().len(), 2);
     }
 
     #[test]
@@ -2348,7 +2692,12 @@ mod tests {
         let text = match &result.content[0] {
             ContentBlock::Text { text } => text,
         };
-        assert!(text.contains("pending_changes"));
+        let report: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(report["status"], "pending_changes");
+        assert_eq!(report["provenance"]["source"], "refactor_lifecycle");
+        assert_eq!(report["provenance"]["state"], "desired_vs_actual");
+        assert!(report.get("proof").is_some());
+        assert!(report.get("truth_maintenance").is_some());
     }
 
     #[test]
@@ -2365,12 +2714,15 @@ mod tests {
         let text = match &result.content[0] {
             ContentBlock::Text { text } => text,
         };
-        assert!(text.contains("pending_changes"));
+        let first: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(first["status"], "pending_changes");
         let result = call_write_tool(ws, &store, "refactor", &json!({}));
         let text = match &result.content[0] {
             ContentBlock::Text { text } => text,
         };
-        assert!(text.contains("pending_changes"));
+        let second: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(second["status"], "pending_changes");
+        assert_eq!(first["change_count"], second["change_count"]);
     }
 
     #[test]
@@ -2387,12 +2739,18 @@ mod tests {
         let text = match &result.content[0] {
             ContentBlock::Text { text } => text,
         };
-        assert!(text.contains("accepted"));
+        let accepted: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(accepted["status"], "accepted");
+        assert_eq!(accepted["provenance"]["source"], "refactor_lifecycle");
+        assert_eq!(accepted["provenance"]["state"], "desired_to_actual");
+        assert!(accepted.get("truth_maintenance").is_some());
         let result = call_write_tool(ws, &store, "refactor", &json!({}));
         let text = match &result.content[0] {
             ContentBlock::Text { text } => text,
         };
-        assert!(text.contains("in_sync"));
+        let plan: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(plan["status"], "in_sync");
+        assert!(plan.get("truth_maintenance").is_some());
     }
 
     #[test]
@@ -2418,7 +2776,11 @@ mod tests {
         let text = match &result.content[0] {
             ContentBlock::Text { text } => text,
         };
-        assert!(text.contains("reset"));
+        let report: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(report["status"], "reset");
+        assert_eq!(report["provenance"]["source"], "refactor_lifecycle");
+        assert_eq!(report["provenance"]["state"], "actual_to_desired");
+        assert!(report.get("truth_maintenance").is_some());
         let reset = store.load_desired(ws).unwrap().unwrap();
         assert_eq!(reset.bounded_contexts.len(), 1);
     }
@@ -2513,6 +2875,13 @@ mod tests {
             "must have has_desired_model"
         );
         assert!(report.get("loop_hint").is_some(), "must have loop_hint");
+        assert!(report.get("proof").is_some(), "must have proof");
+        assert!(report.get("evidence").is_some(), "must have evidence");
+        assert!(report.get("provenance").is_some(), "must have provenance");
+        assert!(
+            report.get("truth_maintenance").is_some(),
+            "must have truth_maintenance"
+        );
 
         // Invariants must have all 4 checks
         let inv = &report["invariants"];
@@ -2539,6 +2908,9 @@ mod tests {
             assert!(action.get("tool").is_some(), "action must have tool");
             assert!(action.get("reason").is_some(), "action must have reason");
         }
+
+        assert_eq!(report["provenance"]["source"], "analysis_pipeline");
+        assert_eq!(report["provenance"]["state"], "desired_vs_actual");
     }
 
     #[test]
@@ -2560,6 +2932,7 @@ mod tests {
 
         // No current model → should suggest sync
         assert_eq!(report["has_actual_model"], false);
+        assert!(report.get("truth_maintenance").is_some());
         let actions = report["next_actions"].as_array().unwrap();
         let first = &actions[0];
         assert_eq!(

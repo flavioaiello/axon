@@ -1,6 +1,6 @@
 [package]
 name = "dendrites"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2024"
 description = "Domain Model Context Protocol Server - Architectural meta-layer for GitHub Copilot"
 license = "MIT"

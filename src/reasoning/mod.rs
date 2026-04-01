@@ -1,0 +1,3808 @@
+use anyhow::{Context, Result};
+use serde_json::{Value, json};
+use std::collections::HashMap;
+
+use crate::store::cozo::{
+    ModelHealth, PersistedReasoningClaim, ReasoningAssumption, ReasoningDependency,
+    ReasoningDerivation, ReasoningJustification, ReasoningProvenance,
+    ReasoningSupportEdge, canonicalize_path,
+};
+use crate::store::Store;
+
+pub const CLAIM_ARCHITECTURE_OVERVIEW: &str = "architecture.overview";
+pub const CLAIM_CHECK_LAYER_VIOLATIONS: &str = "check.layer_violations";
+pub const CLAIM_CHECK_CIRCULAR_DEPS: &str = "check.circular_deps";
+pub const CLAIM_CHECK_AGGREGATE_QUALITY: &str = "check.aggregate_quality";
+pub const CLAIM_CHECK_ORPHAN_CONTEXTS: &str = "check.orphan_contexts";
+pub const CLAIM_CHECK_POLICY_VIOLATIONS: &str = "check.policy_violations";
+pub const CLAIM_CHECK_DRIFT: &str = "check.drift";
+pub const CLAIM_CHECK_ALL: &str = "check.all";
+pub const CLAIM_WHY_LAYER_VIOLATIONS: &str = "why.layer_violations";
+pub const CLAIM_WHY_CIRCULAR_DEPS: &str = "why.circular_deps";
+pub const CLAIM_WHY_POLICY_VIOLATIONS: &str = "why.policy_violations";
+pub const CLAIM_WHY_AGGREGATE_QUALITY: &str = "why.aggregate_quality";
+pub const CLAIM_WHY_ORPHAN_CONTEXTS: &str = "why.orphan_contexts";
+pub const CLAIM_DRIFT_OVERVIEW: &str = "drift.overview";
+pub const CLAIM_DIAGNOSE_REFACTOR: &str = "diagnose.refactor";
+pub const CLAIM_REFACTOR_PLAN: &str = "refactor.plan";
+pub const CLAIM_SAFE_TO_DELETE_PREFIX: &str = "safe_to_delete";
+pub const CLAIM_HOW_CONNECTED_PREFIX: &str = "how_connected";
+pub const CLAIM_IMPACT_PREFIX: &str = "impact";
+pub const CLAIM_HISTORY_PREFIX: &str = "history";
+pub const CLAIM_SEARCH_PREFIX: &str = "search";
+
+const CANONICAL_CLAIM_IDS: [&str; 16] = [
+    CLAIM_ARCHITECTURE_OVERVIEW,
+    CLAIM_CHECK_LAYER_VIOLATIONS,
+    CLAIM_CHECK_CIRCULAR_DEPS,
+    CLAIM_CHECK_AGGREGATE_QUALITY,
+    CLAIM_CHECK_ORPHAN_CONTEXTS,
+    CLAIM_CHECK_POLICY_VIOLATIONS,
+    CLAIM_CHECK_DRIFT,
+    CLAIM_CHECK_ALL,
+    CLAIM_WHY_LAYER_VIOLATIONS,
+    CLAIM_WHY_CIRCULAR_DEPS,
+    CLAIM_WHY_POLICY_VIOLATIONS,
+    CLAIM_WHY_AGGREGATE_QUALITY,
+    CLAIM_WHY_ORPHAN_CONTEXTS,
+    CLAIM_DRIFT_OVERVIEW,
+    CLAIM_DIAGNOSE_REFACTOR,
+    CLAIM_REFACTOR_PLAN,
+];
+
+type CanonicalClaimBuilder =
+    for<'a> fn(&ReasoningKernel<'a>, &str, &MaterializedReasoningData, i64) -> Result<PersistedReasoningClaim>;
+type ParameterizedClaimBuilder =
+    for<'a> fn(&ReasoningKernel<'a>, &str, &PersistedReasoningClaim, &MaterializedReasoningData, i64) -> Result<PersistedReasoningClaim>;
+
+#[derive(Clone, Copy)]
+struct CanonicalClaimRule {
+    id: &'static str,
+    build: CanonicalClaimBuilder,
+}
+
+#[derive(Clone, Copy)]
+struct ParameterizedClaimRule {
+    prefix: &'static str,
+    build: ParameterizedClaimBuilder,
+}
+
+pub struct ReasoningKernel<'a> {
+    store: &'a Store,
+}
+
+struct SnapshotBasis {
+    desired_ts: i64,
+    actual_ts: i64,
+    drift_ts: i64,
+}
+
+struct MaterializedReasoningData {
+    basis: SnapshotBasis,
+    truth_assumptions: Vec<String>,
+    layer_violations: Vec<(String, String, String)>,
+    circular_deps: Vec<(String, String)>,
+    aggregate_quality: Vec<(String, String)>,
+    health: ModelHealth,
+    policy_result: Value,
+    pending_changes: Vec<Value>,
+    drift_entries: Vec<Value>,
+    has_actual: bool,
+    has_desired: bool,
+    ast_stats: Option<Value>,
+}
+
+impl<'a> ReasoningKernel<'a> {
+    pub fn new(store: &'a Store) -> Self {
+        Self { store }
+    }
+
+    pub fn architecture(&self, workspace_path: &str) -> Result<PersistedReasoningClaim> {
+        self.claim(workspace_path, CLAIM_ARCHITECTURE_OVERVIEW)
+    }
+
+    pub fn check(&self, workspace_path: &str, check_name: &str) -> Result<PersistedReasoningClaim> {
+        let claim_id = match check_name {
+            "layer_violations" => CLAIM_CHECK_LAYER_VIOLATIONS,
+            "circular_deps" => CLAIM_CHECK_CIRCULAR_DEPS,
+            "aggregate_quality" => CLAIM_CHECK_AGGREGATE_QUALITY,
+            "orphan_contexts" => CLAIM_CHECK_ORPHAN_CONTEXTS,
+            "policy_violations" => CLAIM_CHECK_POLICY_VIOLATIONS,
+            "drift" => CLAIM_CHECK_DRIFT,
+            "all" | "" => CLAIM_CHECK_ALL,
+            other => anyhow::bail!("Unknown check '{other}'"),
+        };
+        self.claim(workspace_path, claim_id)
+    }
+
+    pub fn explain(
+        &self,
+        workspace_path: &str,
+        violation_type: &str,
+    ) -> Result<PersistedReasoningClaim> {
+        let claim_id = match violation_type {
+            "layer_violations" => CLAIM_WHY_LAYER_VIOLATIONS,
+            "circular_deps" => CLAIM_WHY_CIRCULAR_DEPS,
+            "policy_violations" => CLAIM_WHY_POLICY_VIOLATIONS,
+            "aggregate_quality" => CLAIM_WHY_AGGREGATE_QUALITY,
+            "orphan_contexts" => CLAIM_WHY_ORPHAN_CONTEXTS,
+            other => anyhow::bail!("Unknown violation_type '{other}'"),
+        };
+        self.claim(workspace_path, claim_id)
+    }
+
+    pub fn drift(&self, workspace_path: &str) -> Result<PersistedReasoningClaim> {
+        self.claim(workspace_path, CLAIM_DRIFT_OVERVIEW)
+    }
+
+    pub fn diagnose(&self, workspace_path: &str) -> Result<PersistedReasoningClaim> {
+        self.claim(workspace_path, CLAIM_DIAGNOSE_REFACTOR)
+    }
+
+    pub fn refactor_plan(&self, workspace_path: &str) -> Result<PersistedReasoningClaim> {
+        self.claim(workspace_path, CLAIM_REFACTOR_PLAN)
+    }
+
+    pub fn impact(&self, workspace_path: &str, args: &Value) -> Result<PersistedReasoningClaim> {
+        let claim_id = impact_claim_id(args)?;
+        self.parameterized_claim(workspace_path, &claim_id, |kernel, computed_at_us, data| {
+            kernel.impact_claim(workspace_path, args, data, computed_at_us)
+        })
+    }
+
+    pub fn history(&self, workspace_path: &str, args: &Value) -> Result<PersistedReasoningClaim> {
+        let claim_id = history_claim_id(args);
+        self.parameterized_claim(workspace_path, &claim_id, |kernel, computed_at_us, data| {
+            kernel.history_claim(workspace_path, args, data, computed_at_us)
+        })
+    }
+
+    pub fn search(
+        &self,
+        workspace_path: &str,
+        query: &str,
+        limit: usize,
+    ) -> Result<PersistedReasoningClaim> {
+        let claim_id = search_claim_id(query, limit);
+        let subject = json!({
+            "query": query,
+            "limit": limit,
+        });
+        self.parameterized_claim(workspace_path, &claim_id, |kernel, computed_at_us, data| {
+            kernel.search_claim(workspace_path, &subject, data, computed_at_us)
+        })
+    }
+
+    pub fn safe_to_delete(
+        &self,
+        workspace_path: &str,
+        context: &str,
+        entity: &str,
+    ) -> Result<PersistedReasoningClaim> {
+        let claim_id = safe_to_delete_claim_id(context, entity);
+        self.parameterized_claim(workspace_path, &claim_id, |kernel, computed_at_us, data| {
+            kernel.safe_to_delete_claim(workspace_path, context, entity, data, computed_at_us)
+        })
+    }
+
+    pub fn how_connected(
+        &self,
+        workspace_path: &str,
+        from: &str,
+        to: &str,
+    ) -> Result<PersistedReasoningClaim> {
+        let claim_id = how_connected_claim_id(from, to);
+        self.parameterized_claim(workspace_path, &claim_id, |kernel, computed_at_us, data| {
+            kernel.how_connected_claim(workspace_path, from, to, data, computed_at_us)
+        })
+    }
+
+    pub fn eager_refresh_for_dependency(
+        &self,
+        workspace_path: &str,
+        dependency_state: &str,
+    ) -> Result<Vec<PersistedReasoningClaim>> {
+        let stale_claims = self
+            .store
+            .load_stale_reasoning_claims_for_dependency(workspace_path, dependency_state)?;
+        if stale_claims.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.eager_refresh_stale_claims_from_existing(workspace_path, &stale_claims)
+    }
+
+    pub fn eager_refresh_stale_claims(
+        &self,
+        workspace_path: &str,
+    ) -> Result<Vec<PersistedReasoningClaim>> {
+        let stale_claims = self.store.load_stale_reasoning_claims(workspace_path)?;
+        if stale_claims.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        self.eager_refresh_stale_claims_from_existing(workspace_path, &stale_claims)
+    }
+
+    fn eager_refresh_stale_claims_from_existing(
+        &self,
+        workspace_path: &str,
+        stale_claims: &[PersistedReasoningClaim],
+    ) -> Result<Vec<PersistedReasoningClaim>> {
+        let data = self.load_materialized_data(workspace_path)?;
+        let computed_at_us = now_us();
+        let refreshed = stale_claims
+            .iter()
+            .map(|claim| self.rebuild_claim(workspace_path, claim, &data, computed_at_us))
+            .collect::<Result<Vec<_>>>()?;
+        self.store.upsert_reasoning_claims(workspace_path, &refreshed)?;
+        Ok(refreshed)
+    }
+
+    pub fn refresh(&self, workspace_path: &str) -> Result<Vec<PersistedReasoningClaim>> {
+        let claims = self.materialize_claims(workspace_path)?;
+        self.store.upsert_reasoning_claims(workspace_path, &claims)?;
+        Ok(claims)
+    }
+
+    fn claim(&self, workspace_path: &str, claim_id: &str) -> Result<PersistedReasoningClaim> {
+        self.ensure_fresh(workspace_path, claim_id)?;
+        self.store
+            .load_reasoning_claim(workspace_path, claim_id)?
+            .with_context(|| format!("reasoning claim '{claim_id}' was not materialized"))
+    }
+
+    fn ensure_fresh(&self, workspace_path: &str, claim_id: &str) -> Result<()> {
+        let refresh_needed = match self.store.load_reasoning_claim(workspace_path, claim_id)? {
+            Some(claim) => claim.stale,
+            None => true,
+        };
+
+        if refresh_needed {
+            self.refresh_claim_ids(workspace_path, &[claim_id.to_string()])?;
+        }
+
+        Ok(())
+    }
+
+    fn parameterized_claim<F>(
+        &self,
+        workspace_path: &str,
+        claim_id: &str,
+        builder: F,
+    ) -> Result<PersistedReasoningClaim>
+    where
+        F: FnOnce(&Self, i64, &MaterializedReasoningData) -> Result<PersistedReasoningClaim>,
+    {
+        if let Some(claim) = self.store.load_reasoning_claim(workspace_path, claim_id)? {
+            if !claim.stale {
+                return Ok(claim);
+            }
+        }
+
+        let data = self.load_materialized_data(workspace_path)?;
+        let mut claim = builder(self, now_us(), &data)?;
+        self.populate_default_justifications(&mut claim, &data);
+        self.store
+            .upsert_reasoning_claims(workspace_path, &[claim.clone()])?;
+        Ok(claim)
+    }
+
+    fn refresh_claim_ids(
+        &self,
+        workspace_path: &str,
+        claim_ids: &[String],
+    ) -> Result<Vec<PersistedReasoningClaim>> {
+        if claim_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let data = self.load_materialized_data(workspace_path)?;
+        let computed_at_us = now_us();
+        let claims = claim_ids
+            .iter()
+            .map(|claim_id| self.build_claim_by_id(workspace_path, claim_id, &data, computed_at_us))
+            .collect::<Result<Vec<_>>>()?;
+        self.store.upsert_reasoning_claims(workspace_path, &claims)?;
+        Ok(claims)
+    }
+
+    fn materialize_claims(&self, workspace_path: &str) -> Result<Vec<PersistedReasoningClaim>> {
+        let claim_ids = CANONICAL_CLAIM_IDS
+            .iter()
+            .map(|claim_id| (*claim_id).to_string())
+            .collect::<Vec<_>>();
+        let data = self.load_materialized_data(workspace_path)?;
+        self.materialize_claims_for_ids(workspace_path, &claim_ids, &data, now_us())
+    }
+
+    fn load_materialized_data(&self, workspace_path: &str) -> Result<MaterializedReasoningData> {
+        let canonical = canonicalize_path(workspace_path);
+        let desired = self.store.load_desired(workspace_path)?;
+        let actual = self.store.load_actual(workspace_path)?;
+        let truth = self.store.truth_maintenance_report(workspace_path)?;
+        let basis = self.snapshot_basis(workspace_path)?;
+        let layer_violations = self.store.layer_violations(&canonical)?;
+        let circular_deps = self.store.circular_deps(&canonical)?;
+        let aggregate_quality = self.store.aggregate_roots_without_invariants(&canonical)?;
+        let health = self.store.model_health(&canonical)?;
+        let policy_result = self.store.evaluate_policy_violations(&canonical)?;
+        let pending_changes = self.store.diff_graph(workspace_path)?["pending_changes"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let drift_entries = self
+            .store
+            .load_drift(workspace_path)?
+            .into_iter()
+            .map(|(category, context, name, change_type)| {
+                let mut entry = json!({
+                    "category": category,
+                    "name": name,
+                    "change_type": change_type,
+                });
+                if !context.is_empty() {
+                    entry["context"] = json!(context);
+                }
+                entry
+            })
+            .collect();
+
+        Ok(MaterializedReasoningData {
+            basis,
+            truth_assumptions: truth.assumptions,
+            layer_violations,
+            circular_deps,
+            aggregate_quality,
+            health,
+            policy_result,
+            pending_changes,
+            drift_entries,
+            has_actual: actual
+                .as_ref()
+                .is_some_and(|model| !model.bounded_contexts.is_empty()),
+            has_desired: desired
+                .as_ref()
+                .is_some_and(|model| !model.bounded_contexts.is_empty()),
+            ast_stats: build_ast_stats(actual.as_ref()),
+        })
+    }
+
+    fn materialize_claims_for_ids(
+        &self,
+        workspace_path: &str,
+        claim_ids: &[String],
+        data: &MaterializedReasoningData,
+        computed_at_us: i64,
+    ) -> Result<Vec<PersistedReasoningClaim>> {
+        claim_ids
+            .iter()
+            .map(|claim_id| self.build_claim_by_id(workspace_path, claim_id, data, computed_at_us))
+            .collect()
+    }
+
+    fn build_claim_by_id(
+        &self,
+        workspace_path: &str,
+        claim_id: &str,
+        data: &MaterializedReasoningData,
+        computed_at_us: i64,
+    ) -> Result<PersistedReasoningClaim> {
+        let mut claim = if let Some(rule) = canonical_claim_rule(claim_id) {
+            (rule.build)(self, workspace_path, data, computed_at_us)?
+        } else {
+            let existing = self
+                .store
+                .load_reasoning_claim(workspace_path, claim_id)?
+                .with_context(|| format!("reasoning claim '{claim_id}' is missing stored subject metadata"))?;
+            self.build_parameterized_claim_from_existing(
+                workspace_path,
+                &existing,
+                data,
+                computed_at_us,
+            )?
+        };
+        self.populate_default_justifications(&mut claim, data);
+        Ok(claim)
+    }
+
+    fn rebuild_claim(
+        &self,
+        workspace_path: &str,
+        claim: &PersistedReasoningClaim,
+        data: &MaterializedReasoningData,
+        computed_at_us: i64,
+    ) -> Result<PersistedReasoningClaim> {
+        let mut rebuilt = if canonical_claim_rule(&claim.claim_id).is_some() {
+            self.build_claim_by_id(workspace_path, &claim.claim_id, data, computed_at_us)?
+        } else {
+            self.build_parameterized_claim_from_existing(
+                workspace_path,
+                claim,
+                data,
+                computed_at_us,
+            )?
+        };
+        self.populate_default_justifications(&mut rebuilt, data);
+        Ok(rebuilt)
+    }
+
+    fn build_parameterized_claim_from_existing(
+        &self,
+        workspace_path: &str,
+        claim: &PersistedReasoningClaim,
+        data: &MaterializedReasoningData,
+        computed_at_us: i64,
+    ) -> Result<PersistedReasoningClaim> {
+        let rule = parameterized_claim_rule(&claim.claim_id)
+            .with_context(|| format!("Unknown reasoning claim '{}'", claim.claim_id))?;
+        (rule.build)(self, workspace_path, claim, data, computed_at_us)
+    }
+
+    fn populate_default_justifications(
+        &self,
+        claim: &mut PersistedReasoningClaim,
+        data: &MaterializedReasoningData,
+    ) {
+        if claim.justifications.is_empty() {
+            claim.justifications = default_justifications_for_claim(claim, data);
+        }
+    }
+
+    fn snapshot_basis(&self, workspace_path: &str) -> Result<SnapshotBasis> {
+        Ok(SnapshotBasis {
+            desired_ts: self
+                .store
+                .list_snapshots(workspace_path, "desired")?
+                .into_iter()
+                .next()
+                .unwrap_or(0),
+            actual_ts: self
+                .store
+                .list_snapshots(workspace_path, "actual")?
+                .into_iter()
+                .next()
+                .unwrap_or(0),
+            drift_ts: self
+                .store
+                .load_drift_recomputed_at(workspace_path)?
+                .unwrap_or(0),
+        })
+    }
+
+    fn architecture_claim(
+        &self,
+        workspace_path: &str,
+        data: &MaterializedReasoningData,
+        computed_at_us: i64,
+    ) -> Result<PersistedReasoningClaim> {
+        let canonical = canonicalize_path(workspace_path);
+        let planned = build_model_overview_json(self.store, &canonical, "desired");
+        let current = build_model_overview_json(self.store, &canonical, "actual");
+        let has_current = current
+            .get("bounded_contexts")
+            .and_then(Value::as_array)
+            .is_some_and(|items| !items.is_empty());
+        let pending_count = data.pending_changes.len();
+        let status = if has_current {
+            if pending_count == 0 {
+                "in_sync"
+            } else {
+                "pending_changes"
+            }
+        } else {
+            "no_current"
+        };
+
+        Ok(build_claim(
+            CLAIM_ARCHITECTURE_OVERVIEW,
+            "architecture",
+            "workspace",
+            status,
+            match status {
+                "in_sync" => "Planned and current architecture are in sync.".into(),
+                "pending_changes" => format!(
+                    "Architecture overview shows {pending_count} pending desired-vs-actual change(s)."
+                ),
+                _ => "No current architecture snapshot is stored.".into(),
+            },
+            json!({
+                "planned": planned,
+                "current": if has_current { current } else { Value::Null },
+                "status": status,
+                "pending_change_count": if has_current { pending_count } else { 0 },
+                "health": health_json(&data.health),
+            }),
+            vec![ReasoningDerivation {
+                rule: "architecture overview combines desired/current reconstruction with health and drift summary".into(),
+                derived_from: vec![
+                    "project".into(),
+                    "context".into(),
+                    "context_dep".into(),
+                    "model_health".into(),
+                    "diff_graph".into(),
+                ],
+                witness_count: pending_count,
+            }],
+            vec![support(
+                "evidence",
+                "Architecture overview inputs",
+                json!({
+                    "has_current_model": has_current,
+                    "pending_change_count": pending_count,
+                    "health_score": data.health.score,
+                }),
+            )],
+            data.truth_assumptions.clone(),
+            vec![
+                "Architecture overview is derived from persisted snapshots and does not include unstored editor changes.".into(),
+            ],
+            cross_state_dependencies(&data.basis),
+            computed_at_us,
+            "architecture_overview",
+            "desired_vs_actual",
+        ))
+    }
+
+    fn history_claim(
+        &self,
+        workspace_path: &str,
+        args: &Value,
+        data: &MaterializedReasoningData,
+        computed_at_us: i64,
+    ) -> Result<PersistedReasoningClaim> {
+        let raw_state = args["state"].as_str().unwrap_or("planned");
+        let state = match raw_state {
+            "planned" => "desired",
+            "current" => "actual",
+            other => other,
+        };
+        let has_timestamps = args["ts_old"].is_number() || args["ts_new"].is_number();
+        let subject = json!({
+            "state": raw_state,
+            "ts_old": args["ts_old"],
+            "ts_new": args["ts_new"],
+        });
+
+        let payload = if has_timestamps {
+            let ts_old = args["ts_old"].as_i64().unwrap_or(0);
+            let ts_new = args["ts_new"].as_i64().unwrap_or_else(|| now_us());
+            let mut payload = self.store.diff_snapshots(workspace_path, state, ts_old, ts_new)?;
+            payload["status"] = json!("comparison");
+            payload
+        } else {
+            let timestamps = self.store.list_snapshots(workspace_path, state)?;
+            json!({
+                "status": "listing",
+                "state": raw_state,
+                "snapshots": timestamps,
+                "count": timestamps.len(),
+            })
+        };
+
+        Ok(build_claim(
+            &history_claim_id(args),
+            "history",
+            &subject.to_string(),
+            if has_timestamps { "comparison" } else { "listing" },
+            if has_timestamps {
+                format!("Compared {} snapshots for '{raw_state}' history.", payload["summary"]["total_changes"].as_u64().unwrap_or(0))
+            } else {
+                format!("Listed {} snapshot(s) for '{raw_state}' history.", payload["count"].as_u64().unwrap_or(0))
+            },
+            payload.clone(),
+            vec![ReasoningDerivation {
+                rule: if has_timestamps {
+                    "snapshot history diff compares two stored temporal snapshots"
+                } else {
+                    "snapshot history listing returns recorded temporal snapshots for a state"
+                }
+                .into(),
+                derived_from: vec!["snapshot_log".into()],
+                witness_count: payload["count"].as_u64().unwrap_or_else(|| payload["summary"]["total_changes"].as_u64().unwrap_or(0)) as usize,
+            }],
+            vec![support("evidence", "History payload", payload)],
+            data.truth_assumptions.clone(),
+            vec![
+                "History reflects persisted snapshots only; direct incremental mutations that do not record snapshots will not appear as separate history entries.".into(),
+            ],
+            vec![dependency("snapshot", state, if state == "desired" { data.basis.desired_ts } else { data.basis.actual_ts })],
+            computed_at_us,
+            "snapshot_history",
+            state,
+        ))
+    }
+
+    fn search_claim(
+        &self,
+        workspace_path: &str,
+        subject: &Value,
+        data: &MaterializedReasoningData,
+        computed_at_us: i64,
+    ) -> Result<PersistedReasoningClaim> {
+        let query = subject["query"].as_str().unwrap_or("");
+        let limit = subject["limit"].as_u64().unwrap_or(20) as usize;
+        let payload = self.store.search_text(workspace_path, query, limit)?;
+        let count = payload["count"].as_u64().unwrap_or(0) as usize;
+
+        Ok(build_claim(
+            &search_claim_id(query, limit),
+            "search",
+            &subject.to_string(),
+            "results",
+            format!("Search returned {count} architecture match(es) for '{query}'."),
+            payload.clone(),
+            vec![ReasoningDerivation {
+                rule: "full-text search matches persisted desired-state architecture entities across indexed relations".into(),
+                derived_from: vec![
+                    "context:fts".into(),
+                    "entity:fts".into(),
+                    "service:fts".into(),
+                    "event:fts".into(),
+                    "architectural_decision:title_fts".into(),
+                ],
+                witness_count: count,
+            }],
+            vec![support("evidence", "Search results", payload)],
+            vec![],
+            vec![
+                "Search indexes desired-state persisted content only and may omit unindexed relation fields.".into(),
+            ],
+            vec![dependency("snapshot", "desired", data.basis.desired_ts)],
+            computed_at_us,
+            "fts_search",
+            "desired",
+        ))
+    }
+
+    fn impact_claim(
+        &self,
+        workspace_path: &str,
+        args: &Value,
+        data: &MaterializedReasoningData,
+        computed_at_us: i64,
+    ) -> Result<PersistedReasoningClaim> {
+        let analysis = args["analysis"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .context("'analysis' parameter is required")?;
+        let canonical = canonicalize_path(workspace_path);
+        let subject = normalized_impact_subject(args);
+
+        let (payload, derived_from, rule, limitations, dependencies, provenance_state) =
+            match analysis {
+                "transitive_deps" => {
+                    let context = required_arg(args, "context", analysis)?;
+                    let deps = self.store.transitive_deps(&canonical, &context)?;
+                    (
+                        json!({
+                            "analysis": analysis,
+                            "context": context,
+                            "dependencies": deps,
+                            "count": deps.len(),
+                        }),
+                        vec!["context_dep".into()],
+                        "transitive dependency closure over desired-state context_dep graph".to_string(),
+                        vec!["Only declared desired-state context dependencies are traversed.".into()],
+                        vec![dependency("snapshot", "desired", data.basis.desired_ts)],
+                        "desired",
+                    )
+                }
+                "circular_deps" => {
+                    let cycles = self.store.circular_deps(&canonical)?;
+                    let cycle_pairs: Vec<_> = cycles
+                        .iter()
+                        .map(|(from, to)| json!({ "from": from, "to": to }))
+                        .collect();
+                    (
+                        json!({
+                            "analysis": analysis,
+                            "cycles": cycle_pairs,
+                            "has_cycles": !cycles.is_empty(),
+                            "count": cycles.len(),
+                        }),
+                        vec!["context_dep".into()],
+                        "cycle detection over desired-state context_dep graph".to_string(),
+                        vec!["Cycles are derived from declared context dependencies, not runtime communication paths.".into()],
+                        vec![dependency("snapshot", "desired", data.basis.desired_ts)],
+                        "desired",
+                    )
+                }
+                "layer_violations" => {
+                    let violations = self.store.layer_violations(&canonical)?;
+                    let items: Vec<_> = violations
+                        .iter()
+                        .map(|(context, service, dependency)| {
+                            json!({
+                                "context": context,
+                                "domain_service": service,
+                                "infrastructure_dependency": dependency,
+                            })
+                        })
+                        .collect();
+                    (
+                        json!({
+                            "analysis": analysis,
+                            "violations": items,
+                            "count": violations.len(),
+                        }),
+                        vec!["service".into(), "service_dep".into()],
+                        "layer violation analysis over desired-state service/service_dep relations".to_string(),
+                        vec!["Service layer classifications are taken from persisted desired-state declarations.".into()],
+                        vec![dependency("snapshot", "desired", data.basis.desired_ts)],
+                        "desired",
+                    )
+                }
+                "impact_analysis" => {
+                    let context = required_arg(args, "context", analysis)?;
+                    let entity = required_arg(args, "entity", analysis)?;
+                    let result = self.store.impact_analysis(&canonical, &context, &entity)?;
+                    (
+                        json!({
+                            "analysis": analysis,
+                            "result": result,
+                        }),
+                        vec![
+                            "event".into(),
+                            "repository".into(),
+                            "service_dep".into(),
+                            "context_dep".into(),
+                            "ast_edge".into(),
+                            "import_edge".into(),
+                        ],
+                        "mixed desired/actual impact analysis for an entity within a bounded context".to_string(),
+                        vec!["Impact analysis mixes desired-state dependencies with actual scanned AST/import evidence.".into()],
+                        desired_actual_dependencies(&data.basis),
+                        "desired_vs_actual",
+                    )
+                }
+                "aggregate_quality" => {
+                    let roots = self.store.aggregate_roots_without_invariants(&canonical)?;
+                    let items: Vec<_> = roots
+                        .iter()
+                        .map(|(context, entity)| json!({ "context": context, "entity": entity }))
+                        .collect();
+                    (
+                        json!({
+                            "analysis": analysis,
+                            "aggregate_roots_without_invariants": items,
+                            "count": roots.len(),
+                            "recommendation": if roots.is_empty() {
+                                "All aggregate roots have invariants defined."
+                            } else {
+                                "Consider adding domain invariants to protect these aggregate roots."
+                            },
+                        }),
+                        vec!["entity".into(), "invariant".into()],
+                        "aggregate quality analysis over desired-state entity and invariant relations".to_string(),
+                        vec!["Aggregate quality analysis only considers persisted desired-state invariants.".into()],
+                        vec![dependency("snapshot", "desired", data.basis.desired_ts)],
+                        "desired",
+                    )
+                }
+                "dependency_graph" => {
+                    let graph = self.store.dependency_graph(&canonical)?;
+                    (
+                        json!({
+                            "analysis": analysis,
+                            "graph": graph,
+                        }),
+                        vec!["context".into(), "context_dep".into()],
+                        "dependency graph projection over desired-state contexts and dependencies".to_string(),
+                        vec!["Dependency graph uses persisted desired-state boundaries only.".into()],
+                        vec![dependency("snapshot", "desired", data.basis.desired_ts)],
+                        "desired",
+                    )
+                }
+                "field_usage" => {
+                    let field_type = required_arg(args, "field_type", analysis)?;
+                    let rows = self.store.run_datalog(
+                        &format!(
+                            "?[ctx, owner_kind, owner, field_name] := \
+                                *field{{workspace: $ws, context: ctx, owner_kind, owner, \
+                                       name: field_name, field_type: '{}', state: 'desired' @ 'NOW'}}",
+                            field_type.replace('\'', "''")
+                        ),
+                        &canonical,
+                    )?;
+                    let items: Vec<_> = rows
+                        .iter()
+                        .map(|row| {
+                            json!({
+                                "context": row[0],
+                                "owner_kind": row[1],
+                                "owner": row[2],
+                                "field": row[3],
+                            })
+                        })
+                        .collect();
+                    (
+                        json!({
+                            "analysis": analysis,
+                            "field_type": field_type,
+                            "usages": items,
+                            "count": rows.len(),
+                        }),
+                        vec!["field".into()],
+                        "field usage query over desired-state field relations".to_string(),
+                        vec!["Field usage searches persisted desired-state field metadata only.".into()],
+                        vec![dependency("snapshot", "desired", data.basis.desired_ts)],
+                        "desired",
+                    )
+                }
+                "method_search" => {
+                    let method_name = required_arg(args, "method_name", analysis)?;
+                    let rows = self.store.run_datalog(
+                        &format!(
+                            "?[ctx, owner_kind, owner, return_type] := \
+                                *method{{workspace: $ws, context: ctx, owner_kind, owner, \
+                                        name: '{}', state: 'desired' @ 'NOW', return_type}}",
+                            method_name.replace('\'', "''")
+                        ),
+                        &canonical,
+                    )?;
+                    let items: Vec<_> = rows
+                        .iter()
+                        .map(|row| {
+                            json!({
+                                "context": row[0],
+                                "owner_kind": row[1],
+                                "owner": row[2],
+                                "return_type": row[3],
+                            })
+                        })
+                        .collect();
+                    (
+                        json!({
+                            "analysis": analysis,
+                            "method_name": method_name,
+                            "matches": items,
+                            "count": rows.len(),
+                        }),
+                        vec!["method".into()],
+                        "method search query over desired-state method relations".to_string(),
+                        vec!["Method search uses persisted desired-state method metadata only.".into()],
+                        vec![dependency("snapshot", "desired", data.basis.desired_ts)],
+                        "desired",
+                    )
+                }
+                "shared_fields" => {
+                    let rows = self.store.run_datalog(
+                        "entity_field[ctx, owner, name, ft] := \
+                            *field{workspace: $ws, context: ctx, owner_kind: 'entity', \
+                                   owner, name, field_type: ft, state: 'desired' @ 'NOW'} \
+                         event_field[ctx, owner, name, ft] := \
+                            *field{workspace: $ws, context: ctx, owner_kind: 'event', \
+                                   owner, name, field_type: ft, state: 'desired' @ 'NOW'} \
+                         ?[ctx, entity, event, field_name, field_type] := \
+                            entity_field[ctx, entity, field_name, field_type], \
+                            event_field[ctx, event, field_name, field_type]",
+                        &canonical,
+                    )?;
+                    let items: Vec<_> = rows
+                        .iter()
+                        .map(|row| {
+                            json!({
+                                "context": row[0],
+                                "entity": row[1],
+                                "event": row[2],
+                                "field": row[3],
+                                "type": row[4],
+                            })
+                        })
+                        .collect();
+                    (
+                        json!({
+                            "analysis": analysis,
+                            "shared": items,
+                            "count": rows.len(),
+                            "insight": if rows.is_empty() {
+                                "No shared fields between entities and events."
+                            } else {
+                                "Shared fields suggest event-sourcing alignment. Events carry entity state."
+                            },
+                        }),
+                        vec!["field".into()],
+                        "shared-field analysis across desired-state entity/event field relations".to_string(),
+                        vec!["Shared-field analysis only considers persisted desired-state field metadata.".into()],
+                        vec![dependency("snapshot", "desired", data.basis.desired_ts)],
+                        "desired",
+                    )
+                }
+                "pagerank" => {
+                    let ranked = self.store.pagerank(&canonical)?;
+                    let items: Vec<_> = ranked
+                        .iter()
+                        .map(|(context, rank)| json!({ "context": context, "rank": rank }))
+                        .collect();
+                    (
+                        json!({
+                            "analysis": analysis,
+                            "ranking": items,
+                            "count": ranked.len(),
+                            "insight": "Higher PageRank indicates more architecturally important contexts (more dependencies flow through them).",
+                        }),
+                        vec!["context_dep".into()],
+                        "PageRank over desired-state context dependency graph".to_string(),
+                        vec!["PageRank availability depends on Cozo graph-algorithm support in the current runtime.".into()],
+                        vec![dependency("snapshot", "desired", data.basis.desired_ts)],
+                        "desired",
+                    )
+                }
+                "community_detection" => {
+                    let communities = self.store.community_detection(&canonical)?;
+                    let items: Vec<_> = communities
+                        .iter()
+                        .map(|(context, community)| {
+                            json!({ "context": context, "community": community })
+                        })
+                        .collect();
+                    (
+                        json!({
+                            "analysis": analysis,
+                            "communities": items,
+                            "count": communities.len(),
+                            "insight": "Contexts in the same community are tightly coupled. Consider aligning bounded context boundaries with community boundaries.",
+                        }),
+                        vec!["context_dep".into()],
+                        "community detection over desired-state context dependency graph".to_string(),
+                        vec!["Community detection depends on Cozo graph-algorithm support in the current runtime.".into()],
+                        vec![dependency("snapshot", "desired", data.basis.desired_ts)],
+                        "desired",
+                    )
+                }
+                "betweenness_centrality" => {
+                    let ranked = self.store.betweenness_centrality(&canonical)?;
+                    let items: Vec<_> = ranked
+                        .iter()
+                        .map(|(context, centrality)| {
+                            json!({ "context": context, "centrality": centrality })
+                        })
+                        .collect();
+                    (
+                        json!({
+                            "analysis": analysis,
+                            "ranking": items,
+                            "count": ranked.len(),
+                            "insight": "High betweenness centrality indicates bottleneck contexts. Changes here have outsized downstream impact.",
+                        }),
+                        vec!["context_dep".into()],
+                        "betweenness centrality over desired-state context dependency graph".to_string(),
+                        vec!["Betweenness centrality depends on Cozo graph-algorithm support in the current runtime.".into()],
+                        vec![dependency("snapshot", "desired", data.basis.desired_ts)],
+                        "desired",
+                    )
+                }
+                "degree_centrality" => {
+                    let degrees = self.store.degree_centrality(&canonical)?;
+                    let items: Vec<_> = degrees
+                        .iter()
+                        .map(|(context, in_degree, out_degree)| {
+                            json!({
+                                "context": context,
+                                "in_degree": in_degree,
+                                "out_degree": out_degree,
+                            })
+                        })
+                        .collect();
+                    (
+                        json!({
+                            "analysis": analysis,
+                            "degrees": items,
+                            "count": degrees.len(),
+                        }),
+                        vec!["context".into(), "context_dep".into()],
+                        "degree centrality over desired-state context dependency graph".to_string(),
+                        vec!["Degree centrality is computed from persisted desired-state context dependencies only.".into()],
+                        vec![dependency("snapshot", "desired", data.basis.desired_ts)],
+                        "desired",
+                    )
+                }
+                "topological_order" => {
+                    let result = self.store.topological_order(&canonical)?;
+                    (
+                        json!({
+                            "analysis": analysis,
+                            "result": result,
+                        }),
+                        vec!["context".into(), "context_dep".into()],
+                        "topological ordering over desired-state context dependency graph".to_string(),
+                        vec!["Topological ordering is only possible when the stored context dependency graph is acyclic.".into()],
+                        vec![dependency("snapshot", "desired", data.basis.desired_ts)],
+                        "desired",
+                    )
+                }
+                "call_graph_callers" => {
+                    let symbol = required_arg(args, "symbol", analysis)?;
+                    let result = self.store.call_graph_callers(&canonical, &symbol)?;
+                    (
+                        json!({
+                            "analysis": analysis,
+                            "result": result,
+                        }),
+                        vec!["calls_symbol".into()],
+                        "direct caller lookup over actual-state call graph".to_string(),
+                        vec!["Call graph queries depend on the latest successful actual-state scan.".into()],
+                        vec![dependency("snapshot", "actual", data.basis.actual_ts)],
+                        "actual",
+                    )
+                }
+                "call_graph_callees" => {
+                    let symbol = required_arg(args, "symbol", analysis)?;
+                    let result = self.store.call_graph_callees(&canonical, &symbol)?;
+                    (
+                        json!({
+                            "analysis": analysis,
+                            "result": result,
+                        }),
+                        vec!["calls_symbol".into()],
+                        "direct callee lookup over actual-state call graph".to_string(),
+                        vec!["Call graph queries depend on the latest successful actual-state scan.".into()],
+                        vec![dependency("snapshot", "actual", data.basis.actual_ts)],
+                        "actual",
+                    )
+                }
+                "call_graph_reachability" => {
+                    let symbol = required_arg(args, "symbol", analysis)?;
+                    let result = self.store.call_graph_reachability(&canonical, &symbol)?;
+                    (
+                        json!({
+                            "analysis": analysis,
+                            "result": result,
+                        }),
+                        vec!["calls_symbol".into()],
+                        "transitive reachability over actual-state call graph".to_string(),
+                        vec!["Reachability is limited to static call edges extracted during the latest actual-state scan.".into()],
+                        vec![dependency("snapshot", "actual", data.basis.actual_ts)],
+                        "actual",
+                    )
+                }
+                "call_graph_stats" => {
+                    let result = self.store.call_graph_stats(&canonical)?;
+                    (
+                        json!({
+                            "analysis": analysis,
+                            "result": result,
+                        }),
+                        vec!["calls_symbol".into()],
+                        "call graph summary statistics over actual-state call edges".to_string(),
+                        vec!["Call graph statistics depend on the latest successful actual-state scan.".into()],
+                        vec![dependency("snapshot", "actual", data.basis.actual_ts)],
+                        "actual",
+                    )
+                }
+                other => anyhow::bail!(
+                    "Unknown analysis type: '{}'. Valid types: transitive_deps, circular_deps, layer_violations, impact_analysis, aggregate_quality, dependency_graph, field_usage, method_search, shared_fields, pagerank, community_detection, betweenness_centrality, degree_centrality, topological_order, call_graph_callers, call_graph_callees, call_graph_reachability, call_graph_stats",
+                    other
+                ),
+            };
+
+        let witness_count = impact_witness_count(&payload);
+
+        Ok(build_claim(
+            &impact_claim_id(args)?,
+            "impact",
+            &subject.to_string(),
+            "ok",
+            format!("Impact analysis '{analysis}' completed."),
+            payload.clone(),
+            vec![ReasoningDerivation {
+                rule,
+                derived_from,
+                witness_count,
+            }],
+            vec![support("evidence", "Impact analysis result", payload)],
+            data.truth_assumptions.clone(),
+            limitations,
+            dependencies,
+            computed_at_us,
+            "impact_analysis",
+            provenance_state,
+        ))
+    }
+
+    fn check_layer_violations_claim(
+        &self,
+        data: &MaterializedReasoningData,
+        computed_at_us: i64,
+    ) -> PersistedReasoningClaim {
+        let items: Vec<Value> = data
+            .layer_violations
+            .iter()
+            .map(|(context, service, dependency)| {
+                json!({
+                    "context": context,
+                    "domain_service": service,
+                    "infrastructure_dependency": dependency,
+                })
+            })
+            .collect();
+        build_claim(
+            CLAIM_CHECK_LAYER_VIOLATIONS,
+            "check",
+            "layer_violations",
+            if data.layer_violations.is_empty() { "true" } else { "false" },
+            if data.layer_violations.is_empty() {
+                "No layer violations detected.".to_string()
+            } else {
+                format!("{} layer violation(s) found.", data.layer_violations.len())
+            },
+            json!({
+                "invariant": "layer_violations",
+                "status": if data.layer_violations.is_empty() { "true" } else { "false" },
+                "violations": items.clone(),
+                "count": data.layer_violations.len(),
+            }),
+            vec![ReasoningDerivation {
+                rule: "domain_service MUST_NOT depend_on infrastructure_service".into(),
+                derived_from: vec!["service".into(), "service_dep".into()],
+                witness_count: data.layer_violations.len(),
+            }],
+            vec![support(
+                "evidence",
+                "Layer violation witnesses",
+                json!(items),
+            )],
+            vec![],
+            vec![
+                "Results are limited to stored desired-state service classifications and dependencies.".into(),
+            ],
+            desired_dependencies(&data.basis),
+            computed_at_us,
+            "datalog",
+            "desired",
+        )
+    }
+
+    fn check_circular_deps_claim(
+        &self,
+        data: &MaterializedReasoningData,
+        computed_at_us: i64,
+    ) -> PersistedReasoningClaim {
+        let pairs: Vec<Value> = data
+            .circular_deps
+            .iter()
+            .map(|(from, to)| json!({ "from": from, "to": to }))
+            .collect();
+        build_claim(
+            CLAIM_CHECK_CIRCULAR_DEPS,
+            "check",
+            "circular_deps",
+            if data.circular_deps.is_empty() { "true" } else { "false" },
+            if data.circular_deps.is_empty() {
+                "No circular dependencies detected.".into()
+            } else {
+                format!("{} circular dependency pair(s) found.", data.circular_deps.len())
+            },
+            json!({
+                "invariant": "circular_deps",
+                "status": if data.circular_deps.is_empty() { "true" } else { "false" },
+                "cycles": pairs.clone(),
+                "count": data.circular_deps.len(),
+            }),
+            vec![ReasoningDerivation {
+                rule: "context_dep graph MUST be acyclic".into(),
+                derived_from: vec!["context_dep".into()],
+                witness_count: data.circular_deps.len(),
+            }],
+            vec![support("evidence", "Circular dependency witnesses", json!(pairs))],
+            vec![],
+            vec![
+                "Cycles are computed from declared context dependencies, not runtime communication paths.".into(),
+            ],
+            desired_dependencies(&data.basis),
+            computed_at_us,
+            "datalog",
+            "desired",
+        )
+    }
+
+    fn check_aggregate_quality_claim(
+        &self,
+        data: &MaterializedReasoningData,
+        computed_at_us: i64,
+    ) -> PersistedReasoningClaim {
+        let items: Vec<Value> = data
+            .aggregate_quality
+            .iter()
+            .map(|(context, entity)| json!({ "context": context, "entity": entity }))
+            .collect();
+        build_claim(
+            CLAIM_CHECK_AGGREGATE_QUALITY,
+            "check",
+            "aggregate_quality",
+            if data.aggregate_quality.is_empty() { "true" } else { "false" },
+            if data.aggregate_quality.is_empty() {
+                "All aggregate roots have invariants.".into()
+            } else {
+                format!(
+                    "{} aggregate root(s) without invariants found.",
+                    data.aggregate_quality.len()
+                )
+            },
+            json!({
+                "invariant": "aggregate_quality",
+                "status": if data.aggregate_quality.is_empty() { "true" } else { "false" },
+                "roots_without_invariants": items.clone(),
+                "count": data.aggregate_quality.len(),
+            }),
+            vec![ReasoningDerivation {
+                rule: "aggregate_root MUST have at_least_one invariant".into(),
+                derived_from: vec!["entity".into(), "invariant".into()],
+                witness_count: data.aggregate_quality.len(),
+            }],
+            vec![support(
+                "evidence",
+                "Aggregate roots missing invariants",
+                json!(items),
+            )],
+            vec![],
+            vec![
+                "Aggregate quality is evaluated from stored desired-state entity and invariant relations.".into(),
+            ],
+            desired_dependencies(&data.basis),
+            computed_at_us,
+            "datalog",
+            "desired",
+        )
+    }
+
+    fn check_orphan_contexts_claim(
+        &self,
+        data: &MaterializedReasoningData,
+        computed_at_us: i64,
+    ) -> PersistedReasoningClaim {
+        let orphans = data.health.orphan_contexts.clone();
+        build_claim(
+            CLAIM_CHECK_ORPHAN_CONTEXTS,
+            "check",
+            "orphan_contexts",
+            if orphans.is_empty() { "true" } else { "false" },
+            if orphans.is_empty() {
+                "No orphan contexts detected.".into()
+            } else {
+                format!("{} orphan context(s) found.", orphans.len())
+            },
+            json!({
+                "invariant": "orphan_contexts",
+                "status": if orphans.is_empty() { "true" } else { "false" },
+                "orphans": orphans.clone(),
+                "count": orphans.len(),
+            }),
+            vec![ReasoningDerivation {
+                rule: "context SHOULD participate_in dependency_graph".into(),
+                derived_from: vec!["context".into(), "context_dep".into()],
+                witness_count: orphans.len(),
+            }],
+            vec![support("evidence", "Orphan contexts", json!(orphans))],
+            vec![],
+            vec![
+                "Orphan detection is derived from stored desired-state contexts and dependencies.".into(),
+            ],
+            desired_dependencies(&data.basis),
+            computed_at_us,
+            "datalog",
+            "desired",
+        )
+    }
+
+    fn check_policy_violations_claim(
+        &self,
+        data: &MaterializedReasoningData,
+        computed_at_us: i64,
+    ) -> PersistedReasoningClaim {
+        let violations = data.policy_result["violations"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let count = data.policy_result["count"].as_u64().unwrap_or(0) as usize;
+        build_claim(
+            CLAIM_CHECK_POLICY_VIOLATIONS,
+            "check",
+            "policy_violations",
+            data.policy_result["status"].as_str().unwrap_or("unknown"),
+            if violations.is_empty() {
+                "No policy violations detected.".into()
+            } else {
+                format!("{} policy violation(s) found.", violations.len())
+            },
+            json!({
+                "invariant": "policy_violations",
+                "status": data.policy_result["status"],
+                "violations": data.policy_result["violations"],
+                "count": data.policy_result["count"],
+            }),
+            vec![ReasoningDerivation {
+                rule: "dependency MUST_NOT violate declared constraint".into(),
+                derived_from: vec![
+                    "context_dep".into(),
+                    "layer_assignment".into(),
+                    "dependency_constraint".into(),
+                ],
+                witness_count: count,
+            }],
+            vec![support(
+                "evidence",
+                "Policy violation witnesses",
+                json!(violations),
+            )],
+            vec![],
+            vec![
+                "Policy evaluation depends on declared constraints and stored desired-state dependencies.".into(),
+            ],
+            desired_dependencies(&data.basis),
+            computed_at_us,
+            "datalog",
+            "desired",
+        )
+    }
+
+    fn check_drift_claim(
+        &self,
+        data: &MaterializedReasoningData,
+        computed_at_us: i64,
+    ) -> PersistedReasoningClaim {
+        build_claim(
+            CLAIM_CHECK_DRIFT,
+            "check",
+            "drift",
+            if data.pending_changes.is_empty() { "true" } else { "false" },
+            if data.pending_changes.is_empty() {
+                "Desired and actual state are in sync.".into()
+            } else {
+                format!("{} pending change(s) detected.", data.pending_changes.len())
+            },
+            json!({
+                "check_name": "drift",
+                "status": if data.pending_changes.is_empty() { "true" } else { "false" },
+                "pending_changes": data.pending_changes.len(),
+            }),
+            vec![ReasoningDerivation {
+                rule: "desired and actual state are in sync IFF diff_graph has no pending changes"
+                    .into(),
+                derived_from: vec![
+                    "context".into(),
+                    "entity".into(),
+                    "service".into(),
+                    "event".into(),
+                    "value_object".into(),
+                    "repository".into(),
+                    "module".into(),
+                ],
+                witness_count: data.pending_changes.len(),
+            }],
+            vec![support(
+                "evidence",
+                "Pending desired-vs-actual changes",
+                json!(data.pending_changes),
+            )],
+            data.truth_assumptions.clone(),
+            vec![
+                "Drift freshness depends on whether compute_drift has been rerun after the latest state snapshots.".into(),
+            ],
+            cross_state_dependencies(&data.basis),
+            computed_at_us,
+            "datalog",
+            "desired_vs_actual",
+        )
+    }
+
+    fn check_all_claim(
+        &self,
+        data: &MaterializedReasoningData,
+        computed_at_us: i64,
+    ) -> PersistedReasoningClaim {
+        let policy_count = data.policy_result["count"].as_u64().unwrap_or(0);
+        let results = json!({
+            "layer_violations": {
+                "status": data.layer_violations.is_empty(),
+                "count": data.layer_violations.len(),
+            },
+            "circular_deps": {
+                "status": data.circular_deps.is_empty(),
+                "count": data.circular_deps.len(),
+            },
+            "aggregate_quality": {
+                "status": data.aggregate_quality.is_empty(),
+                "count": data.aggregate_quality.len(),
+            },
+            "orphan_contexts": {
+                "status": data.health.orphan_contexts.is_empty(),
+                "count": data.health.orphan_contexts.len(),
+            },
+            "policy_violations": {
+                "status": policy_count == 0,
+                "count": policy_count,
+            },
+            "drift": {
+                "status": data.pending_changes.is_empty(),
+                "count": data.pending_changes.len(),
+            }
+        });
+        let all_pass = data.layer_violations.is_empty()
+            && data.circular_deps.is_empty()
+            && data.aggregate_quality.is_empty()
+            && data.health.orphan_contexts.is_empty()
+            && policy_count == 0
+            && data.pending_changes.is_empty();
+        build_claim(
+            CLAIM_CHECK_ALL,
+            "check",
+            "all",
+            if all_pass { "pass" } else { "issues_found" },
+            if all_pass {
+                "All curated architectural checks passed.".into()
+            } else {
+                "One or more curated architectural checks failed.".into()
+            },
+            json!({
+                "check_name": "all",
+                "status": if all_pass { "pass" } else { "issues_found" },
+                "checks": results.clone(),
+            }),
+            vec![ReasoningDerivation {
+                rule: "all curated architectural invariants must hold simultaneously".into(),
+                derived_from: vec![
+                    "layer_violations".into(),
+                    "circular_deps".into(),
+                    "aggregate_quality".into(),
+                    "orphan_contexts".into(),
+                    "policy_violations".into(),
+                    "drift".into(),
+                ],
+                witness_count: if all_pass { 0 } else { 1 },
+            }],
+            vec![support("evidence", "Aggregate check results", results.clone())],
+            data.truth_assumptions.clone(),
+            vec![
+                "This aggregate result combines desired-state invariants with cross-state drift status.".into(),
+            ],
+            cross_state_dependencies(&data.basis),
+            computed_at_us,
+            "datalog",
+            "mixed",
+        )
+    }
+
+    fn why_layer_violations_claim(
+        &self,
+        data: &MaterializedReasoningData,
+        computed_at_us: i64,
+    ) -> PersistedReasoningClaim {
+        let evidence: Vec<Value> = data
+            .layer_violations
+            .iter()
+            .map(|(context, service, dependency)| {
+                json!({
+                    "context": context,
+                    "domain_service": service,
+                    "infrastructure_dependency": dependency,
+                    "explanation": format!(
+                        "Service '{service}' in context '{context}' depends on '{dependency}', which is an infrastructure-layer dependency. Domain services must not depend on infrastructure directly."
+                    ),
+                    "rule": "domain_service MUST NOT depend_on infrastructure_dependency",
+                })
+            })
+            .collect();
+        let no_violations = evidence.is_empty();
+        build_claim(
+            CLAIM_WHY_LAYER_VIOLATIONS,
+            "explanation",
+            "layer_violations",
+            if no_violations { "true" } else { "false" },
+            if no_violations {
+                "No layer violations detected. All domain services depend only on domain-level abstractions.".into()
+            } else {
+                format!(
+                    "{} layer violation(s) found. Domain services reference infrastructure dependencies directly, violating the dependency inversion principle.",
+                    evidence.len()
+                )
+            },
+            json!({
+                "violation_type": "layer_violations",
+                "status": if no_violations { "true" } else { "false" },
+                "explanation": if no_violations {
+                    "No layer violations detected. All domain services depend only on domain-level abstractions.".to_string()
+                } else {
+                    format!(
+                        "{} layer violation(s) found. Domain services reference infrastructure dependencies directly, violating the dependency inversion principle.",
+                        evidence.len()
+                    )
+                },
+                "remediation": if no_violations {
+                    Value::Null
+                } else {
+                    json!("Introduce abstractions (traits/interfaces) in the domain layer and inject infrastructure implementations.")
+                },
+            }),
+            vec![ReasoningDerivation {
+                rule: "domain_service MUST NOT depend_on infrastructure_dependency".into(),
+                derived_from: vec!["service".into(), "service_dep".into()],
+                witness_count: evidence.len(),
+            }],
+            vec![support("evidence", "Layer violation explanations", json!(evidence))],
+            vec![],
+            vec![
+                "Explanations are synthesized from stored witnesses and do not inspect implementation code paths directly.".into(),
+            ],
+            desired_dependencies(&data.basis),
+            computed_at_us,
+            "datalog",
+            "desired",
+        )
+    }
+
+    fn why_circular_deps_claim(
+        &self,
+        data: &MaterializedReasoningData,
+        computed_at_us: i64,
+    ) -> PersistedReasoningClaim {
+        let evidence: Vec<Value> = data
+            .circular_deps
+            .iter()
+            .map(|(from, to)| {
+                json!({
+                    "from": from,
+                    "to": to,
+                    "explanation": format!(
+                        "Context '{from}' depends on '{to}' and '{to}' depends on '{from}', forming a circular dependency cycle."
+                    ),
+                    "rule": "context dependency graph MUST be acyclic",
+                })
+            })
+            .collect();
+        let no_cycles = evidence.is_empty();
+        build_claim(
+            CLAIM_WHY_CIRCULAR_DEPS,
+            "explanation",
+            "circular_deps",
+            if no_cycles { "true" } else { "false" },
+            if no_cycles {
+                "No circular dependencies detected. Context dependency graph is acyclic.".into()
+            } else {
+                format!(
+                    "{} circular dependency pair(s) found. Cycles prevent clean module boundaries.",
+                    evidence.len()
+                )
+            },
+            json!({
+                "violation_type": "circular_deps",
+                "status": if no_cycles { "true" } else { "false" },
+                "explanation": if no_cycles {
+                    "No circular dependencies detected. Context dependency graph is acyclic.".to_string()
+                } else {
+                    format!(
+                        "{} circular dependency pair(s) found. Cycles prevent clean module boundaries.",
+                        evidence.len()
+                    )
+                },
+                "remediation": if no_cycles {
+                    Value::Null
+                } else {
+                    json!("Break cycles by extracting shared concepts into a new context or using events for decoupling.")
+                },
+            }),
+            vec![ReasoningDerivation {
+                rule: "context dependency graph MUST be acyclic".into(),
+                derived_from: vec!["context_dep".into()],
+                witness_count: evidence.len(),
+            }],
+            vec![support(
+                "evidence",
+                "Circular dependency explanations",
+                json!(evidence),
+            )],
+            vec![],
+            vec![
+                "Cycle explanations are synthesized from stored witnesses, not runtime traces.".into(),
+            ],
+            desired_dependencies(&data.basis),
+            computed_at_us,
+            "datalog",
+            "desired",
+        )
+    }
+
+    fn why_policy_violations_claim(
+        &self,
+        data: &MaterializedReasoningData,
+        computed_at_us: i64,
+    ) -> PersistedReasoningClaim {
+        let violations = data.policy_result["violations"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let evidence: Vec<Value> = violations
+            .iter()
+            .map(|violation| {
+                let kind = violation["kind"].as_str().unwrap_or("?");
+                json!({
+                    "kind": kind,
+                    "from_context": violation["from_context"],
+                    "to_context": violation["to_context"],
+                    "from_layer": violation["from_layer"],
+                    "to_layer": violation["to_layer"],
+                    "rule": violation["rule"],
+                    "explanation": if kind == "layer" {
+                        format!(
+                            "Context '{}' (layer: {}) depends on '{}' (layer: {}), violating forbidden layer dependency.",
+                            violation["from_context"].as_str().unwrap_or("?"),
+                            violation["from_layer"].as_str().unwrap_or("?"),
+                            violation["to_context"].as_str().unwrap_or("?"),
+                            violation["to_layer"].as_str().unwrap_or("?"),
+                        )
+                    } else {
+                        format!(
+                            "Context '{}' depends on '{}', violating forbidden context dependency.",
+                            violation["from_context"].as_str().unwrap_or("?"),
+                            violation["to_context"].as_str().unwrap_or("?"),
+                        )
+                    }
+                })
+            })
+            .collect();
+        let clean = evidence.is_empty();
+        build_claim(
+            CLAIM_WHY_POLICY_VIOLATIONS,
+            "explanation",
+            "policy_violations",
+            if clean { "true" } else { "false" },
+            if clean {
+                "No policy violations detected. All dependencies conform to declared constraints.".into()
+            } else {
+                format!(
+                    "{} policy violation(s) found. Dependencies violate declared architectural constraints.",
+                    evidence.len()
+                )
+            },
+            json!({
+                "violation_type": "policy_violations",
+                "status": if clean { "true" } else { "false" },
+                "explanation": if clean {
+                    "No policy violations detected. All dependencies conform to declared constraints.".to_string()
+                } else {
+                    format!(
+                        "{} policy violation(s) found. Dependencies violate declared architectural constraints.",
+                        evidence.len()
+                    )
+                },
+                "remediation": if clean {
+                    Value::Null
+                } else {
+                    json!("Review forbidden dependencies and refactor to respect layer boundaries.")
+                },
+            }),
+            vec![ReasoningDerivation {
+                rule: "dependency MUST_NOT violate declared constraint".into(),
+                derived_from: vec![
+                    "context_dep".into(),
+                    "layer_assignment".into(),
+                    "dependency_constraint".into(),
+                ],
+                witness_count: evidence.len(),
+            }],
+            vec![support("evidence", "Policy violation explanations", json!(evidence))],
+            vec![],
+            vec![
+                "Policy explanations depend on declared constraints and stored desired-state dependencies.".into(),
+            ],
+            desired_dependencies(&data.basis),
+            computed_at_us,
+            "datalog",
+            "desired",
+        )
+    }
+
+    fn why_aggregate_quality_claim(
+        &self,
+        data: &MaterializedReasoningData,
+        computed_at_us: i64,
+    ) -> PersistedReasoningClaim {
+        let evidence: Vec<Value> = data
+            .aggregate_quality
+            .iter()
+            .map(|(context, entity)| {
+                json!({
+                    "context": context,
+                    "entity": entity,
+                    "explanation": format!(
+                        "Entity '{entity}' in context '{context}' is marked as aggregate root but has no invariants defined. Aggregate roots should enforce domain invariants."
+                    ),
+                    "rule": "aggregate_root MUST have at_least_one invariant",
+                })
+            })
+            .collect();
+        let clean = evidence.is_empty();
+        build_claim(
+            CLAIM_WHY_AGGREGATE_QUALITY,
+            "explanation",
+            "aggregate_quality",
+            if clean { "true" } else { "false" },
+            if clean {
+                "All aggregate root entities have at least one invariant defined.".into()
+            } else {
+                format!(
+                    "{} aggregate root(s) without invariants. Domain integrity may be at risk.",
+                    evidence.len()
+                )
+            },
+            json!({
+                "violation_type": "aggregate_quality",
+                "status": if clean { "true" } else { "false" },
+                "explanation": if clean {
+                    "All aggregate root entities have at least one invariant defined.".to_string()
+                } else {
+                    format!(
+                        "{} aggregate root(s) without invariants. Domain integrity may be at risk.",
+                        evidence.len()
+                    )
+                },
+                "remediation": if clean {
+                    Value::Null
+                } else {
+                    json!("Add invariants to aggregate roots to express domain rules explicitly.")
+                },
+            }),
+            vec![ReasoningDerivation {
+                rule: "aggregate_root MUST have at_least_one invariant".into(),
+                derived_from: vec!["entity".into(), "invariant".into()],
+                witness_count: evidence.len(),
+            }],
+            vec![support(
+                "evidence",
+                "Aggregate quality explanations",
+                json!(evidence),
+            )],
+            vec![],
+            vec![
+                "Aggregate-quality explanations are synthesized from stored witnesses, not runtime aggregate behavior.".into(),
+            ],
+            desired_dependencies(&data.basis),
+            computed_at_us,
+            "datalog",
+            "desired",
+        )
+    }
+
+    fn why_orphan_contexts_claim(
+        &self,
+        data: &MaterializedReasoningData,
+        computed_at_us: i64,
+    ) -> PersistedReasoningClaim {
+        let evidence: Vec<Value> = data
+            .health
+            .orphan_contexts
+            .iter()
+            .map(|context| {
+                json!({
+                    "context": context,
+                    "explanation": format!(
+                        "Context '{context}' has no dependencies to or from other contexts. It may be unused or missing declared relationships."
+                    ),
+                    "rule": "context SHOULD participate_in dependency_graph",
+                })
+            })
+            .collect();
+        let clean = evidence.is_empty();
+        build_claim(
+            CLAIM_WHY_ORPHAN_CONTEXTS,
+            "explanation",
+            "orphan_contexts",
+            if clean { "true" } else { "false" },
+            if clean {
+                "No orphan contexts. All contexts participate in the dependency graph.".into()
+            } else {
+                format!(
+                    "{} orphan context(s) found. These contexts are isolated from the dependency graph.",
+                    evidence.len()
+                )
+            },
+            json!({
+                "violation_type": "orphan_contexts",
+                "status": if clean { "true" } else { "false" },
+                "explanation": if clean {
+                    "No orphan contexts. All contexts participate in the dependency graph.".to_string()
+                } else {
+                    format!(
+                        "{} orphan context(s) found. These contexts are isolated from the dependency graph.",
+                        evidence.len()
+                    )
+                },
+                "remediation": if clean {
+                    Value::Null
+                } else {
+                    json!("Add dependencies or remove unused contexts.")
+                },
+            }),
+            vec![ReasoningDerivation {
+                rule: "context SHOULD participate_in dependency_graph".into(),
+                derived_from: vec!["context".into(), "context_dep".into()],
+                witness_count: evidence.len(),
+            }],
+            vec![support(
+                "evidence",
+                "Orphan context explanations",
+                json!(evidence),
+            )],
+            vec![],
+            vec![
+                "Orphan-context explanations are derived from stored desired-state boundaries, not runtime interaction data.".into(),
+            ],
+            desired_dependencies(&data.basis),
+            computed_at_us,
+            "datalog",
+            "desired",
+        )
+    }
+
+    fn drift_overview_claim(
+        &self,
+        data: &MaterializedReasoningData,
+        computed_at_us: i64,
+    ) -> PersistedReasoningClaim {
+        let added: Vec<Value> = data
+            .pending_changes
+            .iter()
+            .filter(|change| change["action"].as_str() == Some("add"))
+            .cloned()
+            .collect();
+        let removed: Vec<Value> = data
+            .pending_changes
+            .iter()
+            .filter(|change| change["action"].as_str() == Some("remove"))
+            .cloned()
+            .collect();
+        build_claim(
+            CLAIM_DRIFT_OVERVIEW,
+            "drift",
+            "desired_vs_actual",
+            if data.pending_changes.is_empty() {
+                "in_sync"
+            } else {
+                "pending_changes"
+            },
+            if data.pending_changes.is_empty() {
+                "Desired and actual architecture are in sync.".into()
+            } else {
+                format!(
+                    "{} pending desired-vs-actual change(s) detected.",
+                    data.pending_changes.len()
+                )
+            },
+            json!({
+                "status": if data.pending_changes.is_empty() { "in_sync" } else { "pending_changes" },
+                "summary": {
+                    "total_changes": data.pending_changes.len(),
+                    "additions": added.len(),
+                    "removals": removed.len(),
+                    "drift_entries": data.drift_entries.len(),
+                },
+                "added": added,
+                "removed": removed,
+                "drift": data.drift_entries.clone(),
+            }),
+            vec![ReasoningDerivation {
+                rule: "persisted drift is the desired-vs-actual set difference for tracked architectural relations".into(),
+                derived_from: vec!["diff_graph".into(), "drift".into()],
+                witness_count: data.pending_changes.len(),
+            }],
+            vec![support(
+                "evidence",
+                "Pending changes and persisted drift",
+                json!({
+                    "pending_changes": data.pending_changes,
+                    "persisted_drift": data.drift_entries,
+                }),
+            )],
+            data.truth_assumptions.clone(),
+            vec![
+                "Persisted drift entries can be stale if desired or actual snapshots changed after the last drift recomputation.".into(),
+            ],
+            cross_state_dependencies(&data.basis),
+            computed_at_us,
+            "datalog",
+            "desired_vs_actual",
+        )
+    }
+
+    fn diagnose_claim(
+        &self,
+        data: &MaterializedReasoningData,
+        computed_at_us: i64,
+    ) -> PersistedReasoningClaim {
+        let policy_count = data.policy_result["count"].as_u64().unwrap_or(0);
+        let invariants = json!({
+            "circular_deps": {
+                "status": if data.circular_deps.is_empty() { "pass" } else { "fail" },
+                "count": data.circular_deps.len(),
+                "cycles": data.circular_deps.iter().map(|(from, to)| json!({"from": from, "to": to})).collect::<Vec<_>>(),
+            },
+            "layer_violations": {
+                "status": if data.layer_violations.is_empty() { "pass" } else { "fail" },
+                "count": data.layer_violations.len(),
+                "violations": data.layer_violations.iter().map(|(context, service, dependency)| json!({
+                    "context": context,
+                    "service": service,
+                    "dependency": dependency,
+                })).collect::<Vec<_>>(),
+            },
+            "aggregate_quality": {
+                "status": if data.aggregate_quality.is_empty() { "pass" } else { "fail" },
+                "count": data.aggregate_quality.len(),
+                "roots_without_invariants": data.aggregate_quality.iter().map(|(context, entity)| json!({
+                    "context": context,
+                    "entity": entity,
+                })).collect::<Vec<_>>(),
+            },
+            "policy_violations": {
+                "status": data.policy_result["status"],
+                "count": data.policy_result["count"],
+                "violations": data.policy_result["violations"],
+            }
+        });
+
+        let mut next_actions = Vec::new();
+        let mut priority = 0u32;
+        if !data.has_actual {
+            next_actions.push(json!({
+                "priority": priority,
+                "tool": "sync",
+                "reason": "No current model exists. Scan the workspace to extract architecture from source code.",
+            }));
+            priority += 1;
+        }
+        if !data.circular_deps.is_empty() {
+            next_actions.push(json!({
+                "priority": priority,
+                "tool": "define",
+                "reason": format!(
+                    "{} circular dependency cycle(s) detected. Break cycles by extracting shared concepts or using events.",
+                    data.circular_deps.len()
+                ),
+                "evidence": data.circular_deps.iter().map(|(from, to)| format!("{from} ⇄ {to}")).collect::<Vec<_>>(),
+            }));
+            priority += 1;
+        }
+        if !data.layer_violations.is_empty() {
+            next_actions.push(json!({
+                "priority": priority,
+                "tool": "define",
+                "reason": format!(
+                    "{} layer violation(s). Domain services depend on infrastructure directly. Invert via ports/adapters.",
+                    data.layer_violations.len()
+                ),
+                "evidence": data.layer_violations.iter().map(|(context, service, dependency)| format!("{context}.{service} → {dependency}")).collect::<Vec<_>>(),
+            }));
+            priority += 1;
+        }
+        if policy_count > 0 {
+            next_actions.push(json!({
+                "priority": priority,
+                "tool": "constrain",
+                "action": "evaluate",
+                "reason": format!("{policy_count} policy violation(s). Declared constraints are not met."),
+            }));
+            priority += 1;
+        }
+        if !data.aggregate_quality.is_empty() {
+            next_actions.push(json!({
+                "priority": priority,
+                "tool": "define",
+                "reason": format!(
+                    "{} aggregate root(s) without invariants. Add business rules to protect consistency.",
+                    data.aggregate_quality.len()
+                ),
+                "evidence": data.aggregate_quality.iter().map(|(context, entity)| format!("{context}.{entity}")).collect::<Vec<_>>(),
+            }));
+            priority += 1;
+        }
+        if !data.health.unsourced_events.is_empty() {
+            next_actions.push(json!({
+                "priority": priority,
+                "tool": "define",
+                "reason": format!(
+                    "{} event(s) without a source entity. Link them to their originating aggregate.",
+                    data.health.unsourced_events.len()
+                ),
+                "evidence": data.health.unsourced_events.iter().map(|[context, event]| format!("{context}.{event}")).collect::<Vec<_>>(),
+            }));
+            priority += 1;
+        }
+        if !data.health.orphan_contexts.is_empty() {
+            next_actions.push(json!({
+                "priority": priority,
+                "tool": "define",
+                "reason": format!(
+                    "{} orphan context(s) with no dependencies. Add dependencies or verify they are intentionally standalone.",
+                    data.health.orphan_contexts.len()
+                ),
+                "evidence": data.health.orphan_contexts,
+            }));
+        }
+        if !data.pending_changes.is_empty() {
+            next_actions.push(json!({
+                "priority": priority,
+                "tool": "refactor",
+                "action": "plan",
+                "reason": format!(
+                    "{} pending change(s) between planned and current. Run 'plan' for detailed refactoring steps.",
+                    data.pending_changes.len()
+                ),
+            }));
+        }
+        if next_actions.is_empty() && data.has_actual {
+            next_actions.push(json!({
+                "priority": 0,
+                "tool": "sync",
+                "reason": "Architecture is healthy (score 100). Re-scan periodically to verify after code changes.",
+            }));
+        }
+
+        let mut failing_invariants = Vec::new();
+        if !data.circular_deps.is_empty() {
+            failing_invariants.push("circular_deps");
+        }
+        if !data.layer_violations.is_empty() {
+            failing_invariants.push("layer_violations");
+        }
+        if !data.aggregate_quality.is_empty() {
+            failing_invariants.push("aggregate_quality");
+        }
+        if policy_count > 0 {
+            failing_invariants.push("policy_violations");
+        }
+
+        build_claim(
+            CLAIM_DIAGNOSE_REFACTOR,
+            "diagnose",
+            "refactor",
+            if data.health.score == 100 {
+                "healthy"
+            } else if data.health.score >= 70 {
+                "needs_improvement"
+            } else {
+                "unhealthy"
+            },
+            format!("Architecture health score: {}.", data.health.score),
+            json!({
+                "status": if data.health.score == 100 { "healthy" } else if data.health.score >= 70 { "needs_improvement" } else { "unhealthy" },
+                "health_score": data.health.score,
+                "health": health_json(&data.health),
+                "invariants": invariants,
+                "drift": {
+                    "status": if data.pending_changes.is_empty() { "in_sync" } else { "drifted" },
+                    "pending_change_count": data.pending_changes.len(),
+                    "pending_changes": data.pending_changes,
+                },
+                "ast_edges": data.ast_stats,
+                "has_actual_model": data.has_actual,
+                "has_desired_model": data.has_desired,
+                "next_actions": next_actions,
+                "loop_hint": "After implementing fixes, call sync then diagnose again to verify improvement.",
+            }),
+            vec![ReasoningDerivation {
+                rule: "diagnose composes persisted health, invariant, drift, and AST analyses into a prioritized refactoring report".into(),
+                derived_from: vec![
+                    "model_health".into(),
+                    "circular_deps".into(),
+                    "layer_violations".into(),
+                    "aggregate_roots_without_invariants".into(),
+                    "evaluate_policy_violations".into(),
+                    "diff_graph".into(),
+                    "load_actual".into(),
+                ],
+                witness_count: failing_invariants.len() + 1,
+            }],
+            vec![support(
+                "evidence",
+                "Diagnose summary inputs",
+                json!({
+                    "has_actual_model": data.has_actual,
+                    "has_desired_model": data.has_desired,
+                    "failing_invariants": failing_invariants,
+                    "next_action_count": next_actions.len(),
+                }),
+            )],
+            data.truth_assumptions.clone(),
+            diagnose_limitations(data),
+            cross_state_dependencies(&data.basis),
+            computed_at_us,
+            "analysis_pipeline",
+            "desired_vs_actual",
+        )
+    }
+
+    fn refactor_plan_claim_from_data(
+        &self,
+        workspace_path: &str,
+        data: &MaterializedReasoningData,
+        computed_at_us: i64,
+    ) -> Result<PersistedReasoningClaim> {
+        if data.pending_changes.is_empty() {
+            return Ok(build_claim(
+                CLAIM_REFACTOR_PLAN,
+                "refactor_plan",
+                "refactor",
+                "in_sync",
+                "Current and planned architecture are in sync. Nothing to refactor.".into(),
+                json!({
+                    "status": "in_sync",
+                    "message": "Current and planned architecture are in sync. Nothing to refactor.",
+                }),
+                vec![ReasoningDerivation {
+                    rule: "refactor plan is empty IFF desired-vs-actual diff has no pending changes".into(),
+                    derived_from: vec!["diff_graph".into()],
+                    witness_count: 0,
+                }],
+                vec![support(
+                    "evidence",
+                    "No pending refactor changes",
+                    json!({
+                        "pending_changes": [],
+                        "change_count": 0,
+                    }),
+                )],
+                data.truth_assumptions.clone(),
+                vec![
+                    "Refactor planning operates on persisted desired and actual snapshots, not direct workspace diffs.".into(),
+                    "A fresh sync is still required after code changes to keep the actual model current.".into(),
+                ],
+                cross_state_dependencies(&data.basis),
+                computed_at_us,
+                "refactor_lifecycle",
+                "desired_vs_actual",
+            ));
+        }
+
+        let enriched = enrich_plan(self.store, workspace_path, &data.pending_changes);
+        Ok(build_claim(
+            CLAIM_REFACTOR_PLAN,
+            "refactor_plan",
+            "refactor",
+            "pending_changes",
+            format!("{} pending refactor change(s) require implementation.", data.pending_changes.len()),
+            enriched,
+            vec![ReasoningDerivation {
+                rule: "refactor plan is derived from desired-vs-actual diff ordered by structural priority heuristics".into(),
+                derived_from: vec![
+                    "diff_graph".into(),
+                    "model_health".into(),
+                    "kind_priority".into(),
+                    "suggest_file".into(),
+                ],
+                witness_count: data.pending_changes.len(),
+            }],
+            vec![support(
+                "evidence",
+                "Raw refactor plan inputs",
+                json!({
+                    "raw_pending_changes": data.pending_changes,
+                }),
+            )],
+            data.truth_assumptions.clone(),
+            vec![
+                "Suggested files and execution priority are heuristics derived from module paths and change kinds.".into(),
+                "The plan reflects persisted desired and actual snapshots rather than unstored editor changes.".into(),
+            ],
+            cross_state_dependencies(&data.basis),
+            computed_at_us,
+            "refactor_lifecycle",
+            "desired_vs_actual",
+        ))
+    }
+
+    fn safe_to_delete_claim(
+        &self,
+        workspace_path: &str,
+        context: &str,
+        entity: &str,
+        data: &MaterializedReasoningData,
+        computed_at_us: i64,
+    ) -> Result<PersistedReasoningClaim> {
+        let canonical = canonicalize_path(workspace_path);
+        let result = self.store.can_delete_symbol(&canonical, context, entity)?;
+        let can_delete = result["can_delete"].as_bool().unwrap_or(false);
+
+        let mut assumptions = Vec::new();
+        if !data.has_desired {
+            assumptions.push(
+                "No desired model is stored; aggregate-, event-, and repository-level witnesses may be incomplete."
+                    .to_string(),
+            );
+        }
+        if !data.has_actual {
+            assumptions.push(
+                "No actual model is stored; import-, AST-, and call-graph references are based on empty scan data."
+                    .to_string(),
+            );
+        }
+
+        Ok(build_claim(
+            &safe_to_delete_claim_id(context, entity),
+            "safe_to_delete",
+            &json!({ "context": context, "entity": entity }).to_string(),
+            if can_delete { "true" } else { "false" },
+            if can_delete {
+                format!("'{entity}' in context '{context}' has no inbound references in the stored graph.")
+            } else {
+                format!("'{entity}' in context '{context}' still has inbound references in the stored graph.")
+            },
+            json!({
+                "status": if can_delete { "true" } else { "false" },
+                "context": context,
+                "entity": entity,
+                "can_delete": can_delete,
+                "result": result.clone(),
+            }),
+            vec![ReasoningDerivation {
+                rule: "entity deletable IFF no inbound references are present in the stored desired/actual graph".into(),
+                derived_from: vec![
+                    "aggregate_member".into(),
+                    "event".into(),
+                    "repository".into(),
+                    "import_edge".into(),
+                    "ast_edge".into(),
+                    "calls_symbol".into(),
+                ],
+                witness_count: witness_count_from_value(&result),
+            }],
+            vec![support(
+                "evidence",
+                "Inbound reference witnesses",
+                json!({
+                    "inbound_references": result,
+                }),
+            )],
+            assumptions,
+            vec![
+                "Dynamic dispatch, reflection, string-based lookups, and out-of-repository consumers are not tracked.".into(),
+            ],
+            desired_actual_dependencies(&data.basis),
+            computed_at_us,
+            "deletion_safety",
+            "desired_vs_actual",
+        ))
+    }
+
+    fn how_connected_claim(
+        &self,
+        workspace_path: &str,
+        from: &str,
+        to: &str,
+        data: &MaterializedReasoningData,
+        computed_at_us: i64,
+    ) -> Result<PersistedReasoningClaim> {
+        let canonical = canonicalize_path(workspace_path);
+        let paths = self.store.query_dependency_path(&canonical, from, to)?;
+        let reachable = !paths.is_empty();
+        let assumptions = if !data.has_desired {
+            vec![
+                "No desired model is stored; connectivity is derived from an empty planned dependency graph."
+                    .to_string(),
+            ]
+        } else {
+            Vec::new()
+        };
+
+        Ok(build_claim(
+            &how_connected_claim_id(from, to),
+            "how_connected",
+            &json!({ "from": from, "to": to }).to_string(),
+            if reachable { "reachable" } else { "disconnected" },
+            if reachable {
+                format!("'{from}' reaches '{to}' through stored context dependencies.")
+            } else {
+                format!("No stored dependency path from '{from}' to '{to}'.")
+            },
+            json!({
+                "status": if reachable { "reachable" } else { "disconnected" },
+                "from": from,
+                "to": to,
+                "paths": paths.clone(),
+                "reachable": reachable,
+                "hop_count": paths.len(),
+            }),
+            vec![ReasoningDerivation {
+                rule: "transitive reachability via context_dep".into(),
+                derived_from: vec!["context_dep".into()],
+                witness_count: paths.len(),
+            }],
+            vec![support("evidence", "Dependency path witnesses", json!({ "paths": paths }))],
+            assumptions,
+            vec![
+                "Connectivity is computed from stored desired-state context dependencies only.".into(),
+            ],
+            desired_dependencies(&data.basis),
+            computed_at_us,
+            "dependency_path",
+            "desired",
+        ))
+    }
+}
+
+fn build_claim(
+    claim_id: &str,
+    claim_kind: &str,
+    subject: &str,
+    status: &str,
+    summary: String,
+    payload: Value,
+    derivations: Vec<ReasoningDerivation>,
+    supports: Vec<ReasoningSupportEdge>,
+    assumptions: Vec<String>,
+    limitations: Vec<String>,
+    dependencies: Vec<ReasoningDependency>,
+    computed_at_us: i64,
+    provenance_source: &str,
+    provenance_state: &str,
+) -> PersistedReasoningClaim {
+    let mut claim_assumptions: Vec<ReasoningAssumption> = assumptions
+        .into_iter()
+        .map(|text| ReasoningAssumption {
+            assumption_kind: "assumption".into(),
+            text,
+        })
+        .collect();
+    claim_assumptions.extend(limitations.into_iter().map(|text| ReasoningAssumption {
+        assumption_kind: "limitation".into(),
+        text,
+    }));
+
+    PersistedReasoningClaim {
+        claim_id: claim_id.into(),
+        claim_kind: claim_kind.into(),
+        subject: subject.into(),
+        status: status.into(),
+        summary,
+        payload,
+        provenance: ReasoningProvenance {
+            source: provenance_source.into(),
+            state: provenance_state.into(),
+        },
+        stale: false,
+        computed_at_us,
+        derivations,
+        assumptions: claim_assumptions,
+        supports,
+        dependencies,
+        justifications: Vec::new(),
+    }
+}
+
+fn support(support_kind: &str, summary: &str, detail: Value) -> ReasoningSupportEdge {
+    ReasoningSupportEdge {
+        support_kind: support_kind.into(),
+        summary: summary.into(),
+        detail,
+    }
+}
+
+fn dependency(dependency_kind: &str, dependency_state: &str, basis_timestamp_us: i64) -> ReasoningDependency {
+    ReasoningDependency {
+        dependency_kind: dependency_kind.into(),
+        dependency_state: dependency_state.into(),
+        basis_timestamp_us,
+    }
+}
+
+fn desired_dependencies(basis: &SnapshotBasis) -> Vec<ReasoningDependency> {
+    vec![dependency("snapshot", "desired", basis.desired_ts)]
+}
+
+fn desired_actual_dependencies(basis: &SnapshotBasis) -> Vec<ReasoningDependency> {
+    vec![
+        dependency("snapshot", "desired", basis.desired_ts),
+        dependency("snapshot", "actual", basis.actual_ts),
+    ]
+}
+
+fn cross_state_dependencies(basis: &SnapshotBasis) -> Vec<ReasoningDependency> {
+    vec![
+        dependency("snapshot", "desired", basis.desired_ts),
+        dependency("snapshot", "actual", basis.actual_ts),
+        dependency("materialized", "drift", basis.drift_ts),
+    ]
+}
+
+fn safe_to_delete_claim_id(context: &str, entity: &str) -> String {
+    format!("{CLAIM_SAFE_TO_DELETE_PREFIX}:{context}:{entity}")
+}
+
+fn how_connected_claim_id(from: &str, to: &str) -> String {
+    format!("{CLAIM_HOW_CONNECTED_PREFIX}:{from}:{to}")
+}
+
+fn parse_json_subject(subject: &str) -> Value {
+    serde_json::from_str(subject).unwrap_or_else(|_| json!({}))
+}
+
+fn witness_count_from_value(result: &Value) -> usize {
+    [
+        "aggregates_referencing",
+        "events_sourced",
+        "repositories_managing",
+        "import_references",
+        "ast_references",
+        "call_references",
+    ]
+    .into_iter()
+    .map(|field| {
+        result[field]
+            .as_array()
+            .map(|items| items.len())
+            .unwrap_or(0)
+    })
+    .sum()
+}
+
+fn build_ast_stats(actual: Option<&crate::domain::model::DomainModel>) -> Option<Value> {
+    actual.map(|model| {
+        let mut by_type: HashMap<&str, usize> = HashMap::new();
+        for edge in &model.ast_edges {
+            *by_type.entry(edge.edge_type.as_str()).or_default() += 1;
+        }
+        let breakdown: serde_json::Map<String, Value> = by_type
+            .into_iter()
+            .map(|(kind, count)| (kind.to_string(), json!(count)))
+            .collect();
+        json!({
+            "total": model.ast_edges.len(),
+            "by_type": breakdown,
+        })
+    })
+}
+
+fn health_json(health: &ModelHealth) -> Value {
+    json!({
+        "score": health.score,
+        "circular_deps": health.circular_deps,
+        "layer_violations": health.layer_violations.iter().map(|violation| json!({
+            "context": violation.context,
+            "domain_service": violation.domain_service,
+            "infra_dependency": violation.infra_dependency,
+        })).collect::<Vec<_>>(),
+        "missing_invariants": health.missing_invariants,
+        "orphan_contexts": health.orphan_contexts,
+        "god_contexts": health.god_contexts,
+        "unsourced_events": health.unsourced_events,
+    })
+}
+
+fn diagnose_limitations(data: &MaterializedReasoningData) -> Vec<String> {
+    let mut limitations = vec![
+        "Diagnose relies on persisted snapshots and static structural analysis rather than runtime behavior.".into(),
+        "Health and invariant results are only as fresh as the last successful sync and desired-state update.".into(),
+    ];
+    if !data.has_actual {
+        limitations.push(
+            "No actual model is available; recommendations are based on desired facts and empty scan data.".into(),
+        );
+    }
+    if !data.has_desired {
+        limitations.push(
+            "No desired model is available; drift and refactor guidance may be incomplete until planned architecture is defined or bootstrapped.".into(),
+        );
+    }
+    limitations
+}
+
+fn now_us() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros() as i64
+}
+
+fn enrich_plan(store: &Store, workspace_path: &str, changes: &[Value]) -> Value {
+    let module_paths: HashMap<String, String> = store
+        .run_datalog(
+            "?[name, module_path] := *context{workspace: $ws, name, module_path, state: 'desired' @ 'NOW'}",
+            workspace_path,
+        )
+        .unwrap_or_default()
+        .into_iter()
+        .map(|row| (row[0].clone(), row[1].clone()))
+        .collect();
+
+    let mut enriched: Vec<Value> = changes
+        .iter()
+        .map(|change| {
+            let kind = change["kind"].as_str().unwrap_or("");
+            let action = change["action"].as_str().unwrap_or("");
+            let name = change["name"].as_str().unwrap_or("");
+            let context = change["context"].as_str().unwrap_or("");
+
+            let module_path = if kind == "context" {
+                module_paths.get(name).cloned().unwrap_or_default()
+            } else {
+                module_paths.get(context).cloned().unwrap_or_default()
+            };
+
+            let suggested_file = suggest_file(&module_path, kind, name);
+            let priority = kind_priority(kind);
+
+            let rationale = match (action, kind) {
+                ("add", "context") => format!("Create bounded context '{name}' module structure"),
+                ("remove", "context") => format!("Remove bounded context '{name}' and its module"),
+                ("add", "entity") => format!("Add entity '{name}' to context '{context}'"),
+                ("remove", "entity") => {
+                    format!("Remove entity '{name}' from context '{context}'")
+                }
+                ("add", "service") => format!("Implement service '{name}' in context '{context}'"),
+                ("remove", "service") => {
+                    format!("Remove service '{name}' from context '{context}'")
+                }
+                ("add", other) => format!("Add {other} '{name}' in context '{context}'"),
+                ("remove", other) => {
+                    format!("Remove {other} '{name}' from context '{context}'")
+                }
+                _ => String::new(),
+            };
+
+            let mut entry = change.clone();
+            entry["priority"] = json!(priority);
+            entry["suggested_file"] = json!(suggested_file);
+            entry["rationale"] = json!(rationale);
+            entry
+        })
+        .collect();
+
+    enriched.sort_by_key(|entry| entry["priority"].as_u64().unwrap_or(99));
+
+    let health_score = store.model_health(workspace_path).map(|health| health.score).unwrap_or(0);
+
+    json!({
+        "status": "pending_changes",
+        "pending_changes": enriched,
+        "change_count": changes.len(),
+        "health_score": health_score,
+        "migration_notes": [
+            "Apply changes in priority order (0 = highest).",
+            "Context-level changes should be done before entity/service changes.",
+            "Run `sync` after implementing to update the current model.",
+            "Run `refactor accept` when implementation matches the planned architecture."
+        ]
+    })
+}
+
+fn kind_priority(kind: &str) -> u8 {
+    match kind {
+        "context" => 0,
+        "entity" => 1,
+        "service" => 2,
+        "repository" => 3,
+        "value_object" => 4,
+        "event" => 5,
+        "invariant" | "field" | "method" => 6,
+        _ => 7,
+    }
+}
+
+fn suggest_file(module_path: &str, kind: &str, name: &str) -> String {
+    if module_path.is_empty() {
+        return String::new();
+    }
+    let snake = crate::domain::to_snake(name);
+    match kind {
+        "context" => format!("{module_path}/mod.rs"),
+        "entity" | "value_object" => format!("{module_path}/model.rs"),
+        "service" | "repository" => format!("{module_path}/{snake}.rs"),
+        "event" => format!("{module_path}/events.rs"),
+        "field" | "method" | "invariant" => format!("{module_path}/mod.rs"),
+        _ => String::new(),
+    }
+}
+
+const CANONICAL_CLAIM_RULES: [CanonicalClaimRule; 16] = [
+    CanonicalClaimRule {
+        id: CLAIM_ARCHITECTURE_OVERVIEW,
+        build: build_architecture_rule,
+    },
+    CanonicalClaimRule {
+        id: CLAIM_CHECK_LAYER_VIOLATIONS,
+        build: build_check_layer_violations_rule,
+    },
+    CanonicalClaimRule {
+        id: CLAIM_CHECK_CIRCULAR_DEPS,
+        build: build_check_circular_deps_rule,
+    },
+    CanonicalClaimRule {
+        id: CLAIM_CHECK_AGGREGATE_QUALITY,
+        build: build_check_aggregate_quality_rule,
+    },
+    CanonicalClaimRule {
+        id: CLAIM_CHECK_ORPHAN_CONTEXTS,
+        build: build_check_orphan_contexts_rule,
+    },
+    CanonicalClaimRule {
+        id: CLAIM_CHECK_POLICY_VIOLATIONS,
+        build: build_check_policy_violations_rule,
+    },
+    CanonicalClaimRule {
+        id: CLAIM_CHECK_DRIFT,
+        build: build_check_drift_rule,
+    },
+    CanonicalClaimRule {
+        id: CLAIM_CHECK_ALL,
+        build: build_check_all_rule,
+    },
+    CanonicalClaimRule {
+        id: CLAIM_WHY_LAYER_VIOLATIONS,
+        build: build_why_layer_violations_rule,
+    },
+    CanonicalClaimRule {
+        id: CLAIM_WHY_CIRCULAR_DEPS,
+        build: build_why_circular_deps_rule,
+    },
+    CanonicalClaimRule {
+        id: CLAIM_WHY_POLICY_VIOLATIONS,
+        build: build_why_policy_violations_rule,
+    },
+    CanonicalClaimRule {
+        id: CLAIM_WHY_AGGREGATE_QUALITY,
+        build: build_why_aggregate_quality_rule,
+    },
+    CanonicalClaimRule {
+        id: CLAIM_WHY_ORPHAN_CONTEXTS,
+        build: build_why_orphan_contexts_rule,
+    },
+    CanonicalClaimRule {
+        id: CLAIM_DRIFT_OVERVIEW,
+        build: build_drift_overview_rule,
+    },
+    CanonicalClaimRule {
+        id: CLAIM_DIAGNOSE_REFACTOR,
+        build: build_diagnose_refactor_rule,
+    },
+    CanonicalClaimRule {
+        id: CLAIM_REFACTOR_PLAN,
+        build: build_refactor_plan_rule,
+    },
+];
+
+const PARAMETERIZED_CLAIM_RULES: [ParameterizedClaimRule; 5] = [
+    ParameterizedClaimRule {
+        prefix: CLAIM_SAFE_TO_DELETE_PREFIX,
+        build: rebuild_safe_to_delete_rule,
+    },
+    ParameterizedClaimRule {
+        prefix: CLAIM_HOW_CONNECTED_PREFIX,
+        build: rebuild_how_connected_rule,
+    },
+    ParameterizedClaimRule {
+        prefix: CLAIM_IMPACT_PREFIX,
+        build: rebuild_impact_rule,
+    },
+    ParameterizedClaimRule {
+        prefix: CLAIM_HISTORY_PREFIX,
+        build: rebuild_history_rule,
+    },
+    ParameterizedClaimRule {
+        prefix: CLAIM_SEARCH_PREFIX,
+        build: rebuild_search_rule,
+    },
+];
+
+fn canonical_claim_rule(claim_id: &str) -> Option<CanonicalClaimRule> {
+    CANONICAL_CLAIM_RULES
+        .iter()
+        .copied()
+        .find(|rule| rule.id == claim_id)
+}
+
+fn parameterized_claim_rule(claim_id: &str) -> Option<ParameterizedClaimRule> {
+    PARAMETERIZED_CLAIM_RULES
+        .iter()
+        .copied()
+        .find(|rule| claim_id == rule.prefix || claim_id.starts_with(&format!("{}:", rule.prefix)))
+}
+
+fn build_architecture_rule(
+    kernel: &ReasoningKernel<'_>,
+    workspace_path: &str,
+    data: &MaterializedReasoningData,
+    computed_at_us: i64,
+) -> Result<PersistedReasoningClaim> {
+    kernel.architecture_claim(workspace_path, data, computed_at_us)
+}
+
+fn build_check_layer_violations_rule(
+    kernel: &ReasoningKernel<'_>,
+    _workspace_path: &str,
+    data: &MaterializedReasoningData,
+    computed_at_us: i64,
+) -> Result<PersistedReasoningClaim> {
+    Ok(kernel.check_layer_violations_claim(data, computed_at_us))
+}
+
+fn build_check_circular_deps_rule(
+    kernel: &ReasoningKernel<'_>,
+    _workspace_path: &str,
+    data: &MaterializedReasoningData,
+    computed_at_us: i64,
+) -> Result<PersistedReasoningClaim> {
+    Ok(kernel.check_circular_deps_claim(data, computed_at_us))
+}
+
+fn build_check_aggregate_quality_rule(
+    kernel: &ReasoningKernel<'_>,
+    _workspace_path: &str,
+    data: &MaterializedReasoningData,
+    computed_at_us: i64,
+) -> Result<PersistedReasoningClaim> {
+    Ok(kernel.check_aggregate_quality_claim(data, computed_at_us))
+}
+
+fn build_check_orphan_contexts_rule(
+    kernel: &ReasoningKernel<'_>,
+    _workspace_path: &str,
+    data: &MaterializedReasoningData,
+    computed_at_us: i64,
+) -> Result<PersistedReasoningClaim> {
+    Ok(kernel.check_orphan_contexts_claim(data, computed_at_us))
+}
+
+fn build_check_policy_violations_rule(
+    kernel: &ReasoningKernel<'_>,
+    _workspace_path: &str,
+    data: &MaterializedReasoningData,
+    computed_at_us: i64,
+) -> Result<PersistedReasoningClaim> {
+    Ok(kernel.check_policy_violations_claim(data, computed_at_us))
+}
+
+fn build_check_drift_rule(
+    kernel: &ReasoningKernel<'_>,
+    _workspace_path: &str,
+    data: &MaterializedReasoningData,
+    computed_at_us: i64,
+) -> Result<PersistedReasoningClaim> {
+    Ok(kernel.check_drift_claim(data, computed_at_us))
+}
+
+fn build_check_all_rule(
+    kernel: &ReasoningKernel<'_>,
+    _workspace_path: &str,
+    data: &MaterializedReasoningData,
+    computed_at_us: i64,
+) -> Result<PersistedReasoningClaim> {
+    Ok(kernel.check_all_claim(data, computed_at_us))
+}
+
+fn build_why_layer_violations_rule(
+    kernel: &ReasoningKernel<'_>,
+    _workspace_path: &str,
+    data: &MaterializedReasoningData,
+    computed_at_us: i64,
+) -> Result<PersistedReasoningClaim> {
+    Ok(kernel.why_layer_violations_claim(data, computed_at_us))
+}
+
+fn build_why_circular_deps_rule(
+    kernel: &ReasoningKernel<'_>,
+    _workspace_path: &str,
+    data: &MaterializedReasoningData,
+    computed_at_us: i64,
+) -> Result<PersistedReasoningClaim> {
+    Ok(kernel.why_circular_deps_claim(data, computed_at_us))
+}
+
+fn build_why_policy_violations_rule(
+    kernel: &ReasoningKernel<'_>,
+    _workspace_path: &str,
+    data: &MaterializedReasoningData,
+    computed_at_us: i64,
+) -> Result<PersistedReasoningClaim> {
+    Ok(kernel.why_policy_violations_claim(data, computed_at_us))
+}
+
+fn build_why_aggregate_quality_rule(
+    kernel: &ReasoningKernel<'_>,
+    _workspace_path: &str,
+    data: &MaterializedReasoningData,
+    computed_at_us: i64,
+) -> Result<PersistedReasoningClaim> {
+    Ok(kernel.why_aggregate_quality_claim(data, computed_at_us))
+}
+
+fn build_why_orphan_contexts_rule(
+    kernel: &ReasoningKernel<'_>,
+    _workspace_path: &str,
+    data: &MaterializedReasoningData,
+    computed_at_us: i64,
+) -> Result<PersistedReasoningClaim> {
+    Ok(kernel.why_orphan_contexts_claim(data, computed_at_us))
+}
+
+fn build_drift_overview_rule(
+    kernel: &ReasoningKernel<'_>,
+    _workspace_path: &str,
+    data: &MaterializedReasoningData,
+    computed_at_us: i64,
+) -> Result<PersistedReasoningClaim> {
+    Ok(kernel.drift_overview_claim(data, computed_at_us))
+}
+
+fn build_diagnose_refactor_rule(
+    kernel: &ReasoningKernel<'_>,
+    _workspace_path: &str,
+    data: &MaterializedReasoningData,
+    computed_at_us: i64,
+) -> Result<PersistedReasoningClaim> {
+    Ok(kernel.diagnose_claim(data, computed_at_us))
+}
+
+fn build_refactor_plan_rule(
+    kernel: &ReasoningKernel<'_>,
+    workspace_path: &str,
+    data: &MaterializedReasoningData,
+    computed_at_us: i64,
+) -> Result<PersistedReasoningClaim> {
+    kernel.refactor_plan_claim_from_data(workspace_path, data, computed_at_us)
+}
+
+fn rebuild_safe_to_delete_rule(
+    kernel: &ReasoningKernel<'_>,
+    workspace_path: &str,
+    claim: &PersistedReasoningClaim,
+    data: &MaterializedReasoningData,
+    computed_at_us: i64,
+) -> Result<PersistedReasoningClaim> {
+    let subject = parse_json_subject(&claim.subject);
+    let context = subject["context"].as_str().unwrap_or("");
+    let entity = subject["entity"].as_str().unwrap_or("");
+    if context.is_empty() || entity.is_empty() {
+        anyhow::bail!(
+            "reasoning claim '{}' is missing safe_to_delete subject metadata",
+            claim.claim_id
+        );
+    }
+    kernel.safe_to_delete_claim(workspace_path, context, entity, data, computed_at_us)
+}
+
+fn rebuild_how_connected_rule(
+    kernel: &ReasoningKernel<'_>,
+    workspace_path: &str,
+    claim: &PersistedReasoningClaim,
+    data: &MaterializedReasoningData,
+    computed_at_us: i64,
+) -> Result<PersistedReasoningClaim> {
+    let subject = parse_json_subject(&claim.subject);
+    let from = subject["from"].as_str().unwrap_or("");
+    let to = subject["to"].as_str().unwrap_or("");
+    if from.is_empty() || to.is_empty() {
+        anyhow::bail!(
+            "reasoning claim '{}' is missing how_connected subject metadata",
+            claim.claim_id
+        );
+    }
+    kernel.how_connected_claim(workspace_path, from, to, data, computed_at_us)
+}
+
+fn rebuild_impact_rule(
+    kernel: &ReasoningKernel<'_>,
+    workspace_path: &str,
+    claim: &PersistedReasoningClaim,
+    data: &MaterializedReasoningData,
+    computed_at_us: i64,
+) -> Result<PersistedReasoningClaim> {
+    let subject = parse_json_subject(&claim.subject);
+    kernel.impact_claim(workspace_path, &subject, data, computed_at_us)
+}
+
+fn rebuild_history_rule(
+    kernel: &ReasoningKernel<'_>,
+    workspace_path: &str,
+    claim: &PersistedReasoningClaim,
+    data: &MaterializedReasoningData,
+    computed_at_us: i64,
+) -> Result<PersistedReasoningClaim> {
+    let subject = parse_json_subject(&claim.subject);
+    kernel.history_claim(workspace_path, &subject, data, computed_at_us)
+}
+
+fn rebuild_search_rule(
+    kernel: &ReasoningKernel<'_>,
+    workspace_path: &str,
+    claim: &PersistedReasoningClaim,
+    data: &MaterializedReasoningData,
+    computed_at_us: i64,
+) -> Result<PersistedReasoningClaim> {
+    let subject = parse_json_subject(&claim.subject);
+    kernel.search_claim(workspace_path, &subject, data, computed_at_us)
+}
+
+fn impact_claim_id(args: &Value) -> Result<String> {
+    let subject = normalized_impact_subject(args);
+    let analysis = subject["analysis"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .context("'analysis' parameter is required")?;
+    let mut parts = vec![CLAIM_IMPACT_PREFIX.to_string(), escape_claim_component(analysis)];
+    for key in ["context", "entity", "symbol", "field_type", "method_name"] {
+        if let Some(value) = subject[key].as_str().filter(|value| !value.is_empty()) {
+            parts.push(format!("{key}={}", escape_claim_component(value)));
+        }
+    }
+    Ok(parts.join(":"))
+}
+
+fn history_claim_id(args: &Value) -> String {
+    let raw_state = args["state"].as_str().unwrap_or("planned");
+    match (args["ts_old"].as_i64(), args["ts_new"].as_i64()) {
+        (Some(ts_old), ts_new) => format!(
+            "{CLAIM_HISTORY_PREFIX}:{}:{}:{}",
+            escape_claim_component(raw_state),
+            ts_old,
+            ts_new.unwrap_or(0)
+        ),
+        _ => format!(
+            "{CLAIM_HISTORY_PREFIX}:{}",
+            escape_claim_component(raw_state)
+        ),
+    }
+}
+
+fn search_claim_id(query: &str, limit: usize) -> String {
+    format!(
+        "{CLAIM_SEARCH_PREFIX}:{}:{}",
+        escape_claim_component(query),
+        limit
+    )
+}
+
+fn normalized_impact_subject(args: &Value) -> Value {
+    json!({
+        "analysis": args["analysis"].as_str().unwrap_or(""),
+        "context": args["context"].as_str().unwrap_or(""),
+        "entity": args["entity"].as_str().unwrap_or(""),
+        "symbol": args["symbol"].as_str().unwrap_or(""),
+        "field_type": args["field_type"].as_str().unwrap_or(""),
+        "method_name": args["method_name"].as_str().unwrap_or(""),
+    })
+}
+
+fn required_arg(args: &Value, key: &str, analysis: &str) -> Result<String> {
+    args[key]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .with_context(|| format!("'{}' parameter is required for {}", key, analysis))
+}
+
+fn escape_claim_component(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+        .collect()
+}
+
+fn impact_witness_count(payload: &Value) -> usize {
+    payload["count"]
+        .as_u64()
+        .or_else(|| payload["result"]["count"].as_u64())
+        .unwrap_or(0) as usize
+}
+
+fn build_model_overview_json(store: &Store, workspace: &str, state: &str) -> Value {
+    let project = store
+        .run_datalog(
+            "?[name, description, tech_stack_json, conventions_json, rules_json] := \
+                *project{workspace: $ws, name, description, tech_stack_json, conventions_json, rules_json}",
+            workspace,
+        )
+        .unwrap_or_default();
+
+    let contexts = store
+        .run_datalog(
+            &format!(
+                "?[name, description, module_path] := \
+                    *context{{workspace: $ws, name, description, module_path, state: '{state}' @ 'NOW'}}"
+            ),
+            workspace,
+        )
+        .unwrap_or_default();
+
+    let (proj_name, proj_desc, tech, conventions, rules) = if let Some(row) = project.first() {
+        (
+            row[0].clone(),
+            row[1].clone(),
+            serde_json::from_str::<Value>(&row[2]).unwrap_or(json!({})),
+            serde_json::from_str::<Value>(&row[3]).unwrap_or(json!({})),
+            serde_json::from_str::<Value>(&row[4]).unwrap_or(json!([])),
+        )
+    } else if contexts.is_empty() {
+        return json!({});
+    } else {
+        let fallback_name = std::path::Path::new(workspace)
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| "Unnamed".into());
+        (fallback_name, String::new(), json!({}), json!({}), json!([]))
+    };
+
+    let context_deps = store
+        .run_datalog(
+            &format!(
+                "?[from_ctx, to_ctx] := \
+                    *context_dep{{workspace: $ws, from_ctx, to_ctx, state: '{state}' @ 'NOW'}}"
+            ),
+            workspace,
+        )
+        .unwrap_or_default();
+
+    let entities = store
+        .run_datalog(
+            &format!(
+                "?[ctx, name, description, aggregate_root] := \
+                    *entity{{workspace: $ws, context: ctx, name, description, aggregate_root, state: '{state}' @ 'NOW'}}"
+            ),
+            workspace,
+        )
+        .unwrap_or_default();
+
+    let services = store
+        .run_datalog(
+            &format!(
+                "?[ctx, name, description, kind] := \
+                    *service{{workspace: $ws, context: ctx, name, description, kind, state: '{state}' @ 'NOW'}}"
+            ),
+            workspace,
+        )
+        .unwrap_or_default();
+
+    let events = store
+        .run_datalog(
+            &format!(
+                "?[ctx, name, description, source] := \
+                    *event{{workspace: $ws, context: ctx, name, description, source, state: '{state}' @ 'NOW'}}"
+            ),
+            workspace,
+        )
+        .unwrap_or_default();
+
+    let value_objects = store
+        .run_datalog(
+            &format!(
+                "?[ctx, name, description] := \
+                    *value_object{{workspace: $ws, context: ctx, name, description, state: '{state}' @ 'NOW'}}"
+            ),
+            workspace,
+        )
+        .unwrap_or_default();
+
+    let repositories = store
+        .run_datalog(
+            &format!(
+                "?[ctx, name, aggregate] := \
+                    *repository{{workspace: $ws, context: ctx, name, aggregate, state: '{state}' @ 'NOW'}}"
+            ),
+            workspace,
+        )
+        .unwrap_or_default();
+
+    let fields = store
+        .run_datalog(
+            &format!(
+                "?[ctx, owner_kind, owner, name, field_type, required] := \
+                    *field{{workspace: $ws, context: ctx, owner_kind, owner, name, field_type, required, state: '{state}' @ 'NOW'}}"
+            ),
+            workspace,
+        )
+        .unwrap_or_default();
+
+    let methods = store
+        .run_datalog(
+            &format!(
+                "?[ctx, owner_kind, owner, name, description, return_type] := \
+                    *method{{workspace: $ws, context: ctx, owner_kind, owner, name, description, return_type, state: '{state}' @ 'NOW'}}"
+            ),
+            workspace,
+        )
+        .unwrap_or_default();
+
+    let method_params = store
+        .run_datalog(
+            &format!(
+                "?[ctx, owner_kind, owner, method, name, param_type, required] := \
+                    *method_param{{workspace: $ws, context: ctx, owner_kind, owner, method, name, param_type, required, state: '{state}' @ 'NOW'}}"
+            ),
+            workspace,
+        )
+        .unwrap_or_default();
+
+    let invariants = store
+        .run_datalog(
+            &format!(
+                "?[ctx, entity, text] := \
+                    *invariant{{workspace: $ws, context: ctx, entity, text, state: '{state}' @ 'NOW'}}"
+            ),
+            workspace,
+        )
+        .unwrap_or_default();
+
+    let vo_rules = store
+        .run_datalog(
+            &format!(
+                "?[ctx, vo, text] := \
+                    *vo_rule{{workspace: $ws, context: ctx, value_object: vo, text, state: '{state}' @ 'NOW'}}"
+            ),
+            workspace,
+        )
+        .unwrap_or_default();
+
+    let bounded_contexts: Vec<Value> = contexts
+        .iter()
+        .map(|ctx_row| {
+            let ctx_name = &ctx_row[0];
+
+            let depends_on: Vec<&str> = context_deps
+                .iter()
+                .filter(|row| row[0] == *ctx_name)
+                .map(|row| row[1].as_str())
+                .collect();
+
+            let ctx_entities: Vec<Value> = entities
+                .iter()
+                .filter(|row| row[0] == *ctx_name)
+                .map(|entity| {
+                    let entity_name = &entity[1];
+                    let entity_fields: Vec<Value> = fields
+                        .iter()
+                        .filter(|row| {
+                            row[0] == *ctx_name && row[1] == "entity" && row[2] == *entity_name
+                        })
+                        .map(|row| {
+                            json!({
+                                "name": row[3],
+                                "type": row[4],
+                                "required": row[5] == "true",
+                            })
+                        })
+                        .collect();
+                    let entity_methods: Vec<Value> = methods
+                        .iter()
+                        .filter(|row| {
+                            row[0] == *ctx_name && row[1] == "entity" && row[2] == *entity_name
+                        })
+                        .map(|row| {
+                            let params: Vec<Value> = method_params
+                                .iter()
+                                .filter(|param| {
+                                    param[0] == *ctx_name
+                                        && param[1] == "entity"
+                                        && param[2] == *entity_name
+                                        && param[3] == row[3]
+                                })
+                                .map(|param| {
+                                    json!({
+                                        "name": param[4],
+                                        "type": param[5],
+                                        "required": param[6] == "true",
+                                    })
+                                })
+                                .collect();
+                            json!({
+                                "name": row[3],
+                                "description": row[4],
+                                "return_type": row[5],
+                                "parameters": params,
+                            })
+                        })
+                        .collect();
+                    let entity_invariants: Vec<&str> = invariants
+                        .iter()
+                        .filter(|row| row[0] == *ctx_name && row[1] == *entity_name)
+                        .map(|row| row[2].as_str())
+                        .collect();
+                    json!({
+                        "name": entity_name,
+                        "description": entity[2],
+                        "aggregate_root": entity[3] == "true",
+                        "fields": entity_fields,
+                        "methods": entity_methods,
+                        "invariants": entity_invariants,
+                    })
+                })
+                .collect();
+
+            let ctx_services: Vec<Value> = services
+                .iter()
+                .filter(|row| row[0] == *ctx_name)
+                .map(|service| {
+                    let service_methods: Vec<Value> = methods
+                        .iter()
+                        .filter(|row| {
+                            row[0] == *ctx_name && row[1] == "service" && row[2] == service[1]
+                        })
+                        .map(|row| {
+                            let params: Vec<Value> = method_params
+                                .iter()
+                                .filter(|param| {
+                                    param[0] == *ctx_name
+                                        && param[1] == "service"
+                                        && param[2] == service[1]
+                                        && param[3] == row[3]
+                                })
+                                .map(|param| {
+                                    json!({
+                                        "name": param[4],
+                                        "type": param[5],
+                                        "required": param[6] == "true",
+                                    })
+                                })
+                                .collect();
+                            json!({
+                                "name": row[3],
+                                "description": row[4],
+                                "return_type": row[5],
+                                "parameters": params,
+                            })
+                        })
+                        .collect();
+                    json!({
+                        "name": service[1],
+                        "description": service[2],
+                        "kind": service[3],
+                        "methods": service_methods,
+                    })
+                })
+                .collect();
+
+            let ctx_events: Vec<Value> = events
+                .iter()
+                .filter(|row| row[0] == *ctx_name)
+                .map(|event| {
+                    let event_fields: Vec<Value> = fields
+                        .iter()
+                        .filter(|row| {
+                            row[0] == *ctx_name && row[1] == "event" && row[2] == event[1]
+                        })
+                        .map(|row| {
+                            json!({
+                                "name": row[3],
+                                "type": row[4],
+                                "required": row[5] == "true",
+                            })
+                        })
+                        .collect();
+                    json!({
+                        "name": event[1],
+                        "description": event[2],
+                        "source": event[3],
+                        "fields": event_fields,
+                    })
+                })
+                .collect();
+
+            let ctx_value_objects: Vec<Value> = value_objects
+                .iter()
+                .filter(|row| row[0] == *ctx_name)
+                .map(|value_object| {
+                    let value_object_fields: Vec<Value> = fields
+                        .iter()
+                        .filter(|row| {
+                            row[0] == *ctx_name
+                                && row[1] == "value_object"
+                                && row[2] == value_object[1]
+                        })
+                        .map(|row| {
+                            json!({
+                                "name": row[3],
+                                "type": row[4],
+                                "required": row[5] == "true",
+                            })
+                        })
+                        .collect();
+                    let rules: Vec<&str> = vo_rules
+                        .iter()
+                        .filter(|row| row[0] == *ctx_name && row[1] == value_object[1])
+                        .map(|row| row[2].as_str())
+                        .collect();
+                    json!({
+                        "name": value_object[1],
+                        "description": value_object[2],
+                        "fields": value_object_fields,
+                        "validation_rules": rules,
+                    })
+                })
+                .collect();
+
+            let ctx_repositories: Vec<Value> = repositories
+                .iter()
+                .filter(|row| row[0] == *ctx_name)
+                .map(|repo| {
+                    let repo_methods: Vec<Value> = methods
+                        .iter()
+                        .filter(|row| {
+                            row[0] == *ctx_name && row[1] == "repository" && row[2] == repo[1]
+                        })
+                        .map(|row| {
+                            let params: Vec<Value> = method_params
+                                .iter()
+                                .filter(|param| {
+                                    param[0] == *ctx_name
+                                        && param[1] == "repository"
+                                        && param[2] == repo[1]
+                                        && param[3] == row[3]
+                                })
+                                .map(|param| {
+                                    json!({
+                                        "name": param[4],
+                                        "type": param[5],
+                                        "required": param[6] == "true",
+                                    })
+                                })
+                                .collect();
+                            json!({
+                                "name": row[3],
+                                "description": row[4],
+                                "return_type": row[5],
+                                "parameters": params,
+                            })
+                        })
+                        .collect();
+                    json!({
+                        "name": repo[1],
+                        "aggregate": repo[2],
+                        "methods": repo_methods,
+                    })
+                })
+                .collect();
+
+            json!({
+                "name": ctx_name,
+                "description": ctx_row[1],
+                "module": ctx_row[2],
+                "entities": ctx_entities,
+                "services": ctx_services,
+                "events": ctx_events,
+                "value_objects": ctx_value_objects,
+                "repositories": ctx_repositories,
+                "depends_on": depends_on,
+            })
+        })
+        .collect();
+
+    json!({
+        "project": proj_name,
+        "description": proj_desc,
+        "tech": tech,
+        "bounded_contexts": bounded_contexts,
+        "rules": rules,
+        "conventions": conventions,
+    })
+}
+
+fn relation_justification(
+    fact_kind: &str,
+    fact_state: &str,
+    basis_timestamp_us: i64,
+) -> ReasoningJustification {
+    fact_justification(fact_kind, "*", fact_state, basis_timestamp_us)
+}
+
+fn fact_justification(
+    fact_kind: &str,
+    fact_key: &str,
+    fact_state: &str,
+    basis_timestamp_us: i64,
+) -> ReasoningJustification {
+    ReasoningJustification {
+        fact_kind: fact_kind.into(),
+        fact_key: fact_key.into(),
+        fact_state: fact_state.into(),
+        basis_timestamp_us,
+    }
+}
+
+fn desired_relation_justifications(
+    basis: &SnapshotBasis,
+    relations: &[&str],
+) -> Vec<ReasoningJustification> {
+    relations
+        .iter()
+        .map(|relation| relation_justification(relation, "desired", basis.desired_ts))
+        .collect()
+}
+
+fn actual_relation_justifications(
+    basis: &SnapshotBasis,
+    relations: &[&str],
+) -> Vec<ReasoningJustification> {
+    relations
+        .iter()
+        .map(|relation| relation_justification(relation, "actual", basis.actual_ts))
+        .collect()
+}
+
+fn default_justifications_for_claim(
+    claim: &PersistedReasoningClaim,
+    data: &MaterializedReasoningData,
+) -> Vec<ReasoningJustification> {
+    let mut justifications = match claim.claim_id.as_str() {
+        CLAIM_ARCHITECTURE_OVERVIEW => {
+            let mut items = desired_relation_justifications(
+                &data.basis,
+                &[
+                    "project",
+                    "context",
+                    "context_dep",
+                    "entity",
+                    "service",
+                    "event",
+                    "value_object",
+                    "repository",
+                    "module",
+                    "field",
+                    "method",
+                    "method_param",
+                    "invariant",
+                    "vo_rule",
+                ],
+            );
+            items.extend(actual_relation_justifications(
+                &data.basis,
+                &[
+                    "context",
+                    "context_dep",
+                    "entity",
+                    "service",
+                    "event",
+                    "value_object",
+                    "repository",
+                    "module",
+                    "source_file",
+                    "symbol",
+                    "import_edge",
+                    "calls_symbol",
+                    "ast_edge",
+                ],
+            ));
+            items.push(relation_justification("drift", "drift", data.basis.drift_ts));
+            items
+        }
+        CLAIM_CHECK_LAYER_VIOLATIONS | CLAIM_WHY_LAYER_VIOLATIONS => {
+            desired_relation_justifications(&data.basis, &["service", "service_dep"])
+        }
+        CLAIM_CHECK_CIRCULAR_DEPS | CLAIM_WHY_CIRCULAR_DEPS => {
+            desired_relation_justifications(&data.basis, &["context_dep"])
+        }
+        CLAIM_CHECK_AGGREGATE_QUALITY | CLAIM_WHY_AGGREGATE_QUALITY => {
+            desired_relation_justifications(&data.basis, &["entity", "invariant"])
+        }
+        CLAIM_CHECK_ORPHAN_CONTEXTS | CLAIM_WHY_ORPHAN_CONTEXTS => {
+            desired_relation_justifications(&data.basis, &["context", "context_dep"])
+        }
+        CLAIM_CHECK_POLICY_VIOLATIONS | CLAIM_WHY_POLICY_VIOLATIONS => desired_relation_justifications(
+            &data.basis,
+            &["context_dep", "layer_assignment", "dependency_constraint"],
+        ),
+        CLAIM_CHECK_DRIFT | CLAIM_DRIFT_OVERVIEW | CLAIM_DIAGNOSE_REFACTOR | CLAIM_REFACTOR_PLAN => {
+            let mut items = desired_relation_justifications(
+                &data.basis,
+                &["context", "context_dep", "entity", "service", "event", "value_object", "repository", "module"],
+            );
+            items.extend(actual_relation_justifications(
+                &data.basis,
+                &["context", "context_dep", "entity", "service", "event", "value_object", "repository", "module", "source_file", "symbol", "import_edge", "calls_symbol", "ast_edge"],
+            ));
+            items.push(relation_justification("drift", "drift", data.basis.drift_ts));
+            items
+        }
+        CLAIM_CHECK_ALL => {
+            let mut items = desired_relation_justifications(
+                &data.basis,
+                &["context", "context_dep", "entity", "service", "service_dep", "invariant", "layer_assignment", "dependency_constraint"],
+            );
+            items.extend(actual_relation_justifications(
+                &data.basis,
+                &["context", "entity", "service", "event", "value_object", "repository", "module"],
+            ));
+            items.push(relation_justification("drift", "drift", data.basis.drift_ts));
+            items
+        }
+        _ => Vec::new(),
+    };
+
+    if claim.claim_id.starts_with(&format!("{CLAIM_SAFE_TO_DELETE_PREFIX}:")) {
+        let subject = parse_json_subject(&claim.subject);
+        let context = subject["context"].as_str().unwrap_or("");
+        let entity = subject["entity"].as_str().unwrap_or("");
+        let key = format!("{context}/{entity}");
+        justifications.extend(desired_relation_justifications(
+            &data.basis,
+            &["aggregate_member", "event", "repository"],
+        ));
+        justifications.extend(actual_relation_justifications(
+            &data.basis,
+            &["import_edge", "ast_edge", "calls_symbol"],
+        ));
+        justifications.push(fact_justification("entity", &key, "desired", data.basis.desired_ts));
+        justifications.push(fact_justification("symbol", entity, "actual", data.basis.actual_ts));
+    }
+
+    if claim.claim_id.starts_with(&format!("{CLAIM_HOW_CONNECTED_PREFIX}:")) {
+        let subject = parse_json_subject(&claim.subject);
+        let from = subject["from"].as_str().unwrap_or("");
+        let to = subject["to"].as_str().unwrap_or("");
+        justifications.extend(desired_relation_justifications(&data.basis, &["context", "context_dep"]));
+        if !from.is_empty() {
+            justifications.push(fact_justification("context", from, "desired", data.basis.desired_ts));
+        }
+        if !to.is_empty() {
+            justifications.push(fact_justification("context", to, "desired", data.basis.desired_ts));
+        }
+    }
+
+    if claim.claim_id.starts_with(&format!("{CLAIM_IMPACT_PREFIX}:")) {
+        let subject = parse_json_subject(&claim.subject);
+        let analysis = subject["analysis"].as_str().unwrap_or("");
+        match analysis {
+            "transitive_deps" | "circular_deps" | "dependency_graph" | "pagerank" | "community_detection" | "betweenness_centrality" | "degree_centrality" | "topological_order" => {
+                justifications.extend(desired_relation_justifications(&data.basis, &["context", "context_dep"]));
+            }
+            "layer_violations" => {
+                justifications.extend(desired_relation_justifications(&data.basis, &["service", "service_dep"]));
+            }
+            "aggregate_quality" => {
+                justifications.extend(desired_relation_justifications(&data.basis, &["entity", "invariant"]));
+            }
+            "impact_analysis" => {
+                justifications.extend(desired_relation_justifications(&data.basis, &["event", "repository", "service_dep", "context_dep"]));
+                justifications.extend(actual_relation_justifications(&data.basis, &["ast_edge", "import_edge"]));
+            }
+            "field_usage" | "shared_fields" => {
+                justifications.extend(desired_relation_justifications(&data.basis, &["field"]));
+            }
+            "method_search" => {
+                justifications.extend(desired_relation_justifications(&data.basis, &["method"]));
+            }
+            "call_graph_callers" | "call_graph_callees" | "call_graph_reachability" | "call_graph_stats" => {
+                justifications.extend(actual_relation_justifications(&data.basis, &["calls_symbol"]));
+            }
+            _ => {}
+        }
+        for key in ["context", "entity", "symbol", "field_type", "method_name"] {
+            if let Some(value) = subject[key].as_str().filter(|value| !value.is_empty()) {
+                let fact_kind = match key {
+                    "field_type" => "field_type",
+                    "method_name" => "method_name",
+                    _ => key,
+                };
+                let state = if key == "symbol" { "actual" } else { "desired" };
+                let basis_ts = if state == "actual" {
+                    data.basis.actual_ts
+                } else {
+                    data.basis.desired_ts
+                };
+                justifications.push(fact_justification(fact_kind, value, state, basis_ts));
+            }
+        }
+    }
+
+    if claim.claim_id.starts_with(&format!("{CLAIM_HISTORY_PREFIX}:")) {
+        let subject = parse_json_subject(&claim.subject);
+        let raw_state = subject["state"].as_str().unwrap_or("planned");
+        let state = if raw_state == "current" { "actual" } else { "desired" };
+        let basis_ts = if state == "actual" { data.basis.actual_ts } else { data.basis.desired_ts };
+        justifications.push(fact_justification("snapshot_log", state, state, basis_ts));
+    }
+
+    if claim.claim_id.starts_with(&format!("{CLAIM_SEARCH_PREFIX}:")) {
+        justifications.extend(desired_relation_justifications(
+            &data.basis,
+            &["context", "entity", "service", "event", "architectural_decision", "invariant"],
+        ));
+    }
+
+    justifications
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::model::{
+        BoundedContext, Conventions, DomainModel, Ownership, TechStack,
+    };
+    use std::env::temp_dir;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn test_store() -> Store {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let path = temp_dir().join(format!(
+            "dendrites_reasoning_test_{}_{}.db",
+            std::process::id(),
+            id
+        ));
+        Store::open(&path).unwrap()
+    }
+
+    fn simple_model() -> DomainModel {
+        DomainModel {
+            name: "ReasoningProject".into(),
+            description: "Kernel test model".into(),
+            bounded_contexts: vec![BoundedContext {
+                name: "Identity".into(),
+                description: "Identity context".into(),
+                module_path: "src/identity".into(),
+                ownership: Ownership::default(),
+                aggregates: vec![],
+                policies: vec![],
+                read_models: vec![],
+                entities: vec![],
+                value_objects: vec![],
+                services: vec![],
+                repositories: vec![],
+                events: vec![],
+                modules: vec![],
+                dependencies: vec![],
+                api_endpoints: vec![],
+            }],
+            external_systems: vec![],
+            architectural_decisions: vec![],
+            ownership: Ownership::default(),
+            rules: vec![],
+            tech_stack: TechStack::default(),
+            conventions: Conventions::default(),
+            ast_edges: vec![],
+            source_files: vec![],
+            symbols: vec![],
+            import_edges: vec![],
+            call_edges: vec![],
+        }
+    }
+
+    fn dependency_model(has_dependency: bool) -> DomainModel {
+        DomainModel {
+            name: "DependencyProject".into(),
+            description: "Connectivity test model".into(),
+            bounded_contexts: vec![
+                BoundedContext {
+                    name: "A".into(),
+                    description: "Upstream context".into(),
+                    module_path: "src/a".into(),
+                    ownership: Ownership::default(),
+                    aggregates: vec![],
+                    policies: vec![],
+                    read_models: vec![],
+                    entities: vec![],
+                    value_objects: vec![],
+                    services: vec![],
+                    repositories: vec![],
+                    events: vec![],
+                    modules: vec![],
+                    dependencies: if has_dependency {
+                        vec!["B".into()]
+                    } else {
+                        vec![]
+                    },
+                    api_endpoints: vec![],
+                },
+                BoundedContext {
+                    name: "B".into(),
+                    description: "Downstream context".into(),
+                    module_path: "src/b".into(),
+                    ownership: Ownership::default(),
+                    aggregates: vec![],
+                    policies: vec![],
+                    read_models: vec![],
+                    entities: vec![],
+                    value_objects: vec![],
+                    services: vec![],
+                    repositories: vec![],
+                    events: vec![],
+                    modules: vec![],
+                    dependencies: vec![],
+                    api_endpoints: vec![],
+                },
+            ],
+            external_systems: vec![],
+            architectural_decisions: vec![],
+            ownership: Ownership::default(),
+            rules: vec![],
+            tech_stack: TechStack::default(),
+            conventions: Conventions::default(),
+            ast_edges: vec![],
+            source_files: vec![],
+            symbols: vec![],
+            import_edges: vec![],
+            call_edges: vec![],
+        }
+    }
+
+    #[test]
+    fn test_kernel_materializes_and_loads_claims() {
+        let store = test_store();
+        let ws = "/tmp/test-reasoning-kernel-materialize";
+        let model = simple_model();
+        store.save_desired(ws, &model).unwrap();
+        store.save_actual(ws, &model).unwrap();
+        store.compute_drift(ws).unwrap();
+
+        let kernel = ReasoningKernel::new(&store);
+        let claim = kernel.check(ws, "layer_violations").unwrap();
+        assert_eq!(claim.claim_id, CLAIM_CHECK_LAYER_VIOLATIONS);
+        assert!(!claim.stale);
+
+        let stored = store
+            .load_reasoning_claim(ws, CLAIM_CHECK_LAYER_VIOLATIONS)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.claim_kind, "check");
+        assert_eq!(stored.status, "true");
+        assert!(!stored.derivations.is_empty());
+    }
+
+    #[test]
+    fn test_kernel_dependency_invalidation_is_scoped() {
+        let store = test_store();
+        let ws = "/tmp/test-reasoning-kernel-invalidation";
+        let model = simple_model();
+        store.save_desired(ws, &model).unwrap();
+        store.save_actual(ws, &model).unwrap();
+        store.compute_drift(ws).unwrap();
+
+        let kernel = ReasoningKernel::new(&store);
+        kernel.check(ws, "layer_violations").unwrap();
+        kernel.drift(ws).unwrap();
+
+        store.save_actual(ws, &model).unwrap();
+
+        let desired_only = store
+            .load_reasoning_claim(ws, CLAIM_CHECK_LAYER_VIOLATIONS)
+            .unwrap()
+            .unwrap();
+        assert!(!desired_only.stale, "desired-only claim should remain fresh after actual-only change");
+
+        let drift_claim = store
+            .load_reasoning_claim(ws, CLAIM_DRIFT_OVERVIEW)
+            .unwrap()
+            .unwrap();
+        assert!(drift_claim.stale, "cross-state drift claim should be invalidated after actual change");
+
+        store.compute_drift(ws).unwrap();
+        let refreshed = kernel.drift(ws).unwrap();
+        assert!(!refreshed.stale);
+
+        store.save_desired(ws, &model).unwrap();
+        let invalidated = store
+            .load_reasoning_claim(ws, CLAIM_CHECK_LAYER_VIOLATIONS)
+            .unwrap()
+            .unwrap();
+        assert!(invalidated.stale, "desired dependency should invalidate desired-state claim");
+
+        let refreshed_check = kernel.check(ws, "layer_violations").unwrap();
+        assert!(!refreshed_check.stale);
+    }
+
+    #[test]
+    fn test_parameterized_claim_eager_refreshes_after_desired_change() {
+        let store = test_store();
+        let ws = "/tmp/test-reasoning-parameterized-refresh";
+        let initial = dependency_model(true);
+        store.save_desired(ws, &initial).unwrap();
+        store.save_actual(ws, &initial).unwrap();
+        store.compute_drift(ws).unwrap();
+
+        let kernel = ReasoningKernel::new(&store);
+        let initial_claim = kernel.how_connected(ws, "A", "B").unwrap();
+        assert_eq!(initial_claim.claim_kind, "how_connected");
+        assert_eq!(initial_claim.payload["reachable"], true);
+
+        let updated = dependency_model(false);
+        store.save_desired(ws, &updated).unwrap();
+
+        let claim_id = how_connected_claim_id("A", "B");
+        let stale = store.load_reasoning_claim(ws, &claim_id).unwrap().unwrap();
+        assert!(stale.stale, "parameterized claim should be invalidated by desired changes");
+
+        let refreshed = kernel.eager_refresh_for_dependency(ws, "desired").unwrap();
+        assert!(refreshed.iter().any(|claim| claim.claim_id == claim_id));
+
+        let rebuilt = store.load_reasoning_claim(ws, &claim_id).unwrap().unwrap();
+        assert!(!rebuilt.stale);
+        assert_eq!(rebuilt.payload["reachable"], false);
+        assert_eq!(rebuilt.status, "disconnected");
+    }
+}

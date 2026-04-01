@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use cozo::{DbInstance, ScriptMutability};
-use serde_json::json;
-use std::collections::BTreeMap;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use crate::domain::model::*;
@@ -235,6 +236,14 @@ impl Store {
             ":create calls_symbol { workspace: String, caller: String, callee: String, state: String, vld: Validity default 'ASSERT' => file_path: String default '', line: Int default 0, context: String default '' }",
             // ── Drift model ──
             ":create drift { workspace: String, category: String, context: String, name: String, change_type: String, vld: Validity default 'ASSERT' => detail: String default '' }",
+            ":create drift_meta { workspace: String => computed_at_us: Int default 0 }",
+            // ── Reasoning kernel relations (non-temporal, current cache only) ──
+            ":create reasoning_claim { workspace: String, claim_id: String => claim_kind: String default '', subject: String default '', status: String default '', summary: String default '', payload_json: String default '{}', provenance_source: String default '', provenance_state: String default '', stale: Bool default true, computed_at_us: Int default 0 }",
+            ":create reasoning_derivation { workspace: String, claim_id: String, idx: Int => rule: String default '', derived_from_json: String default '[]', witness_count: Int default 0 }",
+            ":create reasoning_assumption { workspace: String, claim_id: String, idx: Int => assumption_kind: String default 'assumption', text: String default '' }",
+            ":create reasoning_support { workspace: String, claim_id: String, idx: Int => support_kind: String default '', summary: String default '', detail_json: String default '{}' }",
+            ":create reasoning_dependency { workspace: String, claim_id: String, idx: Int => dependency_kind: String default '', dependency_state: String default '', basis_timestamp_us: Int default 0 }",
+            ":create reasoning_justification { workspace: String, claim_id: String, idx: Int => fact_kind: String default '', fact_key: String default '', fact_state: String default '', basis_timestamp_us: Int default 0 }",
             // ── Snapshot log (explicit timestamp tracking for list_snapshots) ──
             ":create snapshot_log { workspace: String, state: String, timestamp_us: Int => label: String default '' }",
         ];
@@ -345,31 +354,6 @@ impl Store {
     /// Save the desired domain model: decomposes into relational rows with `state='desired'`.
     pub fn save_desired(&self, workspace_path: &str, model: &DomainModel) -> Result<()> {
         let ws = canonicalize_path(workspace_path);
-        let now = chrono_now();
-
-        // Upsert project metadata
-        let rules_json = serde_json::to_string(&model.rules).unwrap_or_else(|_| "[]".into());
-        let tech_json = serde_json::to_string(&model.tech_stack).unwrap_or_else(|_| "{}".into());
-        let conv_json = serde_json::to_string(&model.conventions).unwrap_or_else(|_| "{}".into());
-        let params = params_map(&[
-            ("ws", &ws),
-            ("name", &model.name),
-            ("desc", &model.description),
-            ("now", &now),
-            ("rules", &rules_json),
-            ("tech", &tech_json),
-            ("conv", &conv_json),
-        ]);
-        self.db
-            .run_script(
-                "?[workspace, name, description, updated_at, rules_json, tech_stack_json, conventions_json] <- \
-                    [[$ws, $name, $desc, $now, $rules, $tech, $conv]] \
-                 :put project { workspace => name, description, updated_at, rules_json, tech_stack_json, conventions_json }",
-                params,
-                ScriptMutability::Mutable,
-            )
-            .map_err(|e| anyhow::anyhow!("Failed to save project metadata: {:?}", e))?;
-
         self.save_state(&ws, model, "desired")
     }
 
@@ -389,10 +373,48 @@ impl Store {
         self.save_state(&ws, model, "actual")
     }
 
+    fn run_mutation_script(
+        &self,
+        script: &str,
+        params: BTreeMap<String, cozo::DataValue>,
+        context: impl Into<String>,
+    ) -> Result<()> {
+        let context = context.into();
+        self.db
+            .run_script(script, params, ScriptMutability::Mutable)
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("{context}: {:?}", e))
+    }
+
+    fn save_project_metadata(&self, workspace: &str, model: &DomainModel) -> Result<()> {
+        let now = chrono_now();
+        let rules_json = serde_json::to_string(&model.rules).unwrap_or_else(|_| "[]".into());
+        let tech_json = serde_json::to_string(&model.tech_stack).unwrap_or_else(|_| "{}".into());
+        let conv_json = serde_json::to_string(&model.conventions).unwrap_or_else(|_| "{}".into());
+        let params = params_map(&[
+            ("ws", workspace),
+            ("name", &model.name),
+            ("desc", &model.description),
+            ("now", &now),
+            ("rules", &rules_json),
+            ("tech", &tech_json),
+            ("conv", &conv_json),
+        ]);
+        self.run_mutation_script(
+            "?[workspace, name, description, updated_at, rules_json, tech_stack_json, conventions_json] <- \
+                [[$ws, $name, $desc, $now, $rules, $tech, $conv]] \
+             :put project { workspace => name, description, updated_at, rules_json, tech_stack_json, conventions_json }",
+            params,
+            format!("save project metadata '{}'", model.name),
+        )
+    }
+
     /// Accept: promote desired → actual via Datalog state copy.
     pub fn accept(&self, workspace_path: &str) -> Result<()> {
         let ws = canonicalize_path(workspace_path);
-        self.copy_state(&ws, "desired", "actual")
+        self.copy_state(&ws, "desired", "actual")?;
+        self.invalidate_reasoning_claims_for_dependency(workspace_path, "actual")?;
+        Ok(())
     }
 
     /// Reset: revert desired → actual via Datalog state copy, return the restored model.
@@ -403,6 +425,7 @@ impl Store {
             return Ok(None);
         }
         self.copy_state(&ws, "actual", "desired")?;
+        self.invalidate_reasoning_claims_for_dependency(workspace_path, "desired")?;
         self.load_desired(workspace_path)
     }
 
@@ -542,12 +565,12 @@ impl Store {
         Ok(())
     }
 
-    fn remove_owner_meta(&self, ws: &str, ctx: &str, owner_kind: &str, owner: &str) {
-        let _ = self.db.run_script(
+    fn remove_owner_meta(&self, ws: &str, ctx: &str, owner_kind: &str, owner: &str) -> Result<()> {
+        self.run_mutation_script(
             "?[workspace, context, owner_kind, owner, state, vld] := *owner_meta{workspace, context, owner_kind, owner, state @ 'NOW'}, workspace = $ws, context = $ctx, owner_kind = $ok, owner = $owner, vld = 'RETRACT' :put owner_meta { workspace, context, owner_kind, owner, state, vld }",
             params_map(&[("ws", ws), ("ctx", ctx), ("ok", owner_kind), ("owner", owner)]),
-            ScriptMutability::Mutable,
-        );
+            format!("remove owner_meta {owner_kind}:{owner}"),
+        )
     }
 
     fn replace_owner_fields(
@@ -558,11 +581,11 @@ impl Store {
         owner: &str,
         fields: &[Field],
     ) -> Result<()> {
-        let _ = self.db.run_script(
+        self.run_mutation_script(
             "?[workspace, context, owner_kind, owner, name, state, vld] := *field{workspace, context, owner_kind, owner, name, state @ 'NOW'}, workspace = $ws, context = $ctx, owner_kind = $ok, owner = $owner, state = 'desired', vld = 'RETRACT' :put field { workspace, context, owner_kind, owner, name, state, vld }",
             params_map(&[("ws", ws), ("ctx", ctx), ("ok", owner_kind), ("owner", owner)]),
-            ScriptMutability::Mutable,
-        );
+            format!("replace fields for {owner_kind}:{owner}"),
+        )?;
         self.save_fields(ws, ctx, owner_kind, owner, fields, "desired")
     }
 
@@ -574,16 +597,16 @@ impl Store {
         owner: &str,
         methods: &[Method],
     ) -> Result<()> {
-        let _ = self.db.run_script(
+        self.run_mutation_script(
             "?[workspace, context, owner_kind, owner, name, state, vld] := *method{workspace, context, owner_kind, owner, name, state @ 'NOW'}, workspace = $ws, context = $ctx, owner_kind = $ok, owner = $owner, state = 'desired', vld = 'RETRACT' :put method { workspace, context, owner_kind, owner, name, state, vld }",
             params_map(&[("ws", ws), ("ctx", ctx), ("ok", owner_kind), ("owner", owner)]),
-            ScriptMutability::Mutable,
-        );
-        let _ = self.db.run_script(
+            format!("replace methods for {owner_kind}:{owner}"),
+        )?;
+        self.run_mutation_script(
             "?[workspace, context, owner_kind, owner, method, name, state, vld] := *method_param{workspace, context, owner_kind, owner, method, name, state @ 'NOW'}, workspace = $ws, context = $ctx, owner_kind = $ok, owner = $owner, state = 'desired', vld = 'RETRACT' :put method_param { workspace, context, owner_kind, owner, method, name, state, vld }",
             params_map(&[("ws", ws), ("ctx", ctx), ("ok", owner_kind), ("owner", owner)]),
-            ScriptMutability::Mutable,
-        );
+            format!("replace method params for {owner_kind}:{owner}"),
+        )?;
         self.save_methods(ws, ctx, owner_kind, owner, methods, "desired")
     }
 
@@ -594,11 +617,11 @@ impl Store {
         entity: &str,
         invariants: &[String],
     ) -> Result<()> {
-        let _ = self.db.run_script(
-            "?[workspace, context, entity, idx, state, vld] := *invariant{workspace, context, entity, idx, state @ 'NOW'}, workspace = $ws, context = $ctx, entity = $entity, state = 'desired', vld = 'RETRACT' :put invariant { workspace, context, entity, idx, state, vld }",
+        self.run_mutation_script(
+                "?[workspace, context, entity, idx, state, text, vld] := *invariant{workspace, context, entity, idx, state, text @ 'NOW'}, workspace = $ws, context = $ctx, entity = $entity, state = 'desired', vld = 'RETRACT' :put invariant { workspace, context, entity, idx, state, vld => text }",
             params_map(&[("ws", ws), ("ctx", ctx), ("entity", entity)]),
-            ScriptMutability::Mutable,
-        );
+            format!("replace invariants for entity:{entity}"),
+        )?;
         for (idx, invariant) in invariants.iter().enumerate() {
             let mut params = params_map(&[
                 ("ws", ws),
@@ -623,11 +646,11 @@ impl Store {
         value_object: &str,
         rules: &[String],
     ) -> Result<()> {
-        let _ = self.db.run_script(
-            "?[workspace, context, value_object, idx, state, vld] := *vo_rule{workspace, context, value_object, idx, state @ 'NOW'}, workspace = $ws, context = $ctx, value_object = $vo, state = 'desired', vld = 'RETRACT' :put vo_rule { workspace, context, value_object, idx, state, vld }",
+        self.run_mutation_script(
+                "?[workspace, context, value_object, idx, state, text, vld] := *vo_rule{workspace, context, value_object, idx, state, text @ 'NOW'}, workspace = $ws, context = $ctx, value_object = $vo, state = 'desired', vld = 'RETRACT' :put vo_rule { workspace, context, value_object, idx, state, vld => text }",
             params_map(&[("ws", ws), ("ctx", ctx), ("vo", value_object)]),
-            ScriptMutability::Mutable,
-        );
+            format!("replace value object rules for {value_object}"),
+        )?;
         for (idx, rule) in rules.iter().enumerate() {
             let mut params = params_map(&[
                 ("ws", ws),
@@ -652,11 +675,11 @@ impl Store {
         service: &str,
         dependencies: &[String],
     ) -> Result<()> {
-        let _ = self.db.run_script(
+        self.run_mutation_script(
             "?[workspace, context, service, dep, state, vld] := *service_dep{workspace, context, service, dep, state @ 'NOW'}, workspace = $ws, context = $ctx, service = $service, state = 'desired', vld = 'RETRACT' :put service_dep { workspace, context, service, dep, state, vld }",
             params_map(&[("ws", ws), ("ctx", ctx), ("service", service)]),
-            ScriptMutability::Mutable,
-        );
+            format!("replace service dependencies for {service}"),
+        )?;
         for dep in dependencies {
             self.db.run_script(
                 "?[workspace, context, service, dep, state] <- [[$ws, $ctx, $service, $dep, 'desired']] :put service_dep { workspace, context, service, dep, state }",
@@ -683,15 +706,8 @@ impl Store {
         }
 
         let empty = DomainModel::empty(workspace_path);
-        let now = chrono_now();
-        let rules_json = serde_json::to_string(&empty.rules).unwrap_or_else(|_| "[]".into());
-        let tech_json = serde_json::to_string(&empty.tech_stack).unwrap_or_else(|_| "{}".into());
-        let conv_json = serde_json::to_string(&empty.conventions).unwrap_or_else(|_| "{}".into());
-        self.db.run_script(
-            "?[workspace, name, description, updated_at, rules_json, tech_stack_json, conventions_json] <- [[$ws, $name, $desc, $now, $rules, $tech, $conv]] :put project { workspace => name, description, updated_at, rules_json, tech_stack_json, conventions_json }",
-            params_map(&[("ws", &ws), ("name", &empty.name), ("desc", &empty.description), ("now", &now), ("rules", &rules_json), ("tech", &tech_json), ("conv", &conv_json)]),
-            ScriptMutability::Mutable,
-        ).map_err(|e| anyhow::anyhow!("ensure_project: {:?}", e))?;
+        self.save_project_metadata(&ws, &empty)
+            .map_err(|e| anyhow::anyhow!("ensure_project: {e}"))?;
         self.save_owner_meta(&ws, "", "project", &empty.name, &empty.ownership, "desired")?;
         Ok(())
     }
@@ -936,6 +952,7 @@ impl Store {
 
     /// Decompose a DomainModel into relational rows tagged with `state`.
     fn save_state(&self, workspace: &str, model: &DomainModel, state: &str) -> Result<()> {
+        self.save_project_metadata(workspace, model)?;
         self.clear_state(workspace, state)?;
         self.save_owner_meta(
             workspace,
@@ -1466,23 +1483,26 @@ impl Store {
             ).map_err(|e| anyhow::anyhow!("save calls_symbol: {:?}", e))?;
         }
 
-        // Record snapshot timestamp for list_snapshots
+        self.record_snapshot(workspace, state)?;
+        self.invalidate_reasoning_claims_for_dependency(workspace, state)?;
+
+        Ok(())
+    }
+
+    fn record_snapshot(&self, workspace: &str, state: &str) -> Result<i64> {
         let ts_us = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_micros() as i64;
         let mut snap_params = params_map(&[("ws", workspace), ("st", state)]);
         snap_params.insert("ts".into(), int_dv(ts_us));
-        self.db
-            .run_script(
-                "?[workspace, state, timestamp_us] <- [[$ws, $st, $ts]] \
+        self.run_mutation_script(
+            "?[workspace, state, timestamp_us] <- [[$ws, $st, $ts]] \
              :put snapshot_log { workspace, state, timestamp_us }",
-                snap_params,
-                ScriptMutability::Mutable,
-            )
-            .map_err(|e| anyhow::anyhow!("save snapshot_log: {:?}", e))?;
-
-        Ok(())
+            snap_params,
+            format!("save snapshot_log for '{workspace}' state '{state}'"),
+        )?;
+        Ok(ts_us)
     }
 
     /// Retract all current rows for a workspace+state (preserves temporal history).
@@ -1538,7 +1558,6 @@ impl Store {
                 "workspace, decision_id, context, idx, state",
             ),
             ("decision_consequence", "workspace, decision_id, idx, state"),
-            ("invariant", "workspace, context, entity, idx, state"),
             (
                 "field",
                 "workspace, context, owner_kind, owner, name, state",
@@ -1551,7 +1570,6 @@ impl Store {
                 "method_param",
                 "workspace, context, owner_kind, owner, method, name, state",
             ),
-            ("vo_rule", "workspace, context, value_object, idx, state"),
             (
                 "ast_edge",
                 "workspace, state, from_node, to_node, edge_type",
@@ -1566,15 +1584,28 @@ impl Store {
                 "?[{keys}, vld] := *{rel}{{{keys} @ 'NOW'}}, workspace = $ws, state = $st, vld = 'RETRACT' \
                  :put {rel} {{{keys}, vld}}"
             );
-            let _ = self
-                .db
-                .run_script(&script, params.clone(), ScriptMutability::Mutable);
+            self.run_mutation_script(
+                &script,
+                params.clone(),
+                format!("clear_state retract {rel} for '{state}'"),
+            )?;
         }
+        self.run_mutation_script(
+            "?[workspace, context, entity, idx, state, text, vld] := *invariant{workspace, context, entity, idx, state, text @ 'NOW'}, workspace = $ws, state = $st, vld = 'RETRACT' :put invariant { workspace, context, entity, idx, state, vld => text }",
+            params.clone(),
+            format!("clear_state retract invariant for '{state}'"),
+        )?;
+        self.run_mutation_script(
+            "?[workspace, context, value_object, idx, state, text, vld] := *vo_rule{workspace, context, value_object, idx, state, text @ 'NOW'}, workspace = $ws, state = $st, vld = 'RETRACT' :put vo_rule { workspace, context, value_object, idx, state, vld => text }",
+            params,
+            format!("clear_state retract vo_rule for '{state}'"),
+        )?;
         Ok(())
     }
 
     /// Copy all rows from one state to another via Datalog (with temporal snapshots).
     fn copy_state(&self, workspace: &str, from: &str, to: &str) -> Result<()> {
+        let backup = self.reconstruct_model(workspace, to)?;
         self.clear_state(workspace, to)?;
         let params = params_map(&[("ws", workspace), ("from", from), ("to", to)]);
 
@@ -1600,9 +1631,9 @@ impl Store {
              ?[workspace, context, aggregate, member_kind, member, state] := src[workspace, context, aggregate, member_kind, member], state = $to \
              :put aggregate_member {workspace, context, aggregate, member_kind, member, state}",
             // entity
-            "src[ws, c, n, d, a] := *entity{workspace: ws, context: c, name: n, state: $from, description: d, aggregate_root: a @ 'NOW'}, ws = $ws \
-             ?[workspace, context, name, state, description, aggregate_root] := src[workspace, context, name, description, aggregate_root], state = $to \
-             :put entity {workspace, context, name, state => description, aggregate_root}",
+            "src[ws, c, n, d, a, fp, sl, el] := *entity{workspace: ws, context: c, name: n, state: $from, description: d, aggregate_root: a, file_path: fp, start_line: sl, end_line: el @ 'NOW'}, ws = $ws \
+             ?[workspace, context, name, state, description, aggregate_root, file_path, start_line, end_line] := src[workspace, context, name, description, aggregate_root, file_path, start_line, end_line], state = $to \
+             :put entity {workspace, context, name, state => description, aggregate_root, file_path, start_line, end_line}",
             // policy
             "src[ws, c, n, d, k] := *policy{workspace: ws, context: c, name: n, state: $from, description: d, kind: k @ 'NOW'}, ws = $ws \
              ?[workspace, context, name, state, description, kind] := src[workspace, context, name, description, kind], state = $to \
@@ -1616,25 +1647,25 @@ impl Store {
              ?[workspace, context, name, state, description, source] := src[workspace, context, name, description, source], state = $to \
              :put read_model {workspace, context, name, state => description, source}",
             // service
-            "src[ws, c, n, d, k] := *service{workspace: ws, context: c, name: n, state: $from, description: d, kind: k @ 'NOW'}, ws = $ws \
-             ?[workspace, context, name, state, description, kind] := src[workspace, context, name, description, kind], state = $to \
-             :put service {workspace, context, name, state => description, kind}",
+            "src[ws, c, n, d, k, fp, sl, el] := *service{workspace: ws, context: c, name: n, state: $from, description: d, kind: k, file_path: fp, start_line: sl, end_line: el @ 'NOW'}, ws = $ws \
+             ?[workspace, context, name, state, description, kind, file_path, start_line, end_line] := src[workspace, context, name, description, kind, file_path, start_line, end_line], state = $to \
+             :put service {workspace, context, name, state => description, kind, file_path, start_line, end_line}",
             // service_dep
             "src[ws, c, s, d] := *service_dep{workspace: ws, context: c, service: s, dep: d, state: $from @ 'NOW'}, ws = $ws \
              ?[workspace, context, service, dep, state] := src[workspace, context, service, dep], state = $to \
              :put service_dep {workspace, context, service, dep, state}",
             // event
-            "src[ws, c, n, d, s] := *event{workspace: ws, context: c, name: n, state: $from, description: d, source: s @ 'NOW'}, ws = $ws \
-             ?[workspace, context, name, state, description, source] := src[workspace, context, name, description, source], state = $to \
-             :put event {workspace, context, name, state => description, source}",
+            "src[ws, c, n, d, s, fp, sl, el] := *event{workspace: ws, context: c, name: n, state: $from, description: d, source: s, file_path: fp, start_line: sl, end_line: el @ 'NOW'}, ws = $ws \
+             ?[workspace, context, name, state, description, source, file_path, start_line, end_line] := src[workspace, context, name, description, source, file_path, start_line, end_line], state = $to \
+             :put event {workspace, context, name, state => description, source, file_path, start_line, end_line}",
             // value_object
-            "src[ws, c, n, d] := *value_object{workspace: ws, context: c, name: n, state: $from, description: d @ 'NOW'}, ws = $ws \
-             ?[workspace, context, name, state, description] := src[workspace, context, name, description], state = $to \
-             :put value_object {workspace, context, name, state => description}",
+            "src[ws, c, n, d, fp, sl, el] := *value_object{workspace: ws, context: c, name: n, state: $from, description: d, file_path: fp, start_line: sl, end_line: el @ 'NOW'}, ws = $ws \
+             ?[workspace, context, name, state, description, file_path, start_line, end_line] := src[workspace, context, name, description, file_path, start_line, end_line], state = $to \
+             :put value_object {workspace, context, name, state => description, file_path, start_line, end_line}",
             // repository
-            "src[ws, c, n, a] := *repository{workspace: ws, context: c, name: n, state: $from, aggregate: a @ 'NOW'}, ws = $ws \
-             ?[workspace, context, name, state, aggregate] := src[workspace, context, name, aggregate], state = $to \
-             :put repository {workspace, context, name, state => aggregate}",
+            "src[ws, c, n, a, fp, sl, el] := *repository{workspace: ws, context: c, name: n, state: $from, aggregate: a, file_path: fp, start_line: sl, end_line: el @ 'NOW'}, ws = $ws \
+             ?[workspace, context, name, state, aggregate, file_path, start_line, end_line] := src[workspace, context, name, aggregate, file_path, start_line, end_line], state = $to \
+             :put repository {workspace, context, name, state => aggregate, file_path, start_line, end_line}",
             // external_system
             "src[ws, n, d, k, r] := *external_system{workspace: ws, name: n, state: $from, description: d, kind: k, rationale: r @ 'NOW'}, ws = $ws \
              ?[workspace, name, state, description, kind, rationale] := src[workspace, name, description, kind, rationale], state = $to \
@@ -1713,11 +1744,23 @@ impl Store {
              :put ast_edge {workspace, state, from_node, to_node, edge_type}",
         ];
 
-        for script in scripts {
-            let _ = self
-                .db
-                .run_script(script, params.clone(), ScriptMutability::Mutable);
+        for (index, script) in scripts.iter().enumerate() {
+            if let Err(err) = self.run_mutation_script(
+                script,
+                params.clone(),
+                format!("copy_state {from}->{to} step {}", index + 1),
+            ) {
+                if let Some(model) = backup.as_ref()
+                    && let Err(restore_err) = self.save_state(workspace, model, to)
+                {
+                    return Err(anyhow::anyhow!(
+                        "{err}; rollback to '{to}' failed: {restore_err}"
+                    ));
+                }
+                return Err(err);
+            }
         }
+        self.record_snapshot(workspace, to)?;
         Ok(())
     }
 
@@ -1748,15 +1791,15 @@ impl Store {
             )
             .map_err(|e| anyhow::anyhow!("reconstruct contexts: {:?}", e))?;
 
-        let has_project = proj.as_ref().map(|r| !r.rows.is_empty()).unwrap_or(false);
+        let project_row = proj.as_ref().and_then(|rows| rows.rows.first());
+        let has_project = project_row.is_some();
 
         if ctxs.rows.is_empty() && (state == "actual" || !has_project) {
             return Ok(None);
         }
 
         // Extract project-level metadata
-        let (project_name, description, rules, tech_stack, conventions) = if has_project {
-            let r = &proj.unwrap().rows[0];
+        let (project_name, description, rules, tech_stack, conventions) = if let Some(r) = project_row {
             (
                 dv_str(&r[0]),
                 dv_str(&r[1]),
@@ -1836,9 +1879,9 @@ impl Store {
             let ents = self
                 .db
                 .run_script(
-                    "?[name, description, aggregate_root] := \
+                    "?[name, description, aggregate_root, file_path, start_line, end_line] := \
                         *entity{workspace: $ws, context: $ctx, name, state: $st, \
-                                description, aggregate_root @ 'NOW'}",
+                                description, aggregate_root, file_path, start_line, end_line @ 'NOW'}",
                     params_map(&[("ws", &ws), ("ctx", &ctx_name), ("st", state)]),
                     ScriptMutability::Immutable,
                 )
@@ -1855,9 +1898,9 @@ impl Store {
                         fields: self.query_fields(&ws, &ctx_name, "entity", &ename, state),
                         methods: self.query_methods(&ws, &ctx_name, "entity", &ename, state),
                         invariants: self.query_invariants(&ws, &ctx_name, &ename, state),
-                        file_path: None,
-                        start_line: None,
-                        end_line: None,
+                        file_path: dv_opt_string(&r[3]),
+                        start_line: dv_opt_usize(&r[4]),
+                        end_line: dv_opt_usize(&r[5]),
                     }
                 })
                 .collect();
@@ -1934,9 +1977,9 @@ impl Store {
             let svcs = self
                 .db
                 .run_script(
-                    "?[name, description, kind] := \
+                    "?[name, description, kind, file_path, start_line, end_line] := \
                         *service{workspace: $ws, context: $ctx, name, state: $st, \
-                                 description, kind @ 'NOW'}",
+                                 description, kind, file_path, start_line, end_line @ 'NOW'}",
                     params_map(&[("ws", &ws), ("ctx", &ctx_name), ("st", state)]),
                     ScriptMutability::Immutable,
                 )
@@ -1970,9 +2013,9 @@ impl Store {
                         },
                         methods: self.query_methods(&ws, &ctx_name, "service", &svc_name, state),
                         dependencies: svc_deps.iter().map(|r| dv_str(&r[0])).collect(),
-                        file_path: None,
-                        start_line: None,
-                        end_line: None,
+                        file_path: dv_opt_string(&r[3]),
+                        start_line: dv_opt_usize(&r[4]),
+                        end_line: dv_opt_usize(&r[5]),
                     }
                 })
                 .collect();
@@ -1981,9 +2024,9 @@ impl Store {
             let evts = self
                 .db
                 .run_script(
-                    "?[name, description, source] := \
+                    "?[name, description, source, file_path, start_line, end_line] := \
                         *event{workspace: $ws, context: $ctx, name, state: $st, \
-                               description, source @ 'NOW'}",
+                               description, source, file_path, start_line, end_line @ 'NOW'}",
                     params_map(&[("ws", &ws), ("ctx", &ctx_name), ("st", state)]),
                     ScriptMutability::Immutable,
                 )
@@ -2014,9 +2057,9 @@ impl Store {
                         description: dv_str(&r[1]),
                         source: dv_str(&r[2]),
                         fields: self.query_fields(&ws, &ctx_name, "event", &ename, state),
-                        file_path: None,
-                        start_line: None,
-                        end_line: None,
+                        file_path: dv_opt_string(&r[3]),
+                        start_line: dv_opt_usize(&r[4]),
+                        end_line: dv_opt_usize(&r[5]),
                     }
                 })
                 .collect();
@@ -2025,8 +2068,8 @@ impl Store {
             let vos = self
                 .db
                 .run_script(
-                    "?[name, description] := \
-                        *value_object{workspace: $ws, context: $ctx, name, state: $st, description @ 'NOW'}",
+                    "?[name, description, file_path, start_line, end_line] := \
+                        *value_object{workspace: $ws, context: $ctx, name, state: $st, description, file_path, start_line, end_line @ 'NOW'}",
                     params_map(&[("ws", &ws), ("ctx", &ctx_name), ("st", state)]),
                     ScriptMutability::Immutable,
                 )
@@ -2041,9 +2084,9 @@ impl Store {
                         description: dv_str(&r[1]),
                         fields: self.query_fields(&ws, &ctx_name, "value_object", &voname, state),
                         validation_rules: self.query_vo_rules(&ws, &ctx_name, &voname, state),
-                        file_path: None,
-                        start_line: None,
-                        end_line: None,
+                        file_path: dv_opt_string(&r[2]),
+                        start_line: dv_opt_usize(&r[3]),
+                        end_line: dv_opt_usize(&r[4]),
                     }
                 })
                 .collect();
@@ -2052,8 +2095,8 @@ impl Store {
             let repos = self
                 .db
                 .run_script(
-                    "?[name, aggregate] := \
-                        *repository{workspace: $ws, context: $ctx, name, state: $st, aggregate @ 'NOW'}",
+                    "?[name, aggregate, file_path, start_line, end_line] := \
+                        *repository{workspace: $ws, context: $ctx, name, state: $st, aggregate, file_path, start_line, end_line @ 'NOW'}",
                     params_map(&[("ws", &ws), ("ctx", &ctx_name), ("st", state)]),
                     ScriptMutability::Immutable,
                 )
@@ -2067,9 +2110,9 @@ impl Store {
                         name: rname.clone(),
                         aggregate: dv_str(&r[1]),
                         methods: self.query_methods(&ws, &ctx_name, "repository", &rname, state),
-                        file_path: None,
-                        start_line: None,
-                        end_line: None,
+                        file_path: dv_opt_string(&r[2]),
+                        start_line: dv_opt_usize(&r[3]),
+                        end_line: dv_opt_usize(&r[4]),
                     }
                 })
                 .collect();
@@ -2275,7 +2318,7 @@ impl Store {
     pub fn query_entity(&self, ws: &str, ctx: &str, name: &str) -> Option<Entity> {
         let ws = canonicalize_path(ws);
         let rows = self.db.run_script(
-            "?[description, aggregate_root] := *entity{workspace: $ws, context: $ctx, name: $name, state: 'desired', description, aggregate_root @ 'NOW'}",
+            "?[description, aggregate_root, file_path, start_line, end_line] := *entity{workspace: $ws, context: $ctx, name: $name, state: 'desired', description, aggregate_root, file_path, start_line, end_line @ 'NOW'}",
             params_map(&[("ws", &ws), ("ctx", ctx), ("name", name)]),
             ScriptMutability::Immutable,
         ).ok()?.rows;
@@ -2287,16 +2330,16 @@ impl Store {
             fields: self.query_fields(&ws, ctx, "entity", name, "desired"),
             methods: self.query_methods(&ws, ctx, "entity", name, "desired"),
             invariants: self.query_invariants(&ws, ctx, name, "desired"),
-            file_path: None,
-            start_line: None,
-            end_line: None,
+            file_path: dv_opt_string(&row[2]),
+            start_line: dv_opt_usize(&row[3]),
+            end_line: dv_opt_usize(&row[4]),
         })
     }
 
     pub fn query_service(&self, ws: &str, ctx: &str, name: &str) -> Option<Service> {
         let ws = canonicalize_path(ws);
         let rows = self.db.run_script(
-            "?[description, kind] := *service{workspace: $ws, context: $ctx, name: $name, state: 'desired', description, kind @ 'NOW'}",
+            "?[description, kind, file_path, start_line, end_line] := *service{workspace: $ws, context: $ctx, name: $name, state: 'desired', description, kind, file_path, start_line, end_line @ 'NOW'}",
             params_map(&[("ws", &ws), ("ctx", ctx), ("name", name)]),
             ScriptMutability::Immutable,
         ).ok()?.rows;
@@ -2316,16 +2359,16 @@ impl Store {
             },
             methods: self.query_methods(&ws, ctx, "service", name, "desired"),
             dependencies: dep_rows.iter().map(|r| dv_str(&r[0])).collect(),
-            file_path: None,
-            start_line: None,
-            end_line: None,
+            file_path: dv_opt_string(&row[2]),
+            start_line: dv_opt_usize(&row[3]),
+            end_line: dv_opt_usize(&row[4]),
         })
     }
 
     pub fn query_event(&self, ws: &str, ctx: &str, name: &str) -> Option<DomainEvent> {
         let ws = canonicalize_path(ws);
         let rows = self.db.run_script(
-            "?[description, source] := *event{workspace: $ws, context: $ctx, name: $name, state: 'desired', description, source @ 'NOW'}",
+            "?[description, source, file_path, start_line, end_line] := *event{workspace: $ws, context: $ctx, name: $name, state: 'desired', description, source, file_path, start_line, end_line @ 'NOW'}",
             params_map(&[("ws", &ws), ("ctx", ctx), ("name", name)]),
             ScriptMutability::Immutable,
         ).ok()?.rows;
@@ -2335,16 +2378,16 @@ impl Store {
             description: dv_str(&row[0]),
             fields: self.query_fields(&ws, ctx, "event", name, "desired"),
             source: dv_str(&row[1]),
-            file_path: None,
-            start_line: None,
-            end_line: None,
+            file_path: dv_opt_string(&row[2]),
+            start_line: dv_opt_usize(&row[3]),
+            end_line: dv_opt_usize(&row[4]),
         })
     }
 
     pub fn query_value_object(&self, ws: &str, ctx: &str, name: &str) -> Option<ValueObject> {
         let ws = canonicalize_path(ws);
         let rows = self.db.run_script(
-            "?[description] := *value_object{workspace: $ws, context: $ctx, name: $name, state: 'desired', description @ 'NOW'}",
+            "?[description, file_path, start_line, end_line] := *value_object{workspace: $ws, context: $ctx, name: $name, state: 'desired', description, file_path, start_line, end_line @ 'NOW'}",
             params_map(&[("ws", &ws), ("ctx", ctx), ("name", name)]),
             ScriptMutability::Immutable,
         ).ok()?.rows;
@@ -2354,16 +2397,16 @@ impl Store {
             description: dv_str(&row[0]),
             fields: self.query_fields(&ws, ctx, "value_object", name, "desired"),
             validation_rules: self.query_vo_rules(&ws, ctx, name, "desired"),
-            file_path: None,
-            start_line: None,
-            end_line: None,
+            file_path: dv_opt_string(&row[1]),
+            start_line: dv_opt_usize(&row[2]),
+            end_line: dv_opt_usize(&row[3]),
         })
     }
 
     pub fn query_repository(&self, ws: &str, ctx: &str, name: &str) -> Option<Repository> {
         let ws = canonicalize_path(ws);
         let rows = self.db.run_script(
-            "?[aggregate] := *repository{workspace: $ws, context: $ctx, name: $name, state: 'desired', aggregate @ 'NOW'}",
+            "?[aggregate, file_path, start_line, end_line] := *repository{workspace: $ws, context: $ctx, name: $name, state: 'desired', aggregate, file_path, start_line, end_line @ 'NOW'}",
             params_map(&[("ws", &ws), ("ctx", ctx), ("name", name)]),
             ScriptMutability::Immutable,
         ).ok()?.rows;
@@ -2372,9 +2415,9 @@ impl Store {
             name: name.to_string(),
             aggregate: dv_str(&row[0]),
             methods: self.query_methods(&ws, ctx, "repository", name, "desired"),
-            file_path: None,
-            start_line: None,
-            end_line: None,
+            file_path: dv_opt_string(&row[1]),
+            start_line: dv_opt_usize(&row[2]),
+            end_line: dv_opt_usize(&row[3]),
         })
     }
 
@@ -2539,11 +2582,11 @@ impl Store {
             params_map(&[("ws", &ws), ("name", name), ("desc", description), ("mp", module_path)]),
             ScriptMutability::Mutable,
         ).map_err(|e| anyhow::anyhow!("upsert_context: {:?}", e))?;
-        let _ = self.db.run_script(
+        self.run_mutation_script(
             "?[workspace, from_ctx, to_ctx, state, vld] := *context_dep{workspace, from_ctx, to_ctx, state @ 'NOW'}, workspace = $ws, from_ctx = $name, state = 'desired', vld = 'RETRACT' :put context_dep { workspace, from_ctx, to_ctx, state, vld }",
             params_map(&[("ws", &ws), ("name", name)]),
-            ScriptMutability::Mutable,
-        );
+            format!("retract context dependencies for {name}"),
+        )?;
         for dep in dependencies {
             self.db.run_script(
                 "?[workspace, from_ctx, to_ctx, state] <- [[$ws, $from, $to, 'desired']] :put context_dep { workspace, from_ctx, to_ctx, state }",
@@ -2566,17 +2609,17 @@ impl Store {
         if !exists {
             return Ok(false);
         }
-        let _ = self.db.run_script(
+        self.run_mutation_script(
             "?[workspace, from_ctx, to_ctx, state, vld] := *context_dep{workspace, from_ctx, to_ctx, state @ 'NOW'}, workspace = $ws, from_ctx = $name, state = 'desired', vld = 'RETRACT' :put context_dep { workspace, from_ctx, to_ctx, state, vld }",
             p.clone(),
-            ScriptMutability::Mutable,
-        );
-        let _ = self.db.run_script(
+            format!("remove outgoing context dependencies for {name}"),
+        )?;
+        self.run_mutation_script(
             "?[workspace, from_ctx, to_ctx, state, vld] := *context_dep{workspace, from_ctx, to_ctx, state @ 'NOW'}, workspace = $ws, to_ctx = $name, state = 'desired', vld = 'RETRACT' :put context_dep { workspace, from_ctx, to_ctx, state, vld }",
             p.clone(),
-            ScriptMutability::Mutable,
-        );
-        self.remove_owner_meta(&ws, name, "context", name);
+            format!("remove incoming context dependencies for {name}"),
+        )?;
+        self.remove_owner_meta(&ws, name, "context", name)?;
         self.db.run_script(
             "?[workspace, name, state, vld] := workspace = $ws, name = $name, state = 'desired', vld = 'RETRACT' :put context { workspace, name, state, vld }",
             p,
@@ -2598,8 +2641,14 @@ impl Store {
             "aggregate_root".into(),
             cozo::DataValue::Bool(entity.aggregate_root),
         );
+        params.insert(
+            "file".into(),
+            cozo::DataValue::Str(entity.file_path.as_deref().unwrap_or("").into()),
+        );
+        params.insert("sl".into(), int_dv(entity.start_line.unwrap_or(0) as i64));
+        params.insert("el".into(), int_dv(entity.end_line.unwrap_or(0) as i64));
         self.db.run_script(
-            "?[workspace, context, name, state, description, aggregate_root] <- [[$ws, $ctx, $name, 'desired', $desc, $aggregate_root]] :put entity { workspace, context, name, state => description, aggregate_root }",
+            "?[workspace, context, name, state, description, aggregate_root, file_path, start_line, end_line] <- [[$ws, $ctx, $name, 'desired', $desc, $aggregate_root, $file, $sl, $el]] :put entity { workspace, context, name, state => description, aggregate_root, file_path, start_line, end_line }",
             params,
             ScriptMutability::Mutable,
         ).map_err(|e| anyhow::anyhow!("upsert_entity: {:?}", e))?;
@@ -2620,10 +2669,10 @@ impl Store {
         if !exists {
             return Ok(false);
         }
-        let _ = self.db.run_script("?[workspace, context, owner_kind, owner, name, state, vld] := *field{workspace, context, owner_kind, owner, name, state @ 'NOW'}, workspace = $ws, context = $ctx, owner_kind = 'entity', owner = $name, state = 'desired', vld = 'RETRACT' :put field { workspace, context, owner_kind, owner, name, state, vld }", p.clone(), ScriptMutability::Mutable);
-        let _ = self.db.run_script("?[workspace, context, owner_kind, owner, name, state, vld] := *method{workspace, context, owner_kind, owner, name, state @ 'NOW'}, workspace = $ws, context = $ctx, owner_kind = 'entity', owner = $name, state = 'desired', vld = 'RETRACT' :put method { workspace, context, owner_kind, owner, name, state, vld }", p.clone(), ScriptMutability::Mutable);
-        let _ = self.db.run_script("?[workspace, context, owner_kind, owner, method, name, state, vld] := *method_param{workspace, context, owner_kind, owner, method, name, state @ 'NOW'}, workspace = $ws, context = $ctx, owner_kind = 'entity', owner = $name, state = 'desired', vld = 'RETRACT' :put method_param { workspace, context, owner_kind, owner, method, name, state, vld }", p.clone(), ScriptMutability::Mutable);
-        let _ = self.db.run_script("?[workspace, context, entity, idx, state, vld] := *invariant{workspace, context, entity, idx, state @ 'NOW'}, workspace = $ws, context = $ctx, entity = $name, state = 'desired', vld = 'RETRACT' :put invariant { workspace, context, entity, idx, state, vld }", p.clone(), ScriptMutability::Mutable);
+        self.run_mutation_script("?[workspace, context, owner_kind, owner, name, state, vld] := *field{workspace, context, owner_kind, owner, name, state @ 'NOW'}, workspace = $ws, context = $ctx, owner_kind = 'entity', owner = $name, state = 'desired', vld = 'RETRACT' :put field { workspace, context, owner_kind, owner, name, state, vld }", p.clone(), format!("remove entity fields for {name}"))?;
+        self.run_mutation_script("?[workspace, context, owner_kind, owner, name, state, vld] := *method{workspace, context, owner_kind, owner, name, state @ 'NOW'}, workspace = $ws, context = $ctx, owner_kind = 'entity', owner = $name, state = 'desired', vld = 'RETRACT' :put method { workspace, context, owner_kind, owner, name, state, vld }", p.clone(), format!("remove entity methods for {name}"))?;
+        self.run_mutation_script("?[workspace, context, owner_kind, owner, method, name, state, vld] := *method_param{workspace, context, owner_kind, owner, method, name, state @ 'NOW'}, workspace = $ws, context = $ctx, owner_kind = 'entity', owner = $name, state = 'desired', vld = 'RETRACT' :put method_param { workspace, context, owner_kind, owner, method, name, state, vld }", p.clone(), format!("remove entity method params for {name}"))?;
+        self.run_mutation_script("?[workspace, context, entity, idx, state, text, vld] := *invariant{workspace, context, entity, idx, state, text @ 'NOW'}, workspace = $ws, context = $ctx, entity = $name, state = 'desired', vld = 'RETRACT' :put invariant { workspace, context, entity, idx, state, vld => text }", p.clone(), format!("remove entity invariants for {name}"))?;
         self.db.run_script("?[workspace, context, name, state, vld] := workspace = $ws, context = $ctx, name = $name, state = 'desired', vld = 'RETRACT' :put entity { workspace, context, name, state, vld }", p, ScriptMutability::Mutable).map_err(|e| anyhow::anyhow!("remove_entity: {:?}", e))?;
         Ok(true)
     }
@@ -2688,9 +2737,16 @@ impl Store {
             ServiceKind::Infrastructure => "infrastructure",
             ServiceKind::Domain => "domain",
         };
+        let mut params = params_map(&[("ws", &ws), ("ctx", ctx), ("name", &service.name), ("desc", &service.description), ("kind", kind)]);
+        params.insert(
+            "file".into(),
+            cozo::DataValue::Str(service.file_path.as_deref().unwrap_or("").into()),
+        );
+        params.insert("sl".into(), int_dv(service.start_line.unwrap_or(0) as i64));
+        params.insert("el".into(), int_dv(service.end_line.unwrap_or(0) as i64));
         self.db.run_script(
-            "?[workspace, context, name, state, description, kind] <- [[$ws, $ctx, $name, 'desired', $desc, $kind]] :put service { workspace, context, name, state => description, kind }",
-            params_map(&[("ws", &ws), ("ctx", ctx), ("name", &service.name), ("desc", &service.description), ("kind", kind)]),
+            "?[workspace, context, name, state, description, kind, file_path, start_line, end_line] <- [[$ws, $ctx, $name, 'desired', $desc, $kind, $file, $sl, $el]] :put service { workspace, context, name, state => description, kind, file_path, start_line, end_line }",
+            params,
             ScriptMutability::Mutable,
         ).map_err(|e| anyhow::anyhow!("upsert_service: {:?}", e))?;
         self.replace_owner_methods(&ws, ctx, "service", &service.name, &service.methods)?;
@@ -2705,9 +2761,9 @@ impl Store {
         if !exists {
             return Ok(false);
         }
-        let _ = self.db.run_script("?[workspace, context, owner_kind, owner, name, state, vld] := *method{workspace, context, owner_kind, owner, name, state @ 'NOW'}, workspace = $ws, context = $ctx, owner_kind = 'service', owner = $name, state = 'desired', vld = 'RETRACT' :put method { workspace, context, owner_kind, owner, name, state, vld }", p.clone(), ScriptMutability::Mutable);
-        let _ = self.db.run_script("?[workspace, context, owner_kind, owner, method, name, state, vld] := *method_param{workspace, context, owner_kind, owner, method, name, state @ 'NOW'}, workspace = $ws, context = $ctx, owner_kind = 'service', owner = $name, state = 'desired', vld = 'RETRACT' :put method_param { workspace, context, owner_kind, owner, method, name, state, vld }", p.clone(), ScriptMutability::Mutable);
-        let _ = self.db.run_script("?[workspace, context, service, dep, state, vld] := *service_dep{workspace, context, service, dep, state @ 'NOW'}, workspace = $ws, context = $ctx, service = $name, state = 'desired', vld = 'RETRACT' :put service_dep { workspace, context, service, dep, state, vld }", p.clone(), ScriptMutability::Mutable);
+        self.run_mutation_script("?[workspace, context, owner_kind, owner, name, state, vld] := *method{workspace, context, owner_kind, owner, name, state @ 'NOW'}, workspace = $ws, context = $ctx, owner_kind = 'service', owner = $name, state = 'desired', vld = 'RETRACT' :put method { workspace, context, owner_kind, owner, name, state, vld }", p.clone(), format!("remove service methods for {name}"))?;
+        self.run_mutation_script("?[workspace, context, owner_kind, owner, method, name, state, vld] := *method_param{workspace, context, owner_kind, owner, method, name, state @ 'NOW'}, workspace = $ws, context = $ctx, owner_kind = 'service', owner = $name, state = 'desired', vld = 'RETRACT' :put method_param { workspace, context, owner_kind, owner, method, name, state, vld }", p.clone(), format!("remove service method params for {name}"))?;
+        self.run_mutation_script("?[workspace, context, service, dep, state, vld] := *service_dep{workspace, context, service, dep, state @ 'NOW'}, workspace = $ws, context = $ctx, service = $name, state = 'desired', vld = 'RETRACT' :put service_dep { workspace, context, service, dep, state, vld }", p.clone(), format!("remove service dependencies for {name}"))?;
         self.db.run_script("?[workspace, context, name, state, vld] := workspace = $ws, context = $ctx, name = $name, state = 'desired', vld = 'RETRACT' :put service { workspace, context, name, state, vld }", p, ScriptMutability::Mutable).map_err(|e| anyhow::anyhow!("remove_service: {:?}", e))?;
         Ok(true)
     }
@@ -2715,9 +2771,16 @@ impl Store {
     pub fn upsert_event(&self, workspace_path: &str, ctx: &str, event: &DomainEvent) -> Result<()> {
         let ws = canonicalize_path(workspace_path);
         self.ensure_project(workspace_path)?;
+        let mut params = params_map(&[("ws", &ws), ("ctx", ctx), ("name", &event.name), ("desc", &event.description), ("source", &event.source)]);
+        params.insert(
+            "file".into(),
+            cozo::DataValue::Str(event.file_path.as_deref().unwrap_or("").into()),
+        );
+        params.insert("sl".into(), int_dv(event.start_line.unwrap_or(0) as i64));
+        params.insert("el".into(), int_dv(event.end_line.unwrap_or(0) as i64));
         self.db.run_script(
-            "?[workspace, context, name, state, description, source] <- [[$ws, $ctx, $name, 'desired', $desc, $source]] :put event { workspace, context, name, state => description, source }",
-            params_map(&[("ws", &ws), ("ctx", ctx), ("name", &event.name), ("desc", &event.description), ("source", &event.source)]),
+            "?[workspace, context, name, state, description, source, file_path, start_line, end_line] <- [[$ws, $ctx, $name, 'desired', $desc, $source, $file, $sl, $el]] :put event { workspace, context, name, state => description, source, file_path, start_line, end_line }",
+            params,
             ScriptMutability::Mutable,
         ).map_err(|e| anyhow::anyhow!("upsert_event: {:?}", e))?;
         self.replace_owner_fields(&ws, ctx, "event", &event.name, &event.fields)?;
@@ -2731,7 +2794,7 @@ impl Store {
         if !exists {
             return Ok(false);
         }
-        let _ = self.db.run_script("?[workspace, context, owner_kind, owner, name, state, vld] := *field{workspace, context, owner_kind, owner, name, state @ 'NOW'}, workspace = $ws, context = $ctx, owner_kind = 'event', owner = $name, state = 'desired', vld = 'RETRACT' :put field { workspace, context, owner_kind, owner, name, state, vld }", p.clone(), ScriptMutability::Mutable);
+        self.run_mutation_script("?[workspace, context, owner_kind, owner, name, state, vld] := *field{workspace, context, owner_kind, owner, name, state @ 'NOW'}, workspace = $ws, context = $ctx, owner_kind = 'event', owner = $name, state = 'desired', vld = 'RETRACT' :put field { workspace, context, owner_kind, owner, name, state, vld }", p.clone(), format!("remove event fields for {name}"))?;
         self.db.run_script("?[workspace, context, name, state, vld] := workspace = $ws, context = $ctx, name = $name, state = 'desired', vld = 'RETRACT' :put event { workspace, context, name, state, vld }", p, ScriptMutability::Mutable).map_err(|e| anyhow::anyhow!("remove_event: {:?}", e))?;
         Ok(true)
     }
@@ -2744,9 +2807,16 @@ impl Store {
     ) -> Result<()> {
         let ws = canonicalize_path(workspace_path);
         self.ensure_project(workspace_path)?;
+        let mut params = params_map(&[("ws", &ws), ("ctx", ctx), ("name", &value_object.name), ("desc", &value_object.description)]);
+        params.insert(
+            "file".into(),
+            cozo::DataValue::Str(value_object.file_path.as_deref().unwrap_or("").into()),
+        );
+        params.insert("sl".into(), int_dv(value_object.start_line.unwrap_or(0) as i64));
+        params.insert("el".into(), int_dv(value_object.end_line.unwrap_or(0) as i64));
         self.db.run_script(
-            "?[workspace, context, name, state, description] <- [[$ws, $ctx, $name, 'desired', $desc]] :put value_object { workspace, context, name, state => description }",
-            params_map(&[("ws", &ws), ("ctx", ctx), ("name", &value_object.name), ("desc", &value_object.description)]),
+            "?[workspace, context, name, state, description, file_path, start_line, end_line] <- [[$ws, $ctx, $name, 'desired', $desc, $file, $sl, $el]] :put value_object { workspace, context, name, state => description, file_path, start_line, end_line }",
+            params,
             ScriptMutability::Mutable,
         ).map_err(|e| anyhow::anyhow!("upsert_value_object: {:?}", e))?;
         self.replace_owner_fields(
@@ -2767,8 +2837,8 @@ impl Store {
         if !exists {
             return Ok(false);
         }
-        let _ = self.db.run_script("?[workspace, context, owner_kind, owner, name, state, vld] := *field{workspace, context, owner_kind, owner, name, state @ 'NOW'}, workspace = $ws, context = $ctx, owner_kind = 'value_object', owner = $name, state = 'desired', vld = 'RETRACT' :put field { workspace, context, owner_kind, owner, name, state, vld }", p.clone(), ScriptMutability::Mutable);
-        let _ = self.db.run_script("?[workspace, context, value_object, idx, state, vld] := *vo_rule{workspace, context, value_object, idx, state @ 'NOW'}, workspace = $ws, context = $ctx, value_object = $name, state = 'desired', vld = 'RETRACT' :put vo_rule { workspace, context, value_object, idx, state, vld }", p.clone(), ScriptMutability::Mutable);
+        self.run_mutation_script("?[workspace, context, owner_kind, owner, name, state, vld] := *field{workspace, context, owner_kind, owner, name, state @ 'NOW'}, workspace = $ws, context = $ctx, owner_kind = 'value_object', owner = $name, state = 'desired', vld = 'RETRACT' :put field { workspace, context, owner_kind, owner, name, state, vld }", p.clone(), format!("remove value object fields for {name}"))?;
+        self.run_mutation_script("?[workspace, context, value_object, idx, state, text, vld] := *vo_rule{workspace, context, value_object, idx, state, text @ 'NOW'}, workspace = $ws, context = $ctx, value_object = $name, state = 'desired', vld = 'RETRACT' :put vo_rule { workspace, context, value_object, idx, state, vld => text }", p.clone(), format!("remove value object rules for {name}"))?;
         self.db.run_script("?[workspace, context, name, state, vld] := workspace = $ws, context = $ctx, name = $name, state = 'desired', vld = 'RETRACT' :put value_object { workspace, context, name, state, vld }", p, ScriptMutability::Mutable).map_err(|e| anyhow::anyhow!("remove_value_object: {:?}", e))?;
         Ok(true)
     }
@@ -2781,9 +2851,16 @@ impl Store {
     ) -> Result<()> {
         let ws = canonicalize_path(workspace_path);
         self.ensure_project(workspace_path)?;
+        let mut params = params_map(&[("ws", &ws), ("ctx", ctx), ("name", &repository.name), ("aggregate", &repository.aggregate)]);
+        params.insert(
+            "file".into(),
+            cozo::DataValue::Str(repository.file_path.as_deref().unwrap_or("").into()),
+        );
+        params.insert("sl".into(), int_dv(repository.start_line.unwrap_or(0) as i64));
+        params.insert("el".into(), int_dv(repository.end_line.unwrap_or(0) as i64));
         self.db.run_script(
-            "?[workspace, context, name, state, aggregate] <- [[$ws, $ctx, $name, 'desired', $aggregate]] :put repository { workspace, context, name, state => aggregate }",
-            params_map(&[("ws", &ws), ("ctx", ctx), ("name", &repository.name), ("aggregate", &repository.aggregate)]),
+            "?[workspace, context, name, state, aggregate, file_path, start_line, end_line] <- [[$ws, $ctx, $name, 'desired', $aggregate, $file, $sl, $el]] :put repository { workspace, context, name, state => aggregate, file_path, start_line, end_line }",
+            params,
             ScriptMutability::Mutable,
         ).map_err(|e| anyhow::anyhow!("upsert_repository: {:?}", e))?;
         self.replace_owner_methods(
@@ -2803,8 +2880,8 @@ impl Store {
         if !exists {
             return Ok(false);
         }
-        let _ = self.db.run_script("?[workspace, context, owner_kind, owner, name, state, vld] := *method{workspace, context, owner_kind, owner, name, state @ 'NOW'}, workspace = $ws, context = $ctx, owner_kind = 'repository', owner = $name, state = 'desired', vld = 'RETRACT' :put method { workspace, context, owner_kind, owner, name, state, vld }", p.clone(), ScriptMutability::Mutable);
-        let _ = self.db.run_script("?[workspace, context, owner_kind, owner, method, name, state, vld] := *method_param{workspace, context, owner_kind, owner, method, name, state @ 'NOW'}, workspace = $ws, context = $ctx, owner_kind = 'repository', owner = $name, state = 'desired', vld = 'RETRACT' :put method_param { workspace, context, owner_kind, owner, method, name, state, vld }", p.clone(), ScriptMutability::Mutable);
+        self.run_mutation_script("?[workspace, context, owner_kind, owner, name, state, vld] := *method{workspace, context, owner_kind, owner, name, state @ 'NOW'}, workspace = $ws, context = $ctx, owner_kind = 'repository', owner = $name, state = 'desired', vld = 'RETRACT' :put method { workspace, context, owner_kind, owner, name, state, vld }", p.clone(), format!("remove repository methods for {name}"))?;
+        self.run_mutation_script("?[workspace, context, owner_kind, owner, method, name, state, vld] := *method_param{workspace, context, owner_kind, owner, method, name, state @ 'NOW'}, workspace = $ws, context = $ctx, owner_kind = 'repository', owner = $name, state = 'desired', vld = 'RETRACT' :put method_param { workspace, context, owner_kind, owner, method, name, state, vld }", p.clone(), format!("remove repository method params for {name}"))?;
         self.db.run_script("?[workspace, context, name, state, vld] := workspace = $ws, context = $ctx, name = $name, state = 'desired', vld = 'RETRACT' :put repository { workspace, context, name, state, vld }", p, ScriptMutability::Mutable).map_err(|e| anyhow::anyhow!("remove_repository: {:?}", e))?;
         Ok(true)
     }
@@ -2885,11 +2962,11 @@ impl Store {
             &aggregate.ownership,
             "desired",
         )?;
-        let _ = self.db.run_script(
+        self.run_mutation_script(
             "?[workspace, context, aggregate, member_kind, member, state, vld] := *aggregate_member{workspace, context, aggregate, member_kind, member, state @ 'NOW'}, workspace = $ws, context = $ctx, aggregate = $name, state = 'desired', vld = 'RETRACT' :put aggregate_member { workspace, context, aggregate, member_kind, member, state, vld }",
             params_map(&[("ws", &ws), ("ctx", ctx), ("name", &aggregate.name)]),
-            ScriptMutability::Mutable,
-        );
+            format!("retract aggregate members for {}", aggregate.name),
+        )?;
         for entity in &aggregate.entities {
             self.db.run_script("?[workspace, context, aggregate, member_kind, member, state] <- [[$ws, $ctx, $name, 'entity', $member, 'desired']] :put aggregate_member { workspace, context, aggregate, member_kind, member, state }", params_map(&[("ws", &ws), ("ctx", ctx), ("name", &aggregate.name), ("member", entity)]), ScriptMutability::Mutable).map_err(|e| anyhow::anyhow!("upsert_aggregate entity: {:?}", e))?;
         }
@@ -2906,8 +2983,8 @@ impl Store {
         if !exists {
             return Ok(false);
         }
-        let _ = self.db.run_script("?[workspace, context, aggregate, member_kind, member, state, vld] := *aggregate_member{workspace, context, aggregate, member_kind, member, state @ 'NOW'}, workspace = $ws, context = $ctx, aggregate = $name, state = 'desired', vld = 'RETRACT' :put aggregate_member { workspace, context, aggregate, member_kind, member, state, vld }", p.clone(), ScriptMutability::Mutable);
-        self.remove_owner_meta(&ws, ctx, "aggregate", name);
+        self.run_mutation_script("?[workspace, context, aggregate, member_kind, member, state, vld] := *aggregate_member{workspace, context, aggregate, member_kind, member, state @ 'NOW'}, workspace = $ws, context = $ctx, aggregate = $name, state = 'desired', vld = 'RETRACT' :put aggregate_member { workspace, context, aggregate, member_kind, member, state, vld }", p.clone(), format!("remove aggregate members for {name}"))?;
+        self.remove_owner_meta(&ws, ctx, "aggregate", name)?;
         self.db.run_script("?[workspace, context, name, state, vld] := workspace = $ws, context = $ctx, name = $name, state = 'desired', vld = 'RETRACT' :put aggregate { workspace, context, name, state, vld }", p, ScriptMutability::Mutable).map_err(|e| anyhow::anyhow!("remove_aggregate: {:?}", e))?;
         Ok(true)
     }
@@ -2924,7 +3001,7 @@ impl Store {
             &policy.ownership,
             "desired",
         )?;
-        let _ = self.db.run_script("?[workspace, context, policy, link_kind, link, idx, state, vld] := *policy_link{workspace, context, policy, link_kind, link, idx, state @ 'NOW'}, workspace = $ws, context = $ctx, policy = $name, state = 'desired', vld = 'RETRACT' :put policy_link { workspace, context, policy, link_kind, link, idx, state, vld }", params_map(&[("ws", &ws), ("ctx", ctx), ("name", &policy.name)]), ScriptMutability::Mutable);
+        self.run_mutation_script("?[workspace, context, policy, link_kind, link, idx, state, vld] := *policy_link{workspace, context, policy, link_kind, link, idx, state @ 'NOW'}, workspace = $ws, context = $ctx, policy = $name, state = 'desired', vld = 'RETRACT' :put policy_link { workspace, context, policy, link_kind, link, idx, state, vld }", params_map(&[("ws", &ws), ("ctx", ctx), ("name", &policy.name)]), format!("retract policy links for {}", policy.name))?;
         for (idx, trigger) in policy.triggers.iter().enumerate() {
             let mut p = params_map(&[
                 ("ws", &ws),
@@ -2955,8 +3032,8 @@ impl Store {
         if !exists {
             return Ok(false);
         }
-        let _ = self.db.run_script("?[workspace, context, policy, link_kind, link, idx, state, vld] := *policy_link{workspace, context, policy, link_kind, link, idx, state @ 'NOW'}, workspace = $ws, context = $ctx, policy = $name, state = 'desired', vld = 'RETRACT' :put policy_link { workspace, context, policy, link_kind, link, idx, state, vld }", p.clone(), ScriptMutability::Mutable);
-        self.remove_owner_meta(&ws, ctx, "policy", name);
+        self.run_mutation_script("?[workspace, context, policy, link_kind, link, idx, state, vld] := *policy_link{workspace, context, policy, link_kind, link, idx, state @ 'NOW'}, workspace = $ws, context = $ctx, policy = $name, state = 'desired', vld = 'RETRACT' :put policy_link { workspace, context, policy, link_kind, link, idx, state, vld }", p.clone(), format!("remove policy links for {name}"))?;
+        self.remove_owner_meta(&ws, ctx, "policy", name)?;
         self.db.run_script("?[workspace, context, name, state, vld] := workspace = $ws, context = $ctx, name = $name, state = 'desired', vld = 'RETRACT' :put policy { workspace, context, name, state, vld }", p, ScriptMutability::Mutable).map_err(|e| anyhow::anyhow!("remove_policy: {:?}", e))?;
         Ok(true)
     }
@@ -2988,8 +3065,8 @@ impl Store {
         if !exists {
             return Ok(false);
         }
-        self.remove_owner_meta(&ws, ctx, "read_model", name);
-        let _ = self.db.run_script("?[workspace, context, owner_kind, owner, name, state, vld] := *field{workspace, context, owner_kind, owner, name, state @ 'NOW'}, workspace = $ws, context = $ctx, owner_kind = 'read_model', owner = $name, state = 'desired', vld = 'RETRACT' :put field { workspace, context, owner_kind, owner, name, state, vld }", p.clone(), ScriptMutability::Mutable);
+        self.remove_owner_meta(&ws, ctx, "read_model", name)?;
+        self.run_mutation_script("?[workspace, context, owner_kind, owner, name, state, vld] := *field{workspace, context, owner_kind, owner, name, state @ 'NOW'}, workspace = $ws, context = $ctx, owner_kind = 'read_model', owner = $name, state = 'desired', vld = 'RETRACT' :put field { workspace, context, owner_kind, owner, name, state, vld }", p.clone(), format!("remove read model fields for {name}"))?;
         self.db.run_script("?[workspace, context, name, state, vld] := workspace = $ws, context = $ctx, name = $name, state = 'desired', vld = 'RETRACT' :put read_model { workspace, context, name, state, vld }", p, ScriptMutability::Mutable).map_err(|e| anyhow::anyhow!("remove_read_model: {:?}", e))?;
         Ok(true)
     }
@@ -3009,7 +3086,7 @@ impl Store {
             &system.ownership,
             "desired",
         )?;
-        let _ = self.db.run_script("?[workspace, system, context, idx, state, vld] := *external_system_context{workspace, system, context, idx, state @ 'NOW'}, workspace = $ws, system = $name, state = 'desired', vld = 'RETRACT' :put external_system_context { workspace, system, context, idx, state, vld }", params_map(&[("ws", &ws), ("name", &system.name)]), ScriptMutability::Mutable);
+        self.run_mutation_script("?[workspace, system, context, idx, state, vld] := *external_system_context{workspace, system, context, idx, state @ 'NOW'}, workspace = $ws, system = $name, state = 'desired', vld = 'RETRACT' :put external_system_context { workspace, system, context, idx, state, vld }", params_map(&[("ws", &ws), ("name", &system.name)]), format!("retract external system contexts for {}", system.name))?;
         for (idx, ctx) in system.consumed_by_contexts.iter().enumerate() {
             let mut p = params_map(&[("ws", &ws), ("name", &system.name), ("ctx", ctx)]);
             p.insert("idx".into(), int_dv(idx as i64));
@@ -3025,8 +3102,8 @@ impl Store {
         if !exists {
             return Ok(false);
         }
-        self.remove_owner_meta(&ws, "", "external_system", name);
-        let _ = self.db.run_script("?[workspace, system, context, idx, state, vld] := *external_system_context{workspace, system, context, idx, state @ 'NOW'}, workspace = $ws, system = $name, state = 'desired', vld = 'RETRACT' :put external_system_context { workspace, system, context, idx, state, vld }", p.clone(), ScriptMutability::Mutable);
+        self.remove_owner_meta(&ws, "", "external_system", name)?;
+        self.run_mutation_script("?[workspace, system, context, idx, state, vld] := *external_system_context{workspace, system, context, idx, state @ 'NOW'}, workspace = $ws, system = $name, state = 'desired', vld = 'RETRACT' :put external_system_context { workspace, system, context, idx, state, vld }", p.clone(), format!("remove external system contexts for {name}"))?;
         self.db.run_script("?[workspace, name, state, vld] := workspace = $ws, name = $name, state = 'desired', vld = 'RETRACT' :put external_system { workspace, name, state, vld }", p, ScriptMutability::Mutable).map_err(|e| anyhow::anyhow!("remove_external_system: {:?}", e))?;
         Ok(true)
     }
@@ -3047,8 +3124,8 @@ impl Store {
             &decision.ownership,
             "desired",
         )?;
-        let _ = self.db.run_script("?[workspace, decision_id, context, idx, state, vld] := *decision_context{workspace, decision_id, context, idx, state @ 'NOW'}, workspace = $ws, decision_id = $id, state = 'desired', vld = 'RETRACT' :put decision_context { workspace, decision_id, context, idx, state, vld }", params_map(&[("ws", &ws), ("id", &decision.id)]), ScriptMutability::Mutable);
-        let _ = self.db.run_script("?[workspace, decision_id, idx, state, vld] := *decision_consequence{workspace, decision_id, idx, state @ 'NOW'}, workspace = $ws, decision_id = $id, state = 'desired', vld = 'RETRACT' :put decision_consequence { workspace, decision_id, idx, state, vld }", params_map(&[("ws", &ws), ("id", &decision.id)]), ScriptMutability::Mutable);
+        self.run_mutation_script("?[workspace, decision_id, context, idx, state, vld] := *decision_context{workspace, decision_id, context, idx, state @ 'NOW'}, workspace = $ws, decision_id = $id, state = 'desired', vld = 'RETRACT' :put decision_context { workspace, decision_id, context, idx, state, vld }", params_map(&[("ws", &ws), ("id", &decision.id)]), format!("retract decision contexts for {}", decision.id))?;
+        self.run_mutation_script("?[workspace, decision_id, idx, state, vld] := *decision_consequence{workspace, decision_id, idx, state @ 'NOW'}, workspace = $ws, decision_id = $id, state = 'desired', vld = 'RETRACT' :put decision_consequence { workspace, decision_id, idx, state, vld }", params_map(&[("ws", &ws), ("id", &decision.id)]), format!("retract decision consequences for {}", decision.id))?;
         for (idx, ctx) in decision.contexts.iter().enumerate() {
             let mut p = params_map(&[("ws", &ws), ("id", &decision.id), ("ctx", ctx)]);
             p.insert("idx".into(), int_dv(idx as i64));
@@ -3069,9 +3146,9 @@ impl Store {
         if !exists {
             return Ok(false);
         }
-        self.remove_owner_meta(&ws, "", "architectural_decision", id);
-        let _ = self.db.run_script("?[workspace, decision_id, context, idx, state, vld] := *decision_context{workspace, decision_id, context, idx, state @ 'NOW'}, workspace = $ws, decision_id = $id, state = 'desired', vld = 'RETRACT' :put decision_context { workspace, decision_id, context, idx, state, vld }", p.clone(), ScriptMutability::Mutable);
-        let _ = self.db.run_script("?[workspace, decision_id, idx, state, vld] := *decision_consequence{workspace, decision_id, idx, state @ 'NOW'}, workspace = $ws, decision_id = $id, state = 'desired', vld = 'RETRACT' :put decision_consequence { workspace, decision_id, idx, state, vld }", p.clone(), ScriptMutability::Mutable);
+        self.remove_owner_meta(&ws, "", "architectural_decision", id)?;
+        self.run_mutation_script("?[workspace, decision_id, context, idx, state, vld] := *decision_context{workspace, decision_id, context, idx, state @ 'NOW'}, workspace = $ws, decision_id = $id, state = 'desired', vld = 'RETRACT' :put decision_context { workspace, decision_id, context, idx, state, vld }", p.clone(), format!("remove decision contexts for {id}"))?;
+        self.run_mutation_script("?[workspace, decision_id, idx, state, vld] := *decision_consequence{workspace, decision_id, idx, state @ 'NOW'}, workspace = $ws, decision_id = $id, state = 'desired', vld = 'RETRACT' :put decision_consequence { workspace, decision_id, idx, state, vld }", p.clone(), format!("remove decision consequences for {id}"))?;
         self.db.run_script("?[workspace, id, state, vld] := workspace = $ws, id = $id, state = 'desired', vld = 'RETRACT' :put architectural_decision { workspace, id, state, vld }", p, ScriptMutability::Mutable).map_err(|e| anyhow::anyhow!("remove_architectural_decision: {:?}", e))?;
         Ok(true)
     }
@@ -3235,13 +3312,13 @@ impl Store {
         let params = params_map(&[("ws", &ws)]);
 
         // 1. Retract previous drift entries
-        let _ = self.db.run_script(
+        self.run_mutation_script(
             "?[workspace, category, context, name, change_type, vld] := \
              *drift{workspace, category, context, name, change_type @ 'NOW'}, workspace = $ws, vld = 'RETRACT' \
              :put drift { workspace, category, context, name, change_type, vld }",
             params.clone(),
-            ScriptMutability::Mutable,
-        );
+            format!("compute_drift retract previous drift entries for '{ws}'"),
+        )?;
 
         // 2. Compute diff via intermediate rules, insert into drift
         let script = "\
@@ -3280,6 +3357,20 @@ impl Store {
             .run_script(script, params, ScriptMutability::Mutable)
             .map_err(|e| anyhow::anyhow!("compute_drift: {:?}", e))?;
 
+        let drift_ts_us = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros() as i64;
+        let mut meta_params = params_map(&[("ws", &ws)]);
+        meta_params.insert("ts".into(), int_dv(drift_ts_us));
+        self.run_mutation_script(
+            "?[workspace, computed_at_us] <- [[$ws, $ts]] :put drift_meta { workspace => computed_at_us }",
+            meta_params,
+            format!("compute_drift update drift_meta for '{ws}'"),
+        )?;
+
+        self.invalidate_reasoning_claims_for_dependency(&ws, "drift")?;
+
         Ok(result.rows.len())
     }
 
@@ -3304,6 +3395,635 @@ impl Store {
             .iter()
             .map(|r| (dv_str(&r[0]), dv_str(&r[1]), dv_str(&r[2]), dv_str(&r[3])))
             .collect())
+    }
+
+    /// Load the timestamp of the most recent persisted drift computation.
+    pub fn load_drift_recomputed_at(&self, workspace_path: &str) -> Result<Option<i64>> {
+        let ws = canonicalize_path(workspace_path);
+        let params = params_map(&[("ws", &ws)]);
+        let result = self
+            .db
+            .run_script(
+                "?[computed_at_us] := *drift_meta{workspace: $ws, computed_at_us}",
+                params,
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| anyhow::anyhow!("load_drift_recomputed_at: {:?}", e))?;
+        Ok(result.rows.first().map(|row| dv_i64(&row[0])))
+    }
+
+    /// Report the current truth-maintenance state for asserted, scanned, and drift facts.
+    pub fn truth_maintenance_report(&self, workspace_path: &str) -> Result<TruthMaintenanceReport> {
+        let desired = self.load_desired(workspace_path)?;
+        let actual = self.load_actual(workspace_path)?;
+        let desired_snapshot = self
+            .list_snapshots(workspace_path, "desired")?
+            .into_iter()
+            .next();
+        let actual_snapshot = self
+            .list_snapshots(workspace_path, "actual")?
+            .into_iter()
+            .next();
+        let drift_computed_at_us = self.load_drift_recomputed_at(workspace_path)?;
+        let drift_entries = self.load_drift(workspace_path)?;
+
+        let asserted = summarize_fact_snapshot(
+            "asserted",
+            "desired",
+            desired_snapshot,
+            desired.as_ref(),
+        );
+        let scanned = summarize_fact_snapshot(
+            "scanned",
+            "actual",
+            actual_snapshot,
+            actual.as_ref(),
+        );
+
+        let basis_timestamp_us = match (desired_snapshot, actual_snapshot) {
+            (Some(desired_ts), Some(actual_ts)) => Some(desired_ts.max(actual_ts)),
+            _ => None,
+        };
+
+        let drift_status = match (basis_timestamp_us, drift_computed_at_us) {
+            (Some(basis_ts), Some(computed_at_us)) if computed_at_us >= basis_ts => "fresh",
+            (Some(_), Some(_)) => "stale",
+            _ => "unavailable",
+        };
+
+        let mut assumptions = Vec::new();
+        if !asserted.available {
+            assumptions.push(
+                "No asserted planned model is stored; proofs about intended architecture are incomplete."
+                    .to_string(),
+            );
+        }
+        if !scanned.available {
+            assumptions.push(
+                "No scanned implementation model is stored; proofs about actual code structure are incomplete."
+                    .to_string(),
+            );
+        }
+        match drift_status {
+            "stale" => assumptions.push(
+                "Persisted drift entries predate the latest asserted or scanned snapshot and may be stale."
+                    .to_string(),
+            ),
+            "unavailable" if basis_timestamp_us.is_some() => assumptions.push(
+                "Drift has not been recomputed for the current asserted/scanned basis."
+                    .to_string(),
+            ),
+            _ => {}
+        }
+
+        Ok(TruthMaintenanceReport {
+            asserted,
+            scanned,
+            drift: DriftFreshness {
+                available: basis_timestamp_us.is_some() && drift_computed_at_us.is_some(),
+                status: drift_status.to_string(),
+                computed_at_us: drift_computed_at_us,
+                basis_timestamp_us,
+                entry_count: drift_entries.len(),
+            },
+            assumptions,
+        })
+    }
+
+    fn clear_reasoning_claims(&self, workspace: &str) -> Result<()> {
+        let scripts = [
+            (
+                "reasoning_derivation",
+                "?[workspace, claim_id, idx] := *reasoning_derivation{workspace, claim_id, idx}, workspace = $ws :rm reasoning_derivation { workspace, claim_id, idx }",
+            ),
+            (
+                "reasoning_assumption",
+                "?[workspace, claim_id, idx] := *reasoning_assumption{workspace, claim_id, idx}, workspace = $ws :rm reasoning_assumption { workspace, claim_id, idx }",
+            ),
+            (
+                "reasoning_support",
+                "?[workspace, claim_id, idx] := *reasoning_support{workspace, claim_id, idx}, workspace = $ws :rm reasoning_support { workspace, claim_id, idx }",
+            ),
+            (
+                "reasoning_dependency",
+                "?[workspace, claim_id, idx] := *reasoning_dependency{workspace, claim_id, idx}, workspace = $ws :rm reasoning_dependency { workspace, claim_id, idx }",
+            ),
+            (
+                "reasoning_justification",
+                "?[workspace, claim_id, idx] := *reasoning_justification{workspace, claim_id, idx}, workspace = $ws :rm reasoning_justification { workspace, claim_id, idx }",
+            ),
+            (
+                "reasoning_claim",
+                "?[workspace, claim_id] := *reasoning_claim{workspace, claim_id}, workspace = $ws :rm reasoning_claim { workspace, claim_id }",
+            ),
+        ];
+
+        for (relation, script) in scripts {
+            self.run_mutation_script(
+                script,
+                params_map(&[("ws", workspace)]),
+                format!("clear {relation} rows for '{workspace}'"),
+            )?;
+        }
+
+        Ok(())
+    }
+
+    fn clear_reasoning_claim_ids(&self, workspace: &str, claim_ids: &[String]) -> Result<()> {
+        if claim_ids.is_empty() {
+            return Ok(());
+        }
+
+        let scripts = [
+            (
+                "reasoning_derivation",
+                "?[workspace, claim_id, idx] := *reasoning_derivation{workspace, claim_id, idx}, workspace = $ws, claim_id = $claim_id :rm reasoning_derivation { workspace, claim_id, idx }",
+            ),
+            (
+                "reasoning_assumption",
+                "?[workspace, claim_id, idx] := *reasoning_assumption{workspace, claim_id, idx}, workspace = $ws, claim_id = $claim_id :rm reasoning_assumption { workspace, claim_id, idx }",
+            ),
+            (
+                "reasoning_support",
+                "?[workspace, claim_id, idx] := *reasoning_support{workspace, claim_id, idx}, workspace = $ws, claim_id = $claim_id :rm reasoning_support { workspace, claim_id, idx }",
+            ),
+            (
+                "reasoning_dependency",
+                "?[workspace, claim_id, idx] := *reasoning_dependency{workspace, claim_id, idx}, workspace = $ws, claim_id = $claim_id :rm reasoning_dependency { workspace, claim_id, idx }",
+            ),
+            (
+                "reasoning_justification",
+                "?[workspace, claim_id, idx] := *reasoning_justification{workspace, claim_id, idx}, workspace = $ws, claim_id = $claim_id :rm reasoning_justification { workspace, claim_id, idx }",
+            ),
+            (
+                "reasoning_claim",
+                "?[workspace, claim_id] := *reasoning_claim{workspace, claim_id}, workspace = $ws, claim_id = $claim_id :rm reasoning_claim { workspace, claim_id }",
+            ),
+        ];
+
+        for claim_id in claim_ids {
+            let params = params_map(&[("ws", workspace), ("claim_id", claim_id)]);
+            for (relation, script) in scripts {
+                self.run_mutation_script(
+                    script,
+                    params.clone(),
+                    format!("clear {relation} rows for '{workspace}' claim '{claim_id}'"),
+                )?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn write_reasoning_claims(&self, workspace: &str, claims: &[PersistedReasoningClaim]) -> Result<()> {
+        for claim in claims {
+            let payload_json = serde_json::to_string(&claim.payload).unwrap_or_else(|_| "{}".into());
+            let mut claim_params = params_map(&[
+                ("ws", workspace),
+                ("claim_id", &claim.claim_id),
+                ("claim_kind", &claim.claim_kind),
+                ("subject", &claim.subject),
+                ("status", &claim.status),
+                ("summary", &claim.summary),
+                ("payload_json", &payload_json),
+                ("prov_source", &claim.provenance.source),
+                ("prov_state", &claim.provenance.state),
+            ]);
+            claim_params.insert("stale".into(), cozo::DataValue::Bool(claim.stale));
+            claim_params.insert("computed_at_us".into(), int_dv(claim.computed_at_us));
+            self.run_mutation_script(
+                "?[workspace, claim_id, claim_kind, subject, status, summary, payload_json, provenance_source, provenance_state, stale, computed_at_us] <- \
+                 [[$ws, $claim_id, $claim_kind, $subject, $status, $summary, $payload_json, $prov_source, $prov_state, $stale, $computed_at_us]] \
+                 :put reasoning_claim { workspace, claim_id => claim_kind, subject, status, summary, payload_json, provenance_source, provenance_state, stale, computed_at_us }",
+                claim_params,
+                format!("save reasoning claim '{}'", claim.claim_id),
+            )?;
+
+            for (idx, derivation) in claim.derivations.iter().enumerate() {
+                let derived_from_json = serde_json::to_string(&derivation.derived_from)
+                    .unwrap_or_else(|_| "[]".into());
+                let mut params = params_map(&[
+                    ("ws", workspace),
+                    ("claim_id", &claim.claim_id),
+                    ("rule", &derivation.rule),
+                    ("derived_from_json", &derived_from_json),
+                ]);
+                params.insert("idx".into(), int_dv(idx as i64));
+                params.insert(
+                    "witness_count".into(),
+                    int_dv(derivation.witness_count as i64),
+                );
+                self.run_mutation_script(
+                    "?[workspace, claim_id, idx, rule, derived_from_json, witness_count] <- \
+                     [[$ws, $claim_id, $idx, $rule, $derived_from_json, $witness_count]] \
+                     :put reasoning_derivation { workspace, claim_id, idx => rule, derived_from_json, witness_count }",
+                    params,
+                    format!("save reasoning derivation '{}' [{}]", claim.claim_id, idx),
+                )?;
+            }
+
+            for (idx, assumption) in claim.assumptions.iter().enumerate() {
+                let mut params = params_map(&[
+                    ("ws", workspace),
+                    ("claim_id", &claim.claim_id),
+                    ("assumption_kind", &assumption.assumption_kind),
+                    ("text", &assumption.text),
+                ]);
+                params.insert("idx".into(), int_dv(idx as i64));
+                self.run_mutation_script(
+                    "?[workspace, claim_id, idx, assumption_kind, text] <- \
+                     [[$ws, $claim_id, $idx, $assumption_kind, $text]] \
+                     :put reasoning_assumption { workspace, claim_id, idx => assumption_kind, text }",
+                    params,
+                    format!("save reasoning assumption '{}' [{}]", claim.claim_id, idx),
+                )?;
+            }
+
+            for (idx, support) in claim.supports.iter().enumerate() {
+                let detail_json =
+                    serde_json::to_string(&support.detail).unwrap_or_else(|_| "{}".into());
+                let mut params = params_map(&[
+                    ("ws", workspace),
+                    ("claim_id", &claim.claim_id),
+                    ("support_kind", &support.support_kind),
+                    ("summary", &support.summary),
+                    ("detail_json", &detail_json),
+                ]);
+                params.insert("idx".into(), int_dv(idx as i64));
+                self.run_mutation_script(
+                    "?[workspace, claim_id, idx, support_kind, summary, detail_json] <- \
+                     [[$ws, $claim_id, $idx, $support_kind, $summary, $detail_json]] \
+                     :put reasoning_support { workspace, claim_id, idx => support_kind, summary, detail_json }",
+                    params,
+                    format!("save reasoning support '{}' [{}]", claim.claim_id, idx),
+                )?;
+            }
+
+            for (idx, dependency) in claim.dependencies.iter().enumerate() {
+                let mut params = params_map(&[
+                    ("ws", workspace),
+                    ("claim_id", &claim.claim_id),
+                    ("dependency_kind", &dependency.dependency_kind),
+                    ("dependency_state", &dependency.dependency_state),
+                ]);
+                params.insert("idx".into(), int_dv(idx as i64));
+                params.insert(
+                    "basis_timestamp_us".into(),
+                    int_dv(dependency.basis_timestamp_us),
+                );
+                self.run_mutation_script(
+                    "?[workspace, claim_id, idx, dependency_kind, dependency_state, basis_timestamp_us] <- \
+                     [[$ws, $claim_id, $idx, $dependency_kind, $dependency_state, $basis_timestamp_us]] \
+                     :put reasoning_dependency { workspace, claim_id, idx => dependency_kind, dependency_state, basis_timestamp_us }",
+                    params,
+                    format!("save reasoning dependency '{}' [{}]", claim.claim_id, idx),
+                )?;
+            }
+
+            for (idx, justification) in claim.justifications.iter().enumerate() {
+                let mut params = params_map(&[
+                    ("ws", workspace),
+                    ("claim_id", &claim.claim_id),
+                    ("fact_kind", &justification.fact_kind),
+                    ("fact_key", &justification.fact_key),
+                    ("fact_state", &justification.fact_state),
+                ]);
+                params.insert("idx".into(), int_dv(idx as i64));
+                params.insert(
+                    "basis_timestamp_us".into(),
+                    int_dv(justification.basis_timestamp_us),
+                );
+                self.run_mutation_script(
+                    "?[workspace, claim_id, idx, fact_kind, fact_key, fact_state, basis_timestamp_us] <- \
+                     [[$ws, $claim_id, $idx, $fact_kind, $fact_key, $fact_state, $basis_timestamp_us]] \
+                     :put reasoning_justification { workspace, claim_id, idx => fact_kind, fact_key, fact_state, basis_timestamp_us }",
+                    params,
+                    format!("save reasoning justification '{}' [{}]", claim.claim_id, idx),
+                )?;
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn save_reasoning_claims(
+        &self,
+        workspace_path: &str,
+        claims: &[PersistedReasoningClaim],
+    ) -> Result<()> {
+        let ws = canonicalize_path(workspace_path);
+        self.clear_reasoning_claims(&ws)?;
+
+        self.write_reasoning_claims(&ws, claims)
+    }
+
+    pub fn upsert_reasoning_claims(
+        &self,
+        workspace_path: &str,
+        claims: &[PersistedReasoningClaim],
+    ) -> Result<()> {
+        let ws = canonicalize_path(workspace_path);
+        let claim_ids: Vec<String> = claims.iter().map(|claim| claim.claim_id.clone()).collect();
+        self.clear_reasoning_claim_ids(&ws, &claim_ids)?;
+
+        self.write_reasoning_claims(&ws, claims)
+    }
+
+    pub fn load_reasoning_claims(
+        &self,
+        workspace_path: &str,
+    ) -> Result<Vec<PersistedReasoningClaim>> {
+        let ws = canonicalize_path(workspace_path);
+        let result = self
+            .db
+            .run_script(
+                "?[claim_id] := *reasoning_claim{workspace: $ws, claim_id} :sort claim_id",
+                params_map(&[("ws", &ws)]),
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| anyhow::anyhow!("load_reasoning_claims: {:?}", e))?;
+
+        let mut claims = Vec::with_capacity(result.rows.len());
+        for row in &result.rows {
+            if let Some(claim) = self.load_reasoning_claim(&ws, &dv_str(&row[0]))? {
+                claims.push(claim);
+            }
+        }
+        Ok(claims)
+    }
+
+    pub fn load_reasoning_claim(
+        &self,
+        workspace_path: &str,
+        claim_id: &str,
+    ) -> Result<Option<PersistedReasoningClaim>> {
+        let ws = canonicalize_path(workspace_path);
+        let header = self
+            .db
+            .run_script(
+                "?[claim_kind, subject, status, summary, payload_json, provenance_source, provenance_state, stale, computed_at_us] := \
+                 *reasoning_claim{workspace: $ws, claim_id: $claim_id, claim_kind, subject, status, summary, payload_json, provenance_source, provenance_state, stale, computed_at_us}",
+                params_map(&[("ws", &ws), ("claim_id", claim_id)]),
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| anyhow::anyhow!("load_reasoning_claim '{}': {:?}", claim_id, e))?;
+
+        let Some(row) = header.rows.first() else {
+            return Ok(None);
+        };
+
+        let derivations = self
+            .db
+            .run_script(
+                "?[idx, rule, derived_from_json, witness_count] := *reasoning_derivation{workspace: $ws, claim_id: $claim_id, idx, rule, derived_from_json, witness_count} :sort idx",
+                params_map(&[("ws", &ws), ("claim_id", claim_id)]),
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| anyhow::anyhow!("load_reasoning_derivation '{}': {:?}", claim_id, e))?
+            .rows
+            .iter()
+            .map(|row| ReasoningDerivation {
+                rule: dv_str(&row[1]),
+                derived_from: serde_json::from_str::<Vec<String>>(&dv_str(&row[2]))
+                    .unwrap_or_default(),
+                witness_count: dv_i64(&row[3]) as usize,
+            })
+            .collect();
+
+        let assumptions = self
+            .db
+            .run_script(
+                "?[idx, assumption_kind, text] := *reasoning_assumption{workspace: $ws, claim_id: $claim_id, idx, assumption_kind, text} :sort idx",
+                params_map(&[("ws", &ws), ("claim_id", claim_id)]),
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| anyhow::anyhow!("load_reasoning_assumption '{}': {:?}", claim_id, e))?
+            .rows
+            .iter()
+            .map(|row| ReasoningAssumption {
+                assumption_kind: dv_str(&row[1]),
+                text: dv_str(&row[2]),
+            })
+            .collect();
+
+        let supports = self
+            .db
+            .run_script(
+                "?[idx, support_kind, summary, detail_json] := *reasoning_support{workspace: $ws, claim_id: $claim_id, idx, support_kind, summary, detail_json} :sort idx",
+                params_map(&[("ws", &ws), ("claim_id", claim_id)]),
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| anyhow::anyhow!("load_reasoning_support '{}': {:?}", claim_id, e))?
+            .rows
+            .iter()
+            .map(|row| ReasoningSupportEdge {
+                support_kind: dv_str(&row[1]),
+                summary: dv_str(&row[2]),
+                detail: serde_json::from_str::<Value>(&dv_str(&row[3]))
+                    .unwrap_or_else(|_| json!({})),
+            })
+            .collect();
+
+        let dependencies = self
+            .db
+            .run_script(
+                "?[idx, dependency_kind, dependency_state, basis_timestamp_us] := *reasoning_dependency{workspace: $ws, claim_id: $claim_id, idx, dependency_kind, dependency_state, basis_timestamp_us} :sort idx",
+                params_map(&[("ws", &ws), ("claim_id", claim_id)]),
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| anyhow::anyhow!("load_reasoning_dependency '{}': {:?}", claim_id, e))?
+            .rows
+            .iter()
+            .map(|row| ReasoningDependency {
+                dependency_kind: dv_str(&row[1]),
+                dependency_state: dv_str(&row[2]),
+                basis_timestamp_us: dv_i64(&row[3]),
+            })
+            .collect();
+
+        let justifications = self
+            .db
+            .run_script(
+                "?[idx, fact_kind, fact_key, fact_state, basis_timestamp_us] := *reasoning_justification{workspace: $ws, claim_id: $claim_id, idx, fact_kind, fact_key, fact_state, basis_timestamp_us} :sort idx",
+                params_map(&[("ws", &ws), ("claim_id", claim_id)]),
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| anyhow::anyhow!("load_reasoning_justification '{}': {:?}", claim_id, e))?
+            .rows
+            .iter()
+            .map(|row| ReasoningJustification {
+                fact_kind: dv_str(&row[1]),
+                fact_key: dv_str(&row[2]),
+                fact_state: dv_str(&row[3]),
+                basis_timestamp_us: dv_i64(&row[4]),
+            })
+            .collect();
+
+        Ok(Some(PersistedReasoningClaim {
+            claim_id: claim_id.to_string(),
+            claim_kind: dv_str(&row[0]),
+            subject: dv_str(&row[1]),
+            status: dv_str(&row[2]),
+            summary: dv_str(&row[3]),
+            payload: serde_json::from_str::<Value>(&dv_str(&row[4]))
+                .unwrap_or_else(|_| json!({})),
+            provenance: ReasoningProvenance {
+                source: dv_str(&row[5]),
+                state: dv_str(&row[6]),
+            },
+            stale: matches!(&row[7], cozo::DataValue::Bool(true)),
+            computed_at_us: dv_i64(&row[8]),
+            derivations,
+            assumptions,
+            supports,
+            dependencies,
+            justifications,
+        }))
+    }
+
+    pub fn load_stale_reasoning_claims(&self, workspace_path: &str) -> Result<Vec<PersistedReasoningClaim>> {
+        let ws = canonicalize_path(workspace_path);
+        let result = self
+            .db
+            .run_script(
+                "?[claim_id] := *reasoning_claim{workspace: $ws, claim_id, claim_kind, subject, status, summary, payload_json, provenance_source, provenance_state, stale: true, computed_at_us} :sort claim_id",
+                params_map(&[("ws", &ws)]),
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| anyhow::anyhow!("load_stale_reasoning_claims: {:?}", e))?;
+
+        let mut claims = Vec::with_capacity(result.rows.len());
+        for row in &result.rows {
+            if let Some(claim) = self.load_reasoning_claim(&ws, &dv_str(&row[0]))? {
+                claims.push(claim);
+            }
+        }
+        Ok(claims)
+    }
+
+    pub fn load_stale_reasoning_claims_for_dependency(
+        &self,
+        workspace_path: &str,
+        dependency_state: &str,
+    ) -> Result<Vec<PersistedReasoningClaim>> {
+        let ws = canonicalize_path(workspace_path);
+        let result = self
+            .db
+            .run_script(
+                "?[claim_id] := \
+                 *reasoning_dependency{workspace: $ws, claim_id, idx, dependency_kind, dependency_state: $dependency_state, basis_timestamp_us}, \
+                 *reasoning_claim{workspace: $ws, claim_id, claim_kind, subject, status, summary, payload_json, provenance_source, provenance_state, stale: true, computed_at_us} \
+                 :sort claim_id",
+                params_map(&[("ws", &ws), ("dependency_state", dependency_state)]),
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "load_stale_reasoning_claims_for_dependency '{}': {:?}",
+                    dependency_state,
+                    e
+                )
+            })?;
+
+        let mut claim_ids = BTreeSet::new();
+        let mut claims = Vec::new();
+        for row in &result.rows {
+            let claim_id = dv_str(&row[0]);
+            if claim_ids.insert(claim_id.clone()) {
+                if let Some(claim) = self.load_reasoning_claim(&ws, &claim_id)? {
+                    claims.push(claim);
+                }
+            }
+        }
+
+        Ok(claims)
+    }
+
+    pub fn invalidate_reasoning_claims_for_dependency(
+        &self,
+        workspace_path: &str,
+        dependency_state: &str,
+    ) -> Result<usize> {
+        let ws = canonicalize_path(workspace_path);
+        let result = self
+            .db
+            .run_script(
+                "?[claim_id] := *reasoning_dependency{workspace: $ws, claim_id, idx, dependency_kind, dependency_state: $dependency_state, basis_timestamp_us} :sort claim_id",
+                params_map(&[("ws", &ws), ("dependency_state", dependency_state)]),
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "invalidate_reasoning_claims_for_dependency '{}': {:?}",
+                    dependency_state,
+                    e
+                )
+            })?;
+
+        for row in &result.rows {
+            let claim_id = dv_str(&row[0]);
+            self.run_mutation_script(
+                "current[claim_kind, subject, status, summary, payload_json, provenance_source, provenance_state, computed_at_us] := \
+                 *reasoning_claim{workspace: $ws, claim_id: $claim_id, claim_kind, subject, status, summary, payload_json, provenance_source, provenance_state, stale: current_stale, computed_at_us} \
+                 ?[workspace, claim_id, claim_kind, subject, status, summary, payload_json, provenance_source, provenance_state, stale, computed_at_us] := \
+                 current[claim_kind, subject, status, summary, payload_json, provenance_source, provenance_state, computed_at_us], workspace = $ws, claim_id = $claim_id, stale = true \
+                 :put reasoning_claim { workspace, claim_id => claim_kind, subject, status, summary, payload_json, provenance_source, provenance_state, stale, computed_at_us }",
+                params_map(&[("ws", &ws), ("claim_id", &claim_id)]),
+                format!(
+                    "mark reasoning claim '{}' stale for dependency '{}'",
+                    claim_id,
+                    dependency_state
+                ),
+            )?;
+        }
+
+        Ok(result.rows.len())
+    }
+
+    pub fn invalidate_reasoning_claims_for_facts(
+        &self,
+        workspace_path: &str,
+        facts: &[ReasoningFactRef],
+    ) -> Result<usize> {
+        let ws = canonicalize_path(workspace_path);
+        let mut claim_ids = BTreeSet::new();
+
+        for fact in facts {
+            let result = self
+                .db
+                .run_script(
+                    "?[claim_id, fact_key] := *reasoning_justification{workspace: $ws, claim_id, idx, fact_kind: $fact_kind, fact_key, fact_state: $fact_state, basis_timestamp_us}",
+                    params_map(&[
+                        ("ws", &ws),
+                        ("fact_kind", &fact.fact_kind),
+                        ("fact_state", &fact.fact_state),
+                    ]),
+                    ScriptMutability::Immutable,
+                )
+                .map_err(|e| anyhow::anyhow!("invalidate_reasoning_claims_for_facts '{:?}': {:?}", fact, e))?;
+
+            for row in &result.rows {
+                let claim_id = dv_str(&row[0]);
+                let stored_key = dv_str(&row[1]);
+                if fact.fact_key == "*" || stored_key == "*" || stored_key == fact.fact_key {
+                    claim_ids.insert(claim_id);
+                }
+            }
+        }
+
+        for claim_id in &claim_ids {
+            self.run_mutation_script(
+                "current[claim_kind, subject, status, summary, payload_json, provenance_source, provenance_state, computed_at_us] := \
+                 *reasoning_claim{workspace: $ws, claim_id: $claim_id, claim_kind, subject, status, summary, payload_json, provenance_source, provenance_state, stale: current_stale, computed_at_us} \
+                 ?[workspace, claim_id, claim_kind, subject, status, summary, payload_json, provenance_source, provenance_state, stale, computed_at_us] := \
+                 current[claim_kind, subject, status, summary, payload_json, provenance_source, provenance_state, computed_at_us], workspace = $ws, claim_id = $claim_id, stale = true \
+                 :put reasoning_claim { workspace, claim_id => claim_kind, subject, status, summary, payload_json, provenance_source, provenance_state, stale, computed_at_us }",
+                params_map(&[("ws", &ws), ("claim_id", claim_id)]),
+                format!("mark reasoning claim '{}' stale for fact invalidation", claim_id),
+            )?;
+        }
+
+        Ok(claim_ids.len())
     }
 
     /// List distinct save timestamps for a workspace+state, derived from
@@ -4550,7 +5270,223 @@ pub struct CommunityMembership {
     pub community: u64,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FactSnapshotSummary {
+    pub knowledge_kind: String,
+    pub state: String,
+    pub available: bool,
+    pub snapshot_timestamp_us: Option<i64>,
+    pub context_count: usize,
+    pub entity_count: usize,
+    pub value_object_count: usize,
+    pub service_count: usize,
+    pub repository_count: usize,
+    pub event_count: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DriftFreshness {
+    pub available: bool,
+    pub status: String,
+    pub computed_at_us: Option<i64>,
+    pub basis_timestamp_us: Option<i64>,
+    pub entry_count: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TruthMaintenanceReport {
+    pub asserted: FactSnapshotSummary,
+    pub scanned: FactSnapshotSummary,
+    pub drift: DriftFreshness,
+    pub assumptions: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReasoningProvenance {
+    pub source: String,
+    pub state: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReasoningDerivation {
+    pub rule: String,
+    #[serde(default)]
+    pub derived_from: Vec<String>,
+    pub witness_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReasoningAssumption {
+    pub assumption_kind: String,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReasoningSupportEdge {
+    pub support_kind: String,
+    pub summary: String,
+    pub detail: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReasoningDependency {
+    pub dependency_kind: String,
+    pub dependency_state: String,
+    pub basis_timestamp_us: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReasoningJustification {
+    pub fact_kind: String,
+    pub fact_key: String,
+    pub fact_state: String,
+    pub basis_timestamp_us: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReasoningFactRef {
+    pub fact_kind: String,
+    pub fact_key: String,
+    pub fact_state: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedReasoningClaim {
+    pub claim_id: String,
+    pub claim_kind: String,
+    pub subject: String,
+    pub status: String,
+    pub summary: String,
+    pub payload: Value,
+    pub provenance: ReasoningProvenance,
+    pub stale: bool,
+    pub computed_at_us: i64,
+    #[serde(default)]
+    pub derivations: Vec<ReasoningDerivation>,
+    #[serde(default)]
+    pub assumptions: Vec<ReasoningAssumption>,
+    #[serde(default)]
+    pub supports: Vec<ReasoningSupportEdge>,
+    #[serde(default)]
+    pub dependencies: Vec<ReasoningDependency>,
+    #[serde(default)]
+    pub justifications: Vec<ReasoningJustification>,
+}
+
+impl PersistedReasoningClaim {
+    pub fn proof_json(&self) -> Option<Value> {
+        match self.derivations.as_slice() {
+            [] => None,
+            [single] => Some(json!({
+                "rule": single.rule,
+                "derived_from": single.derived_from,
+                "witness_count": single.witness_count,
+            })),
+            many => Some(Value::Array(
+                many.iter()
+                    .map(|derivation| {
+                        json!({
+                            "rule": derivation.rule,
+                            "derived_from": derivation.derived_from,
+                            "witness_count": derivation.witness_count,
+                        })
+                    })
+                    .collect(),
+            )),
+        }
+    }
+
+    pub fn evidence_json(&self) -> Option<Value> {
+        match self.supports.as_slice() {
+            [] => None,
+            [single] => Some(single.detail.clone()),
+            many => Some(Value::Array(
+                many.iter()
+                    .map(|support| {
+                        json!({
+                            "support_kind": support.support_kind,
+                            "summary": support.summary,
+                            "detail": support.detail,
+                        })
+                    })
+                    .collect(),
+            )),
+        }
+    }
+
+    pub fn limitation_texts(&self) -> Vec<String> {
+        self.assumptions
+            .iter()
+            .filter(|assumption| assumption.assumption_kind == "limitation")
+            .map(|assumption| assumption.text.clone())
+            .collect()
+    }
+
+    pub fn assumption_texts(&self) -> Vec<String> {
+        self.assumptions
+            .iter()
+            .filter(|assumption| assumption.assumption_kind != "limitation")
+            .map(|assumption| assumption.text.clone())
+            .collect()
+    }
+}
+
 // ── Helper Functions ───────────────────────────────────────────────────────
+
+fn summarize_fact_snapshot(
+    knowledge_kind: &str,
+    state: &str,
+    snapshot_timestamp_us: Option<i64>,
+    model: Option<&DomainModel>,
+) -> FactSnapshotSummary {
+    let Some(model) = model else {
+        return FactSnapshotSummary {
+            knowledge_kind: knowledge_kind.to_string(),
+            state: state.to_string(),
+            available: false,
+            snapshot_timestamp_us,
+            context_count: 0,
+            entity_count: 0,
+            value_object_count: 0,
+            service_count: 0,
+            repository_count: 0,
+            event_count: 0,
+        };
+    };
+
+    FactSnapshotSummary {
+        knowledge_kind: knowledge_kind.to_string(),
+        state: state.to_string(),
+        available: true,
+        snapshot_timestamp_us,
+        context_count: model.bounded_contexts.len(),
+        entity_count: model
+            .bounded_contexts
+            .iter()
+            .map(|context| context.entities.len())
+            .sum(),
+        value_object_count: model
+            .bounded_contexts
+            .iter()
+            .map(|context| context.value_objects.len())
+            .sum(),
+        service_count: model
+            .bounded_contexts
+            .iter()
+            .map(|context| context.services.len())
+            .sum(),
+        repository_count: model
+            .bounded_contexts
+            .iter()
+            .map(|context| context.repositories.len())
+            .sum(),
+        event_count: model
+            .bounded_contexts
+            .iter()
+            .map(|context| context.events.len())
+            .sum(),
+    }
+}
 
 /// Normalize workspace path for consistent keying.
 pub fn canonicalize_path(path: &str) -> String {
@@ -4603,6 +5539,22 @@ fn dv_i64(val: &cozo::DataValue) -> i64 {
         cozo::DataValue::Num(cozo::Num::Int(i)) => *i,
         cozo::DataValue::Num(cozo::Num::Float(f)) => *f as i64,
         _ => 0,
+    }
+}
+
+fn dv_opt_string(val: &cozo::DataValue) -> Option<String> {
+    let value = dv_str(val);
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn dv_opt_usize(val: &cozo::DataValue) -> Option<usize> {
+    match dv_i64(val) {
+        n if n > 0 => Some(n as usize),
+        _ => None,
     }
 }
 
@@ -4854,9 +5806,9 @@ mod tests {
                         "Name must not be empty".into(),
                         "Price must be positive".into(),
                     ],
-                    file_path: None,
-                    start_line: None,
-                    end_line: None,
+                    file_path: Some("src/catalog/domain/product.rs".into()),
+                    start_line: Some(12),
+                    end_line: Some(82),
                 }],
                 value_objects: vec![ValueObject {
                     name: "Money".into(),
@@ -4879,9 +5831,9 @@ mod tests {
                         "Amount must be non-negative".into(),
                         "Currency must be ISO 4217".into(),
                     ],
-                    file_path: None,
-                    start_line: None,
-                    end_line: None,
+                    file_path: Some("src/catalog/domain/money.rs".into()),
+                    start_line: Some(3),
+                    end_line: Some(27),
                 }],
                 services: vec![Service {
                     name: "CatalogService".into(),
@@ -4897,9 +5849,9 @@ mod tests {
                         end_line: None,
                     }],
                     dependencies: vec![],
-                    file_path: None,
-                    start_line: None,
-                    end_line: None,
+                    file_path: Some("src/catalog/application/catalog_service.rs".into()),
+                    start_line: Some(8),
+                    end_line: Some(34),
                 }],
                 repositories: vec![Repository {
                     name: "ProductRepository".into(),
@@ -4934,9 +5886,9 @@ mod tests {
                             end_line: None,
                         },
                     ],
-                    file_path: None,
-                    start_line: None,
-                    end_line: None,
+                    file_path: Some("src/catalog/infrastructure/product_repository.rs".into()),
+                    start_line: Some(5),
+                    end_line: Some(41),
                 }],
                 events: vec![DomainEvent {
                     name: "ProductCreated".into(),
@@ -4956,9 +5908,9 @@ mod tests {
                             description: "".into(),
                         },
                     ],
-                    file_path: None,
-                    start_line: None,
-                    end_line: None,
+                    file_path: Some("src/catalog/domain/events.rs".into()),
+                    start_line: Some(4),
+                    end_line: Some(18),
                 }],
                 modules: vec![],
                 dependencies: vec![],
@@ -5029,6 +5981,9 @@ mod tests {
             .iter()
             .find(|e| e.name == "Product")
             .unwrap();
+        assert_eq!(product.file_path.as_deref(), Some("src/catalog/domain/product.rs"));
+        assert_eq!(product.start_line, Some(12));
+        assert_eq!(product.end_line, Some(82));
         assert_eq!(product.fields.len(), 3);
         assert_eq!(product.fields[0].name, "id");
         assert_eq!(product.fields[1].name, "name");
@@ -5056,6 +6011,9 @@ mod tests {
             .iter()
             .find(|v| v.name == "Money")
             .unwrap();
+        assert_eq!(money.file_path.as_deref(), Some("src/catalog/domain/money.rs"));
+        assert_eq!(money.start_line, Some(3));
+        assert_eq!(money.end_line, Some(27));
         assert_eq!(money.fields.len(), 2);
         assert_eq!(money.fields[0].name, "amount");
         assert_eq!(money.validation_rules.len(), 2);
@@ -5068,6 +6026,12 @@ mod tests {
             .iter()
             .find(|s| s.name == "CatalogService")
             .unwrap();
+        assert_eq!(
+            cat_svc.file_path.as_deref(),
+            Some("src/catalog/application/catalog_service.rs")
+        );
+        assert_eq!(cat_svc.start_line, Some(8));
+        assert_eq!(cat_svc.end_line, Some(34));
         assert_eq!(cat_svc.methods.len(), 1);
         assert_eq!(cat_svc.methods[0].name, "list_products");
         assert_eq!(cat_svc.methods[0].return_type, "Vec<Product>");
@@ -5079,6 +6043,12 @@ mod tests {
             .iter()
             .find(|r| r.name == "ProductRepository")
             .unwrap();
+        assert_eq!(
+            repo.file_path.as_deref(),
+            Some("src/catalog/infrastructure/product_repository.rs")
+        );
+        assert_eq!(repo.start_line, Some(5));
+        assert_eq!(repo.end_line, Some(41));
         assert_eq!(repo.aggregate, "Product");
         assert_eq!(repo.methods.len(), 2);
         assert_eq!(repo.methods[0].name, "find_by_id");
@@ -5092,6 +6062,9 @@ mod tests {
             .iter()
             .find(|e| e.name == "ProductCreated")
             .unwrap();
+        assert_eq!(evt.file_path.as_deref(), Some("src/catalog/domain/events.rs"));
+        assert_eq!(evt.start_line, Some(4));
+        assert_eq!(evt.end_line, Some(18));
         assert_eq!(evt.fields.len(), 2);
         assert_eq!(evt.fields[0].name, "product_id");
         assert_eq!(evt.source, "Product");
@@ -5110,6 +6083,12 @@ mod tests {
             .iter()
             .find(|c| c.name == "Catalog")
             .unwrap();
+        assert_eq!(
+            cat.entities[0].file_path.as_deref(),
+            Some("src/catalog/domain/product.rs")
+        );
+        assert_eq!(cat.entities[0].start_line, Some(12));
+        assert_eq!(cat.entities[0].end_line, Some(82));
         assert_eq!(cat.entities[0].fields.len(), 3);
         assert_eq!(cat.entities[0].methods.len(), 2);
         assert_eq!(cat.value_objects[0].fields.len(), 2);
@@ -5130,6 +6109,47 @@ mod tests {
 
         let reset = store.reset(ws).unwrap().unwrap();
         assert_eq!(reset.bounded_contexts[0].entities[0].fields.len(), 3);
+        assert_eq!(
+            reset.bounded_contexts[0].entities[0].file_path.as_deref(),
+            Some("src/catalog/domain/product.rs")
+        );
+        assert_eq!(reset.bounded_contexts[0].entities[0].start_line, Some(12));
+        assert_eq!(reset.bounded_contexts[0].entities[0].end_line, Some(82));
+    }
+
+    #[test]
+    fn test_upsert_entity_preserves_source_location() {
+        let store = temp_store();
+        let ws = "/tmp/test-upsert-entity-location";
+        store.save_desired(ws, &rich_model()).unwrap();
+
+        let mut product = store.query_entity(ws, "Catalog", "Product").unwrap();
+        assert_eq!(product.file_path.as_deref(), Some("src/catalog/domain/product.rs"));
+        assert_eq!(product.start_line, Some(12));
+        assert_eq!(product.end_line, Some(82));
+
+        product.description = "Updated product".into();
+        store.upsert_entity(ws, "Catalog", &product).unwrap();
+
+        let queried = store.query_entity(ws, "Catalog", "Product").unwrap();
+        assert_eq!(queried.description, "Updated product");
+        assert_eq!(queried.file_path.as_deref(), Some("src/catalog/domain/product.rs"));
+        assert_eq!(queried.start_line, Some(12));
+        assert_eq!(queried.end_line, Some(82));
+
+        let loaded = store.load_desired(ws).unwrap().unwrap();
+        let loaded_product = loaded.bounded_contexts[0]
+            .entities
+            .iter()
+            .find(|entity| entity.name == "Product")
+            .unwrap();
+        assert_eq!(loaded_product.description, "Updated product");
+        assert_eq!(
+            loaded_product.file_path.as_deref(),
+            Some("src/catalog/domain/product.rs")
+        );
+        assert_eq!(loaded_product.start_line, Some(12));
+        assert_eq!(loaded_product.end_line, Some(82));
     }
 
     #[test]
@@ -5358,6 +6378,237 @@ mod tests {
 
         let entries = store.load_drift(ws).unwrap();
         assert!(entries.is_empty(), "No drift entries when in sync");
+    }
+
+    #[test]
+    fn test_truth_maintenance_report_tracks_freshness() {
+        let store = temp_store();
+        let ws = "/tmp/test-truth-maintenance";
+
+        let empty = store.truth_maintenance_report(ws).unwrap();
+        assert!(!empty.asserted.available);
+        assert!(!empty.scanned.available);
+        assert_eq!(empty.drift.status, "unavailable");
+
+        store.save_desired(ws, &full_model()).unwrap();
+        let desired_only = store.truth_maintenance_report(ws).unwrap();
+        assert!(desired_only.asserted.available);
+        assert!(!desired_only.scanned.available);
+        assert_eq!(desired_only.drift.status, "unavailable");
+        assert!(
+            desired_only
+                .assumptions
+                .iter()
+                .any(|assumption| assumption.contains("No scanned implementation model"))
+        );
+
+        store.save_actual(ws, &full_model()).unwrap();
+        let before_drift = store.truth_maintenance_report(ws).unwrap();
+        assert_eq!(before_drift.drift.status, "unavailable");
+        assert!(!before_drift.drift.available);
+
+        store.compute_drift(ws).unwrap();
+        let fresh = store.truth_maintenance_report(ws).unwrap();
+        assert_eq!(fresh.drift.status, "fresh");
+        assert!(fresh.drift.available);
+        assert!(fresh.drift.computed_at_us.is_some());
+        assert!(fresh.assumptions.is_empty());
+
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let mut modified = full_model();
+        modified.bounded_contexts.push(BoundedContext {
+            api_endpoints: vec![],
+            name: "LateChange".into(),
+            description: "Introduced after drift computation".into(),
+            module_path: "src/late_change".into(),
+            ownership: Ownership::default(),
+            aggregates: vec![],
+            policies: vec![],
+            read_models: vec![],
+            entities: vec![],
+            value_objects: vec![],
+            services: vec![],
+            repositories: vec![],
+            events: vec![],
+            modules: vec![],
+            dependencies: vec![],
+        });
+        store.save_desired(ws, &modified).unwrap();
+
+        let stale = store.truth_maintenance_report(ws).unwrap();
+        assert_eq!(stale.drift.status, "stale");
+        assert!(stale.drift.available);
+        assert!(
+            stale
+                .assumptions
+                .iter()
+                .any(|assumption| assumption.contains("may be stale"))
+        );
+    }
+
+    #[test]
+    fn test_reasoning_claim_roundtrip_and_invalidation() {
+        let store = temp_store();
+        let ws = "/tmp/test-reasoning-claim-roundtrip";
+
+        let claim = PersistedReasoningClaim {
+            claim_id: "check.layer_violations".into(),
+            claim_kind: "check".into(),
+            subject: "layer_violations".into(),
+            status: "true".into(),
+            summary: "No layer violations detected.".into(),
+            payload: json!({
+                "invariant": "layer_violations",
+                "status": "true",
+                "count": 0,
+            }),
+            provenance: ReasoningProvenance {
+                source: "datalog".into(),
+                state: "desired".into(),
+            },
+            stale: false,
+            computed_at_us: 42,
+            derivations: vec![ReasoningDerivation {
+                rule: "domain_service MUST_NOT depend_on infrastructure_service".into(),
+                derived_from: vec!["service".into(), "service_dep".into()],
+                witness_count: 0,
+            }],
+            assumptions: vec![ReasoningAssumption {
+                assumption_kind: "limitation".into(),
+                text: "Only stored desired-state dependencies are considered.".into(),
+            }],
+            supports: vec![ReasoningSupportEdge {
+                support_kind: "evidence".into(),
+                summary: "No witnesses".into(),
+                detail: json!([]),
+            }],
+            dependencies: vec![ReasoningDependency {
+                dependency_kind: "snapshot".into(),
+                dependency_state: "desired".into(),
+                basis_timestamp_us: 7,
+            }],
+            justifications: vec![ReasoningJustification {
+                fact_kind: "service".into(),
+                fact_key: "*".into(),
+                fact_state: "desired".into(),
+                basis_timestamp_us: 7,
+            }],
+        };
+
+        store.save_reasoning_claims(ws, &[claim.clone()]).unwrap();
+
+        let loaded = store
+            .load_reasoning_claim(ws, &claim.claim_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.claim_kind, claim.claim_kind);
+        assert_eq!(loaded.summary, claim.summary);
+        assert!(!loaded.stale);
+        assert_eq!(loaded.derivations.len(), 1);
+        assert_eq!(loaded.supports.len(), 1);
+        assert_eq!(loaded.assumption_texts().len(), 0);
+        assert_eq!(loaded.limitation_texts().len(), 1);
+
+        assert_eq!(
+            store
+                .invalidate_reasoning_claims_for_dependency(ws, "actual")
+                .unwrap(),
+            0
+        );
+        let still_fresh = store
+            .load_reasoning_claim(ws, &claim.claim_id)
+            .unwrap()
+            .unwrap();
+        assert!(!still_fresh.stale);
+
+        assert_eq!(
+            store
+                .invalidate_reasoning_claims_for_dependency(ws, "desired")
+                .unwrap(),
+            1
+        );
+        let stale = store
+            .load_reasoning_claim(ws, &claim.claim_id)
+            .unwrap()
+            .unwrap();
+        assert!(stale.stale);
+    }
+
+    #[test]
+    fn test_reasoning_fact_invalidation_is_precise() {
+        let store = temp_store();
+        let ws = "/tmp/test-reasoning-fact-invalidation";
+
+        let entity_claim = PersistedReasoningClaim {
+            claim_id: "claim.entity".into(),
+            claim_kind: "check".into(),
+            subject: "entity".into(),
+            status: "true".into(),
+            summary: "entity claim".into(),
+            payload: json!({ "status": "true" }),
+            provenance: ReasoningProvenance {
+                source: "test".into(),
+                state: "desired".into(),
+            },
+            stale: false,
+            computed_at_us: 1,
+            derivations: vec![],
+            assumptions: vec![],
+            supports: vec![],
+            dependencies: vec![],
+            justifications: vec![ReasoningJustification {
+                fact_kind: "entity".into(),
+                fact_key: "Sales/Order".into(),
+                fact_state: "desired".into(),
+                basis_timestamp_us: 1,
+            }],
+        };
+
+        let service_claim = PersistedReasoningClaim {
+            claim_id: "claim.service".into(),
+            claim_kind: "check".into(),
+            subject: "service".into(),
+            status: "true".into(),
+            summary: "service claim".into(),
+            payload: json!({ "status": "true" }),
+            provenance: ReasoningProvenance {
+                source: "test".into(),
+                state: "desired".into(),
+            },
+            stale: false,
+            computed_at_us: 1,
+            derivations: vec![],
+            assumptions: vec![],
+            supports: vec![],
+            dependencies: vec![],
+            justifications: vec![ReasoningJustification {
+                fact_kind: "service".into(),
+                fact_key: "Sales/BillingService".into(),
+                fact_state: "desired".into(),
+                basis_timestamp_us: 1,
+            }],
+        };
+
+        store
+            .save_reasoning_claims(ws, &[entity_claim, service_claim])
+            .unwrap();
+
+        let invalidated = store
+            .invalidate_reasoning_claims_for_facts(
+                ws,
+                &[ReasoningFactRef {
+                    fact_kind: "entity".into(),
+                    fact_key: "Sales/Order".into(),
+                    fact_state: "desired".into(),
+                }],
+            )
+            .unwrap();
+        assert_eq!(invalidated, 1);
+
+        let entity_claim = store.load_reasoning_claim(ws, "claim.entity").unwrap().unwrap();
+        let service_claim = store.load_reasoning_claim(ws, "claim.service").unwrap().unwrap();
+        assert!(entity_claim.stale);
+        assert!(!service_claim.stale);
     }
 
     #[test]

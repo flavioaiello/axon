@@ -2187,7 +2187,7 @@ export class User implements Identifiable {
 
     #[test]
     fn test_ts_classes_and_interfaces() {
-        let (structs, _, methods, _) = scanner()
+        let (structs, _, _, _) = scanner()
             .scan_file(Path::new("test.ts"), TS_SOURCE)
             .unwrap();
         // Identifiable (interface), UserService (class), User (class)

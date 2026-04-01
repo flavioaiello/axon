@@ -1,6 +1,6 @@
 /// MCP JSON-RPC protocol types (SDK-compatible, spec 2025-03-26)
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 // ─── JSON-RPC Envelope ─────────────────────────────────────────────────────
 
@@ -120,6 +120,69 @@ pub struct ToolCallResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "isError")]
     pub is_error: Option<bool>,
+}
+
+pub fn text_tool_result(text: impl Into<String>) -> ToolCallResult {
+    ToolCallResult {
+        content: vec![ContentBlock::Text { text: text.into() }],
+        is_error: None,
+    }
+}
+
+pub fn error_tool_result(message: impl Into<String>) -> ToolCallResult {
+    ToolCallResult {
+        content: vec![ContentBlock::Text {
+            text: message.into(),
+        }],
+        is_error: Some(true),
+    }
+}
+
+pub fn json_tool_result(value: Value) -> ToolCallResult {
+    text_tool_result(value.to_string())
+}
+
+pub fn json_error_tool_result(value: Value) -> ToolCallResult {
+    ToolCallResult {
+        content: vec![ContentBlock::Text {
+            text: value.to_string(),
+        }],
+        is_error: Some(true),
+    }
+}
+
+pub fn with_reasoning_context(
+    mut payload: Value,
+    proof: Option<Value>,
+    evidence: Option<Value>,
+    limitations: Vec<String>,
+    provenance: Option<Value>,
+) -> Value {
+    if !payload.is_object() {
+        payload = json!({ "result": payload });
+    }
+
+    let object = payload
+        .as_object_mut()
+        .expect("reasoning payload must be a JSON object");
+
+    if let Some(proof) = proof {
+        object.insert("proof".into(), proof);
+    }
+    if let Some(evidence) = evidence {
+        object.insert("evidence".into(), evidence);
+    }
+    if !limitations.is_empty() {
+        object.insert(
+            "limitations".into(),
+            Value::Array(limitations.into_iter().map(Value::String).collect()),
+        );
+    }
+    if let Some(provenance) = provenance {
+        object.insert("provenance".into(), provenance);
+    }
+
+    payload
 }
 
 // ─── Resources ─────────────────────────────────────────────────────────────
