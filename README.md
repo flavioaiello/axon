@@ -63,27 +63,29 @@ Add to `.vscode/mcp.json` in your project:
 
 Once configured, Copilot gains access to all axon tools, resources, and prompts automatically.
 
-VSCodium does not provide MCP by itself; MCP support comes from the installed agent extension or from an external CLI. Use the same `axon serve ...` command in whichever MCP client you run.
+VSCodium does not provide MCP by itself; MCP support comes from the installed agent extension or from an external CLI. The examples below assume the Homebrew install above, so `axon` is available on `PATH`.
 
 ### Claude Code
 
-When using Claude Code from a VS Code or VSCodium terminal, register axon as a stdio MCP server:
+After installing axon with Homebrew, register it as a stdio MCP server from a VS Code or VSCodium terminal:
 
 ```bash
 claude mcp add axon -- axon serve --workspace "$PWD"
 ```
 
-If `axon` is not on `PATH`, use the absolute binary path instead:
+If a GUI-launched Claude Code extension does not inherit your shell `PATH`, point it at the Homebrew binary directly:
 
 ```bash
-claude mcp add axon -- /path/to/axon serve --workspace /path/to/rust/workspace
+claude mcp add axon -- /opt/homebrew/bin/axon serve --workspace /path/to/rust/workspace
 ```
+
+On Intel Macs, use `/usr/local/bin/axon` instead.
 
 Claude Code extensions that expose MCP settings can use the same command and args as the VS Code MCP JSON above.
 
 ### Codex
 
-For Codex CLI, add axon to `~/.codex/config.toml`:
+After installing axon with Homebrew, add it to `~/.codex/config.toml`:
 
 ```toml
 [mcp_servers.axon]
@@ -91,7 +93,15 @@ command = "axon"
 args = ["serve", "--workspace", "/absolute/path/to/rust/workspace"]
 ```
 
-If you launch Codex from the project directory and your Codex version supports environment expansion in config, point `--workspace` at that workspace path. Otherwise prefer an absolute path. Codex extensions for VS Code or VSCodium should use the same MCP server command when they provide MCP configuration.
+If Codex is launched from a GUI and cannot find `axon`, use the Homebrew binary path:
+
+```toml
+[mcp_servers.axon]
+command = "/opt/homebrew/bin/axon"
+args = ["serve", "--workspace", "/absolute/path/to/rust/workspace"]
+```
+
+On Intel Macs, use `/usr/local/bin/axon` instead. Codex extensions for VS Code or VSCodium should use the same MCP server command when they provide MCP configuration.
 
 ## MCP tools
 
