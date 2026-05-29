@@ -2,14 +2,15 @@ use crate::domain::model::DomainModel;
 use crate::mcp::protocol::*;
 use crate::store::Store;
 
-/// Returns the list of prompts the Dendrites server exposes.
+/// Returns the list of prompts the Axon server exposes.
 pub fn list_prompts() -> Vec<PromptDefinition> {
     vec![PromptDefinition {
-        name: "dendrites_guidelines".into(),
-        description: "Architecture guidelines enriched by Datalog inference from the domain \
-                      knowledge graph. Surfaces circular deps, layer violations, complexity \
+        name: "axon_guidelines".into(),
+        description:
+            "Rust architecture guidelines enriched by Datalog inference from the implemented \
+                      Rust fact graph. Surfaces circular deps, layer violations, complexity \
                       hotspots, and model health — all computed live from CozoDB."
-            .into(),
+                .into(),
         arguments: vec![],
     }]
 }
@@ -18,7 +19,7 @@ pub fn list_prompts() -> Vec<PromptDefinition> {
 ///
 /// The `store` and `workspace_path` are required so that prompts can run
 /// Datalog inference queries against the CozoDB knowledge graph, making
-/// the domain model a **metalayer** that actively shapes every interaction.
+/// the Rust architecture graph a metalayer that actively shapes every interaction.
 pub fn get_prompt(
     model: &DomainModel,
     store: &Store,
@@ -26,7 +27,7 @@ pub fn get_prompt(
     name: &str,
 ) -> Option<PromptGetResult> {
     match name {
-        "dendrites_guidelines" => Some(build_guidelines_prompt(model, store, workspace_path)),
+        "axon_guidelines" => Some(build_guidelines_prompt(model, store, workspace_path)),
         _ => None,
     }
 }
@@ -40,20 +41,20 @@ fn build_guidelines_prompt(
     let is_empty = model.bounded_contexts.is_empty();
 
     let context_line = if is_empty {
-        "No bounded contexts defined yet.".to_string()
+        "No semantic overlays defined yet; Rust facts remain the ground truth.".to_string()
     } else {
         let names: Vec<&str> = model
             .bounded_contexts
             .iter()
             .map(|bc| bc.name.as_str())
             .collect();
-        format!("Bounded contexts: {}", names.join(", "))
+        format!("Semantic overlays: {}", names.join(", "))
     };
 
     let bootstrap = if is_empty {
         "\n**This project has no architecture model yet.** \
-         Analyze the codebase first: identify modules, entities, services, \
-         and events using `define` (changes build the planned architecture).\n"
+            Analyze the codebase first: identify crates, modules, structs, imports, and calls using `sync` \
+            (changes update the implemented Rust architecture graph). Use `define` only to enrich semantic overlays.\n"
     } else {
         ""
     };
@@ -80,21 +81,21 @@ fn build_guidelines_prompt(
     let health_section = build_health_section(store, workspace_path);
 
     let text = format!(
-        r#"## Dendrites — {project_name}
+        r#"## Axon — {project_name}
 
 {context_line}
 {bootstrap}
 ### Workflow
 
-Dendrites tracks two views: the **current** architecture (what the code actually does) and the **planned** architecture (what you want to build toward).
+Axon tracks the **implemented Rust architecture**: source-extracted Rust facts are ground truth; DDD and pattern terms are semantic overlays.
 
-1. **Understand the codebase** → call `architecture` (shows current + planned + health score + pending changes)
-2. **Define architecture elements** → call `define` with the appropriate `kind` (bounded_context, entity, service, event) — auto-saved, returns file path suggestions
-3. **Analyze impact** → call `impact` with analysis type (circular_deps, layer_violations, transitive_deps, call_graph_callers, etc.)
-4. **Review drift** → call `refactor` to compare current vs planned → code actions, file paths, priorities
-5. **Iterate** steps 2–4 until the planned architecture is satisfactory
-6. **After implementing** → call `refactor` with `action: "accept"` to mark planned as current
-7. **To discard changes** → call `refactor` with `action: "reset"` to revert planned to current
+1. **Read the status quo** → call `architecture` (Rust ontology summary + health score + recent temporal changes)
+2. **Refresh from source** → call `sync` after code changes; the watcher usually does this automatically
+3. **Use the overview correctly** → the web graph intentionally shows only crate/module/submodule/struct; MCP keeps source files, symbols, imports, and calls available for precision
+4. **Enrich missing semantics** → call `define` only when static extraction needs DDD/policy labels or ownership context
+5. **Analyze impact** → call `impact` with module/struct/symbol aliases and analysis type (dependency_graph, call_graph_callers, call_graph_reachability, etc.)
+6. **Review history** → call `drift` or `history` to compare recent implemented graph snapshots
+7. **Constrain architecture** → call `constrain` to declare layers and forbidden/allowed dependencies
 
 ### Continuous Improvement
 
@@ -102,7 +103,7 @@ Use `diagnose` as the improvement loop:
 
 1. **Diagnose** → call `refactor` with `action: "diagnose"` — runs full analysis and returns prioritized `next_actions`
 2. **Follow next_actions** → implement the highest-priority fix
-3. **Re-scan** → call `sync` to update the current architecture from source
+3. **Re-scan** → call `sync` to update the implemented architecture from source
 4. **Diagnose again** → call `refactor` with `action: "diagnose"` — health score should improve
 5. **Iterate** until `status: "healthy"` (score 100)
 {rules_section}
@@ -283,7 +284,7 @@ mod tests {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::SeqCst);
         let path = std::env::temp_dir().join(format!(
-            "dendrites_prompt_test_{}_{}.db",
+            "axon_prompt_test_{}_{}.db",
             std::process::id(),
             id
         ));
@@ -294,14 +295,14 @@ mod tests {
     fn test_list_prompts() {
         let prompts = list_prompts();
         assert_eq!(prompts.len(), 1);
-        assert_eq!(prompts[0].name, "dendrites_guidelines");
+        assert_eq!(prompts[0].name, "axon_guidelines");
     }
 
     #[test]
     fn test_get_prompt_found() {
         let model = test_model();
         let store = test_store();
-        let result = get_prompt(&model, &store, "/tmp/test", "dendrites_guidelines");
+        let result = get_prompt(&model, &store, "/tmp/test", "axon_guidelines");
         assert!(result.is_some());
         let prompt = result.unwrap();
         assert!(prompt.description.contains("TestProject"));
@@ -319,7 +320,7 @@ mod tests {
     fn test_prompt_includes_contexts() {
         let model = test_model();
         let store = test_store();
-        let prompt = get_prompt(&model, &store, "/tmp/test", "dendrites_guidelines").unwrap();
+        let prompt = get_prompt(&model, &store, "/tmp/test", "axon_guidelines").unwrap();
         let text = match &prompt.messages[0].content {
             ContentBlock::Text { text } => text,
         };
@@ -330,7 +331,7 @@ mod tests {
     fn test_prompt_includes_workflow() {
         let model = test_model();
         let store = test_store();
-        let prompt = get_prompt(&model, &store, "/tmp/test", "dendrites_guidelines").unwrap();
+        let prompt = get_prompt(&model, &store, "/tmp/test", "axon_guidelines").unwrap();
         let text = match &prompt.messages[0].content {
             ContentBlock::Text { text } => text,
         };
@@ -342,7 +343,7 @@ mod tests {
     fn test_prompt_includes_health_section() {
         let model = test_model();
         let store = test_store();
-        let prompt = get_prompt(&model, &store, "/tmp/test", "dendrites_guidelines").unwrap();
+        let prompt = get_prompt(&model, &store, "/tmp/test", "axon_guidelines").unwrap();
         let text = match &prompt.messages[0].content {
             ContentBlock::Text { text } => text,
         };
@@ -355,7 +356,7 @@ mod tests {
         // Empty store → score 100, no issues
         let model = test_model();
         let store = test_store();
-        let prompt = get_prompt(&model, &store, "/tmp/test", "dendrites_guidelines").unwrap();
+        let prompt = get_prompt(&model, &store, "/tmp/test", "axon_guidelines").unwrap();
         let text = match &prompt.messages[0].content {
             ContentBlock::Text { text } => text,
         };

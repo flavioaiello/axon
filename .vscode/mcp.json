@@ -1,0 +1,15 @@
+{
+  "servers": {
+    "axon": {
+      "type": "stdio",
+      "command": "/Users/flavioaiello/.cargo/bin/axon",
+      "args": [
+        "serve",
+        "--workspace",
+        "${workspaceFolder}",
+        "--web-port",
+        "3769"
+      ]
+    }
+  }
+}

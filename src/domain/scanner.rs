@@ -3,10 +3,10 @@ use std::path::Path;
 
 use super::analyze::{CallInfo, LiveDependency, ScanResult};
 
-/// A trait that defines how to parse source files into generic domain intelligence artifacts
-/// mapping code structures into the `dendrites` graph-based boundary systems.
+/// A trait that defines how to parse Rust source files into domain intelligence artifacts
+/// mapped into the `axon` graph-based boundary system.
 ///
-/// Implementations of this trait are language-specific (e.g. `RustSynScanner`, `TypeScriptTreeSitterScanner`).
+/// The production implementation is `RustSynScanner`.
 pub trait AstScanner {
     /// Extracts module/package dependencies (e.g. `use`, `import`) to build the cross-cutting graph.
     fn extract_live_dependencies(

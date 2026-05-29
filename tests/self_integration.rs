@@ -1,10 +1,10 @@
-//! Self-model integration test: dendrites models itself.
+//! Self-model integration test: axon models itself.
 //!
-//! This test exercises the full MCP tool lifecycle against the dendrites
+//! This test exercises the full MCP tool lifecycle against the axon
 //! codebase itself, proving that the server is a valuable higher-domain
 //! abstraction layer. The flow:
 //!
-//!   1. **refactor(scan)** → AST-extract the actual dendrites domain model
+//!   1. **refactor(scan)** → AST-extract the actual axon domain model
 //!   2. **architecture** → verify the scanned model is persisted & queryable
 //!   3. **define** → enrich the planned model with domain knowledge
 //!   4. **architecture** → verify mutations are visible
@@ -18,11 +18,11 @@ use serde_json::{Value, json};
 use std::env::temp_dir;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use dendrites::domain::analyze::scan_actual_model;
-use dendrites::mcp::tools::call_tool;
-use dendrites::mcp::write_tools::call_write_tool;
-use dendrites::store::Store;
-use dendrites::store::cozo::canonicalize_path;
+use axon::domain::analyze::scan_actual_model;
+use axon::mcp::tools::call_tool;
+use axon::mcp::write_tools::call_write_tool;
+use axon::store::Store;
+use axon::store::cozo::canonicalize_path;
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -30,7 +30,7 @@ fn temp_store() -> Store {
     static CTR: AtomicU64 = AtomicU64::new(0);
     let id = CTR.fetch_add(1, Ordering::SeqCst);
     let path = temp_dir().join(format!(
-        "dendrites_self_integ_{}_{}.db",
+        "axon_self_integ_{}_{}.db",
         std::process::id(),
         id
     ));
@@ -38,7 +38,7 @@ fn temp_store() -> Store {
 }
 
 /// Extract the text payload from a tool call result, panic if error.
-fn unwrap_tool_text(result: &dendrites::mcp::protocol::ToolCallResult) -> Value {
+fn unwrap_tool_text(result: &axon::mcp::protocol::ToolCallResult) -> Value {
     assert_ne!(
         result.is_error,
         Some(true),
@@ -46,33 +46,33 @@ fn unwrap_tool_text(result: &dendrites::mcp::protocol::ToolCallResult) -> Value 
         result.content
     );
     match &result.content[0] {
-        dendrites::mcp::protocol::ContentBlock::Text { text } => {
+        axon::mcp::protocol::ContentBlock::Text { text } => {
             serde_json::from_str(text).unwrap_or_else(|_| json!(text))
         }
     }
 }
 
-/// The real dendrites workspace root (this repository).
-fn dendrites_root() -> std::path::PathBuf {
+/// The real axon workspace root (this repository).
+fn axon_root() -> std::path::PathBuf {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     manifest.to_path_buf()
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  Phase 1: Scan → Persist → Show round-trip on dendrites itself
+//  Phase 1: Scan → Persist → Show round-trip on axon itself
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[test]
 fn self_scan_persist_show_roundtrip() {
     let store = temp_store();
-    let ws_root = dendrites_root();
+    let ws_root = axon_root();
     let ws = ws_root.to_string_lossy().to_string();
 
-    // ── Step 1: Scan actual model from dendrites source ────────────────
+    // ── Step 1: Scan actual model from axon source ────────────────
     let actual = scan_actual_model(&ws_root, None)
-        .expect("scan_actual_model must succeed on dendrites source");
+        .expect("scan_actual_model must succeed on axon source");
 
-    // dendrites has src/{domain,mcp,server,store} → at least 4 bounded contexts
+    // axon has src/{domain,mcp,server,store} → at least 4 bounded contexts
     assert!(
         !actual.bounded_contexts.is_empty(),
         "Scan must discover at least one bounded context"
@@ -109,10 +109,10 @@ fn self_scan_persist_show_roundtrip() {
         );
     }
 
-    // Verify AST edges are populated (dendrites uses derive macros and trait impls)
+    // Verify AST edges are populated (axon uses derive macros and trait impls)
     assert!(
         !actual.ast_edges.is_empty(),
-        "Self-scan must discover AST edges (derives, trait impls) from dendrites Rust source"
+        "Self-scan must discover AST edges (derives, trait impls) from axon Rust source"
     );
 
     // ── Step 2: Persist to CozoDB ──────────────────────────────────────
@@ -163,7 +163,7 @@ fn self_scan_persist_show_roundtrip() {
 #[test]
 fn self_mutate_and_enrich_desired_model() {
     let store = temp_store();
-    let ws_root = dendrites_root();
+    let ws_root = axon_root();
     let ws = ws_root.to_string_lossy().to_string();
 
     // Scan and persist actual first
@@ -276,15 +276,15 @@ fn self_mutate_and_enrich_desired_model() {
     );
     unwrap_tool_text(&result);
 
-    // ── Show planned model ─────────────────────────────────────────────
+    // ── Show implemented model ─────────────────────────────────────────
     let show_result = call_tool(&store, &ws, "architecture", &json!({}));
     let show_json = unwrap_tool_text(&show_result);
 
-    let desired_contexts = show_json["planned"]["bounded_contexts"]
+    let desired_contexts = show_json["implemented"]["bounded_contexts"]
         .as_array()
         .expect("Must have bounded_contexts");
 
-    // The Reasoning context must exist in the planned model
+    // The Reasoning context must exist in the implemented model
     let reasoning = desired_contexts
         .iter()
         .find(|bc| bc["name"] == "Reasoning")
@@ -335,7 +335,7 @@ fn self_mutate_and_enrich_desired_model() {
 #[test]
 fn self_query_cross_cutting_insights() {
     let store = temp_store();
-    let ws_root = dendrites_root();
+    let ws_root = axon_root();
     let ws = ws_root.to_string_lossy().to_string();
 
     // Set up: scan actual + copy to desired
@@ -345,7 +345,7 @@ fn self_query_cross_cutting_insights() {
         .save_desired(&ws, &actual)
         .expect("save_desired failed");
 
-    let canonical = dendrites::store::cozo::canonicalize_path(&ws);
+    let canonical = axon::store::cozo::canonicalize_path(&ws);
 
     // ── Query 1: List all bounded contexts ─────────────────────────────
     let rows = store
@@ -401,7 +401,7 @@ fn self_query_cross_cutting_insights() {
 #[test]
 fn self_refactor_lifecycle() {
     let store = temp_store();
-    let ws_root = dendrites_root();
+    let ws_root = axon_root();
     let ws = ws_root.to_string_lossy().to_string();
 
     // Set up: scan actual, copy to desired, then mutate desired
@@ -477,47 +477,47 @@ fn self_refactor_lifecycle() {
     let change_count = changes.map_or(0, |c| c.len());
     eprintln!("── Refactor plan: {} pending changes ──", change_count);
 
-    // ── Step 4: Accept → promote planned to current ─────────────────────
+    // ── Step 4: Accept compatibility path is an actual-first no-op ──────
     let result = call_write_tool(&ws, &store, "refactor", &json!({"action": "accept"}));
     let accept_json = unwrap_tool_text(&result);
     assert_eq!(
         accept_json.get("status").and_then(|s| s.as_str()),
-        Some("accepted"),
-        "Accept must succeed: {:?}",
+        Some("actual_first_noop"),
+        "Accept compatibility path must succeed: {:?}",
         accept_json
     );
 
-    // Verify: plan should now be in_sync
+    // Verify: plan still reports temporal changes because accept does not erase history.
     let result = call_write_tool(&ws, &store, "refactor", &json!({"action": "plan"}));
     let plan_json = unwrap_tool_text(&result);
-    let is_sync = plan_json
+    let is_pending = plan_json
         .get("status")
-        .map(|s| s == "in_sync")
+        .map(|s| s == "pending_changes")
         .unwrap_or(false);
-    let has_no_changes = plan_json
+    let has_changes = plan_json
         .get("pending_changes")
         .and_then(|v| v.as_array())
-        .map(|a| a.is_empty())
+        .map(|a| !a.is_empty())
         .unwrap_or(false);
     assert!(
-        is_sync || has_no_changes,
-        "After accept, plan should be in_sync: {:?}",
+        is_pending || has_changes,
+        "After accept compatibility no-op, plan should still expose temporal changes: {:?}",
         plan_json
     );
 
-    // Verify: actual model now includes Telemetry
+    // Verify: implemented model includes Telemetry.
     let show_result = call_tool(&store, &ws, "architecture", &json!({}));
     let show_json = unwrap_tool_text(&show_result);
-    let actual_contexts = show_json["current"]["bounded_contexts"]
+    let actual_contexts = show_json["implemented"]["bounded_contexts"]
         .as_array()
         .expect("Must have bounded_contexts");
     assert!(
         actual_contexts.iter().any(|bc| bc["name"] == "Telemetry"),
-        "Telemetry context must be in current after accept"
+        "Telemetry context must be in implemented graph"
     );
-    eprintln!("── Accept: planned promoted to current ──");
+    eprintln!("── Accept: actual-first compatibility no-op ──");
 
-    // ── Step 5: Mutate again, then reset ───────────────────────────────
+    // ── Step 5: Mutate again, then reset compatibility path ────────────
     call_write_tool(
         &ws,
         &store,
@@ -525,7 +525,7 @@ fn self_refactor_lifecycle() {
         &json!({
             "kind": "bounded_context",
             "name": "Ephemeral",
-            "description": "This should be discarded by reset",
+            "description": "This remains because reset is a no-op in actual-first mode",
             "module_path": "src/ephemeral"
         }),
     );
@@ -534,27 +534,26 @@ fn self_refactor_lifecycle() {
     let reset_json = unwrap_tool_text(&result);
     assert_eq!(
         reset_json.get("status").and_then(|s| s.as_str()),
-        Some("reset"),
-        "Reset must succeed: {:?}",
+        Some("actual_first_noop"),
+        "Reset compatibility path must succeed: {:?}",
         reset_json
     );
 
-    // Verify: planned should no longer have Ephemeral
+    // Verify: implemented graph still has Ephemeral because reset is a compatibility no-op.
     let show_result = call_tool(&store, &ws, "architecture", &json!({}));
     let show_json = unwrap_tool_text(&show_result);
-    let desired_contexts = show_json["planned"]["bounded_contexts"]
+    let desired_contexts = show_json["implemented"]["bounded_contexts"]
         .as_array()
         .expect("Must have bounded_contexts");
     assert!(
-        !desired_contexts.iter().any(|bc| bc["name"] == "Ephemeral"),
-        "Ephemeral context must NOT be in planned after reset"
+        desired_contexts.iter().any(|bc| bc["name"] == "Ephemeral"),
+        "Ephemeral context must remain after actual-first reset compatibility no-op"
     );
-    // But Telemetry should still be there (was accepted into current)
     assert!(
         desired_contexts.iter().any(|bc| bc["name"] == "Telemetry"),
-        "Telemetry context must survive in planned after reset (was in current)"
+        "Telemetry context must remain in implemented graph"
     );
-    eprintln!("── Reset: planned reverted to current, Ephemeral discarded ──");
+    eprintln!("── Reset: actual-first compatibility no-op ──");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -564,7 +563,7 @@ fn self_refactor_lifecycle() {
 #[test]
 fn self_model_proves_mcp_value() {
     let store = temp_store();
-    let ws_root = dendrites_root();
+    let ws_root = axon_root();
     let ws = ws_root.to_string_lossy().to_string();
 
     // Full setup: scan + persist actual + copy to desired
@@ -650,11 +649,11 @@ fn self_model_proves_mcp_value() {
     // Final assertion: the model is non-trivial
     assert!(
         contexts.len() >= 3,
-        "dendrites should have at least 3 bounded contexts (domain, mcp, server, store)"
+        "axon should have at least 3 bounded contexts (domain, mcp, server, store)"
     );
     assert!(
         total_entities + total_services + total_vos >= 10,
-        "dendrites should have at least 10 domain elements total"
+        "axon should have at least 10 domain elements total"
     );
 }
 
@@ -665,7 +664,7 @@ fn self_model_proves_mcp_value() {
 #[test]
 fn self_scan_via_mcp_tool_dispatch() {
     let store = temp_store();
-    let ws_root = dendrites_root();
+    let ws_root = axon_root();
     let ws = ws_root.to_string_lossy().to_string();
 
     // Use the MCP write_tool dispatch directly (same path as MCP clients)
@@ -713,7 +712,7 @@ fn self_scan_via_mcp_tool_dispatch() {
 #[test]
 fn self_mutate_remove_elements() {
     let store = temp_store();
-    let ws_root = dendrites_root();
+    let ws_root = axon_root();
     let ws = ws_root.to_string_lossy().to_string();
 
     // Scan and baseline
@@ -751,7 +750,7 @@ fn self_mutate_remove_elements() {
     // Verify they exist
     let show = call_tool(&store, &ws, "architecture", &json!({}));
     let json = unwrap_tool_text(&show);
-    let contexts = json["planned"]["bounded_contexts"].as_array().unwrap();
+    let contexts = json["implemented"]["bounded_contexts"].as_array().unwrap();
     assert!(
         contexts.iter().any(|bc| bc["name"] == "Disposable"),
         "Disposable must exist before removal"
@@ -787,7 +786,7 @@ fn self_mutate_remove_elements() {
     // Verify removal
     let show = call_tool(&store, &ws, "architecture", &json!({}));
     let json = unwrap_tool_text(&show);
-    let contexts = json["planned"]["bounded_contexts"].as_array().unwrap();
+    let contexts = json["implemented"]["bounded_contexts"].as_array().unwrap();
     assert!(
         !contexts.iter().any(|bc| bc["name"] == "Disposable"),
         "Disposable must be gone after removal"
@@ -796,13 +795,13 @@ fn self_mutate_remove_elements() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  Phase 7: Self-improvement loop — diagnose on dendrites itself
+//  Phase 7: Self-improvement loop — diagnose on axon itself
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[test]
 fn self_diagnose_improvement_loop() {
     let store = temp_store();
-    let ws_root = dendrites_root();
+    let ws_root = axon_root();
     let ws = ws_root.to_string_lossy().to_string();
 
     // ── Step 1: Scan actual model ──────────────────────────────────────
@@ -815,12 +814,7 @@ fn self_diagnose_improvement_loop() {
         .expect("save_desired must succeed");
 
     // ── Step 2: Run diagnose ───────────────────────────────────────────
-    let result = call_write_tool(
-        &ws,
-        &store,
-        "refactor",
-        &json!({"action": "diagnose"}),
-    );
+    let result = call_write_tool(&ws, &store, "refactor", &json!({"action": "diagnose"}));
     let report = unwrap_tool_text(&result);
 
     eprintln!("── Diagnose results ──");
@@ -872,7 +866,7 @@ fn self_diagnose_improvement_loop() {
 
     // ── Step 3: Verify the loop is actionable ──────────────────────────
     // After scan, models are in sync so no drift, but aggregate quality
-    // issues should be detected (dendrites has aggregate roots without invariants)
+    // issues should be detected (axon has aggregate roots without invariants)
     assert!(
         report["has_actual_model"].as_bool().unwrap(),
         "must have actual model after scan"

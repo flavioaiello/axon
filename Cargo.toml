@@ -1,8 +1,8 @@
 [package]
-name = "dendrites"
-version = "0.3.2"
+name = "axon"
+version = "0.4.0"
 edition = "2024"
-description = "Domain Model Context Protocol Server - Architectural meta-layer for GitHub Copilot"
+description = "Live Rust domain model graph for AI coding agents"
 license = "MIT"
 
 [dependencies]
@@ -20,8 +20,3 @@ ignore = "0.4.20"
 notify = "8.2.0"
 proc-macro2 = { version = "1.0.106", features = ["span-locations"] }
 quote = "1.0.45"
-tree-sitter = "0.26.6"
-tree-sitter-typescript = "0.23.2"
-tree-sitter-python = "0.25.0"
-tree-sitter-go = "0.25.0"
-tree-sitter-java = "0.23.5"

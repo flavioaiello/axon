@@ -24,12 +24,11 @@ impl ActualStateWatcher {
         let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
             if let Ok(event) = res {
                 let is_source_file = event.paths.iter().any(|p| {
-                    // Filter: only .rs/.py/.ts/.tsx files, never inside target/ or node_modules/ directories
-                    p.extension().is_some_and(|ext| {
-                        ext == "rs" || ext == "py" || ext == "ts" || ext == "tsx" || ext == "go" || ext == "java"
-                    }) && !p
-                        .components()
-                        .any(|c| c.as_os_str() == "target" || c.as_os_str() == "node_modules")
+                    // Filter: only Rust source files, never inside target/ or node_modules/ directories.
+                    p.extension().is_some_and(|ext| ext == "rs")
+                        && !p
+                            .components()
+                            .any(|c| c.as_os_str() == "target" || c.as_os_str() == "node_modules")
                 });
 
                 if is_source_file {
@@ -39,7 +38,7 @@ impl ActualStateWatcher {
         })?;
 
         // Watch the workspace root recursively.
-        // The event filter above excludes target/ and non-.rs files.
+        // The event filter above excludes target/ and non-Rust files.
         let workspace_root = self.registry.workspace_root();
         watcher.watch(workspace_root, RecursiveMode::Recursive)?;
         info!(
@@ -53,6 +52,11 @@ impl ActualStateWatcher {
         tokio::spawn(async move {
             // Keep the watcher alive by moving it into the task
             let _watcher = watcher;
+
+            info!("Performing initial in-memory architecture sync...");
+            if let Err(e) = sync_all_crates(&registry).await {
+                error!("Initial actual model sync failed: {}", e);
+            }
 
             loop {
                 // 2. Wait for the first file-change event
@@ -97,28 +101,21 @@ async fn sync_all_crates(registry: &CrateRegistry) -> Result<()> {
     for entry in registry.crates() {
         let ws = entry.workspace_key();
 
-        // Desired model is optional enrichment, not a gate
-        let desired = entry.store.load_desired(&ws)?;
+        // The previous implemented graph is optional enrichment, not a gate.
+        let previous = entry.store.load_actual(&ws)?;
 
         // Full bottom-up AST scan scoped to this crate's root
-        let actual = scan_actual_model(&entry.root, desired.as_ref())?;
+        let actual = scan_actual_model(&entry.root, previous.as_ref())?;
 
         // Save into this crate's local store
         entry.store.save_actual(&ws, &actual)?;
-        let _ = entry.store.compute_drift(&ws);
 
-        // Auto-bootstrap: if desired state is empty (first-time scan), seed it
-        // from the freshly discovered actual state so the model is immediately
-        // ready for refinement without requiring a manual `reset`.
-        if entry.store.load_desired(&ws)?.is_none() {
-            entry.store.reset(&ws)?;
-            info!(
-                "Bootstrapped desired model from actual for crate '{}'",
-                entry.name
-            );
-        }
+        let drift_count = entry.store.compute_drift(&ws)?;
 
-        info!("Synced actual model for crate '{}'", entry.name);
+        info!(
+            "Synced implemented model for crate '{}' ({} temporal change(s))",
+            entry.name, drift_count
+        );
     }
     Ok(())
 }

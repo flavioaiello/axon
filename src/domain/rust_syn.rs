@@ -285,7 +285,9 @@ fn type_to_string(ty: &syn::Type) -> String {
             // Check if previous token ended with a lifetime identifier char
             // and next is an alpha/underscore (type name after lifetime).
             let prev_is_lifetime = result.chars().last().map_or(false, |c| c.is_alphanumeric());
-            let next_is_ident = chars.peek().map_or(false, |c| c.is_alphabetic() || *c == '_');
+            let next_is_ident = chars
+                .peek()
+                .map_or(false, |c| c.is_alphabetic() || *c == '_');
             if prev_is_lifetime && next_is_ident {
                 // Check if we're after a lifetime ('a, 'b, etc.)
                 let has_lifetime = result.contains('\'');

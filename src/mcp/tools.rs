@@ -1,20 +1,22 @@
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 
+use crate::domain::model::DomainModel;
 use crate::mcp::protocol::*;
 use crate::reasoning::ReasoningKernel;
-use crate::store::cozo::PersistedReasoningClaim;
 use crate::store::Store;
+use crate::store::cozo::PersistedReasoningClaim;
 
-/// Returns the list of tools the Dendrites server exposes.
+/// Returns the list of tools the Axon server exposes.
 pub fn list_tools() -> Vec<ToolDefinition> {
-    vec![
+    let mut tools = vec![
         ToolDefinition {
             name: "architecture".into(),
-            description: "Show the complete architecture of this codebase: modules, components, \
-                          services, events, and their relationships. Includes a health score \
-                          (0-100) with specific issues like circular dependencies, layer violations, \
-                          and complexity hotspots. \
-                          Call this first to understand any codebase before making changes."
+            description: "Show the complete implemented Rust architecture contract: workspace, \
+                          crate, modules/submodules, source files, Rust symbols, imports, calls, \
+                          and semantic overlays. Includes the compact overview projection used by \
+                          the web UI plus health and temporal change status. Call this first before \
+                          changing a Rust codebase."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -24,7 +26,9 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "impact".into(),
-            description: "Analyze the downstream impact of changing or deleting a component.\n\
+            description: "Analyze downstream impact in the implemented Rust graph. Use module/context \
+                          for architecture-level dependency analysis and symbol/struct for call graph \
+                          analysis.\n\
                           Supports: transitive_deps, circular_deps, layer_violations, impact_analysis, \n\
                           aggregate_quality, dependency_graph, field_usage, method_search, shared_fields, \n\
                           pagerank, community_detection, betweenness_centrality, degree_centrality, \n\
@@ -43,8 +47,10 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                                  "call_graph_callers", "call_graph_callees", "call_graph_reachability", "call_graph_stats"],
                         "description": "The specific analysis to run"
                     },
-                    "context": { "type": "string", "description": "Module or component name (required for transitive_deps, impact_analysis)" },
-                    "entity": { "type": "string", "description": "Entity name (required for impact_analysis)" },
+                    "context": { "type": "string", "description": "Compatibility alias for module/context name (required for transitive_deps, impact_analysis)" },
+                    "module": { "type": "string", "description": "Rust module name/path alias for context" },
+                    "entity": { "type": "string", "description": "Compatibility alias for struct/entity name (required for impact_analysis)" },
+                    "struct": { "type": "string", "description": "Rust struct name alias for entity" },
                     "symbol": { "type": "string", "description": "Symbol name (required for call_graph_callers, call_graph_callees, call_graph_reachability)" },
                     "field_type": { "type": "string", "description": "Field type to search (required for field_usage)" },
                     "method_name": { "type": "string", "description": "Method name to search (required for method_search)" }
@@ -54,23 +60,27 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "safe_to_delete".into(),
-            description: "Check whether a function, struct, or component can be safely deleted. \
-                          Evaluates all inbound references — callers, dependents, event consumers — \
+            description: "Check whether a Rust struct, symbol, or compatibility entity can be safely deleted. \
+                          Evaluates inbound references including callers, imports, dependents, and overlays — \
                           and returns a clear yes/no with evidence."
                 .into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "context": { "type": "string", "description": "Module or component name" },
-                    "entity": { "type": "string", "description": "Entity or symbol name to check" }
+                    "context": { "type": "string", "description": "Compatibility context name" },
+                    "module": { "type": "string", "description": "Rust module name/path alias for context" },
+                    "entity": { "type": "string", "description": "Compatibility entity name" },
+                    "struct": { "type": "string", "description": "Rust struct name alias for entity" },
+                    "symbol": { "type": "string", "description": "Rust symbol name alias for entity" }
                 },
-                "required": ["context", "entity"]
+                "required": []
             }),
         },
         ToolDefinition {
             name: "check".into(),
-            description: "Check for architectural problems: circular dependencies, layer violations, \
-                          missing business rules on core entities, isolated modules, or policy violations. \
+            description: "Check for architectural problems over the implemented Rust graph and semantic overlays: \
+                          circular dependencies, layer violations, missing business rules on core structs, \
+                          isolated modules, or policy violations. \
                           Run without parameters to check everything at once."
                 .into(),
             input_schema: json!({
@@ -87,8 +97,8 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "how_connected".into(),
-            description: "Show how two modules or components are connected. Returns the dependency \
-                          path(s) between them, proving whether and how they relate."
+            description: "Show how two Rust modules/components are connected. Returns proof paths \
+                          over stored dependency facts when available."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -118,8 +128,8 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "drift".into(),
-            description: "Compare planned architecture vs current implementation. Shows what's been \
-                          added, removed, or changed — and what still needs to be implemented."
+            description: "Compare the two most recent implemented architecture snapshots. Shows what was \
+                          added or removed in the actual graph over time."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -137,8 +147,8 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                 "properties": {
                     "state": {
                         "type": "string",
-                        "enum": ["planned", "current"],
-                        "description": "Which model state to query (default: planned)"
+                        "enum": ["actual", "implemented", "current", "planned"],
+                        "description": "Which history stream to query (default: actual; planned/current are compatibility aliases)"
                     },
                     "ts_old": {
                         "type": "integer",
@@ -154,8 +164,8 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "search".into(),
-            description: "Search the architecture by keyword. Finds matching modules, components, \
-                          services, events, and decisions across the entire codebase."
+            description: "Search the architecture by keyword. Finds matching Rust modules, structs, \
+                          semantic labels, services/events overlays, and decisions across the codebase."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -166,13 +176,88 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                 "required": ["query"]
             }),
         },
-    ]
+    ];
+
+    add_tool_alias(
+        &mut tools,
+        "architecture",
+        "get_model",
+        "Alias for architecture. Returns the implemented Rust ontology contract with health and temporal change status.",
+    );
+    add_tool_alias(
+        &mut tools,
+        "impact",
+        "query_blast_radius",
+        "Alias for impact. Runs dependency, impact, graph, field, method, and call-graph analyses.",
+    );
+    add_tool_alias(
+        &mut tools,
+        "safe_to_delete",
+        "can_delete_symbol",
+        "Alias for safe_to_delete. Checks whether a symbol can be deleted and returns inbound-reference witnesses.",
+    );
+    add_tool_alias(
+        &mut tools,
+        "check",
+        "check_architectural_invariant",
+        "Alias for check. Evaluates named architectural invariants and returns proof evidence.",
+    );
+    add_tool_alias(
+        &mut tools,
+        "how_connected",
+        "query_dependency_path",
+        "Alias for how_connected. Returns proof paths between two Rust modules/components.",
+    );
+    add_tool_alias(
+        &mut tools,
+        "why",
+        "explain_violation",
+        "Alias for why. Explains architectural violations with evidence and limitations.",
+    );
+    add_tool_alias(
+        &mut tools,
+        "drift",
+        "diff_models",
+        "Alias for drift. Compares recent implemented architecture snapshots.",
+    );
+    add_tool_alias(
+        &mut tools,
+        "search",
+        "search_architecture",
+        "Alias for search. Runs full-text search over stored architecture facts.",
+    );
+    tools.push(ToolDefinition {
+        name: "model_health".into(),
+        description: "Compute a structured Datalog-derived health report over implemented Rust facts and semantic overlays: score, cycles, layer violations, aggregate quality, orphan modules/contexts, and graph analytics when available.".into(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {},
+            "required": []
+        }),
+    });
+
+    tools
+}
+
+fn add_tool_alias(
+    tools: &mut Vec<ToolDefinition>,
+    source_name: &str,
+    alias_name: &str,
+    description: &str,
+) {
+    if let Some(source) = tools.iter().find(|tool| tool.name == source_name) {
+        tools.push(ToolDefinition {
+            name: alias_name.into(),
+            description: description.into(),
+            input_schema: source.input_schema.clone(),
+        });
+    }
 }
 
 /// Dispatches a tool call and returns the result.
 pub fn call_tool(store: &Store, workspace_path: &str, name: &str, args: &Value) -> ToolCallResult {
     match name {
-        "architecture" => {
+        "architecture" | "get_model" => {
             let kernel = ReasoningKernel::new(store);
             match kernel.architecture(workspace_path) {
                 Ok(claim) => stored_claim_result(store, workspace_path, &claim),
@@ -180,7 +265,46 @@ pub fn call_tool(store: &Store, workspace_path: &str, name: &str, args: &Value) 
             }
         }
 
-        "impact" => {
+        "model_health" => {
+            match store.model_health(workspace_path) {
+                Ok(health) => json_result(with_reasoning_context(
+                    json!({
+                        "status": "ok",
+                        "model_health": health,
+                    }),
+                    Some(json!({
+                        "rule": "model health is computed from persisted architecture relations",
+                        "derived_from": [
+                            "context_dep",
+                            "service",
+                            "entity",
+                            "invariant",
+                            "event",
+                            "context"
+                        ],
+                        "witness_count": health.circular_deps.len()
+                            + health.layer_violations.len()
+                            + health.missing_invariants.len()
+                            + health.orphan_contexts.len(),
+                    })),
+                    Some(json!({
+                        "score": health.score,
+                        "circular_dependency_count": health.circular_deps.len(),
+                        "layer_violation_count": health.layer_violations.len(),
+                        "missing_invariant_count": health.missing_invariants.len(),
+                        "orphan_context_count": health.orphan_contexts.len(),
+                    })),
+                    vec![
+                        "Model health uses the latest persisted implemented architecture facts.".into(),
+                        "Graph analytics are empty when the active Cozo runtime does not provide the required fixed rules.".into(),
+                    ],
+                    Some(json!({"source": "model_health", "state": "actual"})),
+                )),
+                Err(e) => error_result(format!("model_health failed: {e}")),
+            }
+        }
+
+        "impact" | "query_blast_radius" => {
             let kernel = ReasoningKernel::new(store);
             match kernel.impact(workspace_path, args) {
                 Ok(claim) => stored_claim_result(store, workspace_path, &claim),
@@ -188,14 +312,18 @@ pub fn call_tool(store: &Store, workspace_path: &str, name: &str, args: &Value) 
             }
         }
 
-        "safe_to_delete" => {
-            let context = match args["context"].as_str() {
+        "safe_to_delete" | "can_delete_symbol" => {
+            let context = match args["context"].as_str().or_else(|| args["module"].as_str()) {
                 Some(c) => c,
-                None => return error_result("'context' parameter is required".into()),
+                None => return error_result("'context' or 'module' parameter is required".into()),
             };
-            let entity = match args["entity"].as_str() {
+            let entity = match args["entity"]
+                .as_str()
+                .or_else(|| args["struct"].as_str())
+                .or_else(|| args["symbol"].as_str())
+            {
                 Some(e) => e,
-                None => return error_result("'entity' parameter is required".into()),
+                None => return error_result("'entity', 'struct', or 'symbol' parameter is required".into()),
             };
             let kernel = ReasoningKernel::new(store);
             match kernel.safe_to_delete(workspace_path, context, entity) {
@@ -204,7 +332,7 @@ pub fn call_tool(store: &Store, workspace_path: &str, name: &str, args: &Value) 
             }
         }
 
-        "check" => {
+        "check" | "check_architectural_invariant" => {
             let invariant = args["check_name"].as_str()
                 .or_else(|| args["invariant"].as_str())
                 .unwrap_or("all");
@@ -218,7 +346,7 @@ pub fn call_tool(store: &Store, workspace_path: &str, name: &str, args: &Value) 
             }
         }
 
-        "how_connected" => {
+        "how_connected" | "query_dependency_path" => {
             let from = args["from"].as_str()
                 .or_else(|| args["from_context"].as_str());
             let from = match from {
@@ -238,7 +366,7 @@ pub fn call_tool(store: &Store, workspace_path: &str, name: &str, args: &Value) 
             }
         }
 
-        "why" => {
+        "why" | "explain_violation" => {
             let violation_type = match args["violation_type"].as_str() {
                 Some(v) => v,
                 None => return error_result("'violation_type' parameter is required".into()),
@@ -251,7 +379,7 @@ pub fn call_tool(store: &Store, workspace_path: &str, name: &str, args: &Value) 
             }
         }
 
-        "drift" => {
+        "drift" | "diff_models" => {
             let kernel = ReasoningKernel::new(store);
             match kernel.drift(workspace_path) {
                 Ok(claim) => stored_claim_result(store, workspace_path, &claim),
@@ -267,7 +395,7 @@ pub fn call_tool(store: &Store, workspace_path: &str, name: &str, args: &Value) 
             }
         }
 
-        "search" => {
+        "search" | "search_architecture" => {
             let query = match args["query"].as_str() {
                 Some(q) => q,
                 None => return error_result("'query' parameter is required".into()),
@@ -299,9 +427,9 @@ fn truth_maintenance_json(store: &Store, workspace_path: &str) -> Value {
         .and_then(|report| serde_json::to_value(report).ok())
         .unwrap_or_else(|| {
             json!({
-                "asserted": {
-                    "knowledge_kind": "asserted",
-                    "state": "desired",
+                "implemented": {
+                    "knowledge_kind": "implemented",
+                    "state": "actual",
                     "available": false,
                     "snapshot_timestamp_us": null,
                     "context_count": 0,
@@ -369,6 +497,8 @@ fn stored_claim_result(
 
 /// Build a model overview purely from Datalog relations — replaces DomainRegistry.
 pub fn build_model_overview(store: &Store, workspace: &str, state: &str) -> Value {
+    let rust_ontology = build_rust_ontology_overview(store, workspace, state);
+
     // Load project metadata
     let project = store.run_datalog(
         "?[name, description, tech_stack_json, conventions_json, rules_json] := \
@@ -396,14 +526,20 @@ pub fn build_model_overview(store: &Store, workspace: &str, state: &str) -> Valu
             serde_json::from_str::<Value>(&row[3]).unwrap_or(json!({})),
             serde_json::from_str::<Value>(&row[4]).unwrap_or(json!([])),
         )
-    } else if contexts.is_empty() {
+    } else if contexts.is_empty() && !rust_ontology["available"].as_bool().unwrap_or(false) {
         return json!({});
     } else {
         let fallback_name = std::path::Path::new(workspace)
             .file_name()
             .map(|name| name.to_string_lossy().to_string())
             .unwrap_or_else(|| "Unnamed".into());
-        (fallback_name, String::new(), json!({}), json!({}), json!([]))
+        (
+            fallback_name,
+            String::new(),
+            json!({}),
+            json!({}),
+            json!([]),
+        )
     };
 
     let context_deps = store
@@ -594,11 +730,163 @@ pub fn build_model_overview(store: &Store, workspace: &str, state: &str) -> Valu
     json!({
         "project": proj_name,
         "description": proj_desc,
+        "ontology_contract": {
+            "ground_truth": "rust",
+            "primary_nodes": ["workspace", "crate", "module", "submodule", "source_file", "symbol"],
+            "overview_nodes": ["crate", "module", "submodule", "struct"],
+            "semantic_overlays": ["entity_candidate", "value_object_candidate", "service_candidate", "repository_candidate", "event_candidate"],
+            "ui": "The web graph is an overview projection; the stored Rust fact graph remains complete for MCP reasoning."
+        },
+        "rust_ontology": rust_ontology,
         "tech": tech,
         "bounded_contexts": bc_json,
         "rules": rules,
         "conventions": conventions,
     })
+}
+
+fn build_rust_ontology_overview(store: &Store, workspace: &str, state: &str) -> Value {
+    let model = match state {
+        "actual" | "implemented" | "current" => store.load_actual(workspace),
+        _ => store.load_desired(workspace),
+    }
+    .ok()
+    .flatten();
+
+    let Some(model) = model else {
+        return json!({
+            "available": false,
+            "contract": "Rust facts are the ground truth; no persisted model is available yet.",
+            "counts": {
+                "source_files": 0,
+                "symbols": 0,
+                "structs": 0,
+                "enums": 0,
+                "traits": 0,
+                "functions": 0,
+                "methods": 0,
+                "imports": 0,
+                "calls": 0
+            }
+        });
+    };
+
+    let mut symbol_counts: BTreeMap<String, usize> = BTreeMap::new();
+    let mut method_counts_by_owner: BTreeMap<String, usize> = BTreeMap::new();
+    for symbol in &model.symbols {
+        *symbol_counts.entry(symbol.kind.clone()).or_default() += 1;
+        if symbol.kind == "method"
+            && let Some((owner, _)) = symbol.name.split_once("::")
+        {
+            *method_counts_by_owner.entry(owner.to_string()).or_default() += 1;
+        }
+    }
+
+    let modules = rust_modules_for_overview(&model);
+    let module_json: Vec<Value> = modules
+        .iter()
+        .map(|(path, file_count)| {
+            json!({
+                "path": path,
+                "kind": if path.contains("::") { "submodule" } else { "module" },
+                "file_count": file_count,
+            })
+        })
+        .collect();
+
+    let structs: Vec<Value> = model
+        .symbols
+        .iter()
+        .filter(|symbol| symbol.kind == "struct")
+        .map(|symbol| {
+            json!({
+                "name": symbol.name,
+                "module": rust_module_path_from_file_path(&symbol.file_path),
+                "file_path": symbol.file_path,
+                "start_line": symbol.start_line,
+                "end_line": symbol.end_line,
+                "visibility": symbol.visibility,
+                "method_count": method_counts_by_owner.get(&symbol.name).copied().unwrap_or_default(),
+            })
+        })
+        .collect();
+
+    json!({
+        "available": true,
+        "contract": "Rust facts are the ground truth. DDD and pattern terms are semantic overlays, not primary storage nodes.",
+        "complete_fact_relations": ["source_file", "symbol", "import_edge", "calls_symbol", "ast_edge"],
+        "overview_projection": {
+            "nodes": ["crate", "module", "submodule", "struct"],
+            "edges": ["contains", "declares", "imports", "calls"],
+            "purpose": "Human-scale architecture overview; not a loss of stored MCP facts."
+        },
+        "counts": {
+            "source_files": model.source_files.len(),
+            "symbols": model.symbols.len(),
+            "structs": symbol_counts.get("struct").copied().unwrap_or_default(),
+            "enums": symbol_counts.get("enum").copied().unwrap_or_default(),
+            "traits": symbol_counts.get("trait").copied().unwrap_or_default(),
+            "functions": symbol_counts.get("function").copied().unwrap_or_default(),
+            "methods": symbol_counts.get("method").copied().unwrap_or_default(),
+            "imports": model.import_edges.len(),
+            "calls": model.call_edges.len(),
+        },
+        "modules": module_json,
+        "structs": structs,
+        "query_guidance": {
+            "overview": "Use architecture/get_model for the Rust ontology summary.",
+            "connectivity": "Use impact with dependency_graph, call_graph_callers, call_graph_callees, call_graph_reachability, or call_graph_stats.",
+            "deletion": "Use safe_to_delete with module + struct/symbol aliases.",
+            "refresh": "Use sync after code changes if the watcher has not already updated the graph."
+        }
+    })
+}
+
+fn rust_modules_for_overview(model: &DomainModel) -> BTreeMap<String, usize> {
+    let mut modules = BTreeMap::new();
+    for source_file in &model.source_files {
+        if let Some(path) = rust_module_path_from_file_path(&source_file.path) {
+            *modules.entry(path).or_default() += 1;
+        }
+    }
+    for context in &model.bounded_contexts {
+        for module in &context.modules {
+            if !module.path.is_empty() {
+                modules.entry(module.path.clone()).or_insert(0);
+            }
+        }
+    }
+    modules
+}
+
+fn rust_module_path_from_file_path(file_path: &str) -> Option<String> {
+    let normalized = file_path.replace('\\', "/");
+    let parts: Vec<&str> = normalized
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect();
+    let start = parts
+        .iter()
+        .position(|part| *part == "src")
+        .map_or(0, |index| index + 1);
+    let relative = &parts[start..];
+    let file_name = relative.last()?;
+    if !file_name.ends_with(".rs") {
+        return None;
+    }
+
+    let mut segments: Vec<String> = relative[..relative.len().saturating_sub(1)]
+        .iter()
+        .map(|segment| segment.to_string())
+        .collect();
+    let stem = file_name.trim_end_matches(".rs");
+    if stem != "mod" {
+        if (stem == "lib" || stem == "main") && segments.is_empty() {
+            return None;
+        }
+        segments.push(stem.to_string());
+    }
+    (!segments.is_empty()).then(|| segments.join("::"))
 }
 
 #[cfg(test)]
@@ -612,7 +900,7 @@ mod tests {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::SeqCst);
         let path = temp_dir().join(format!(
-            "dendrites_tools_test_{}_{}.db",
+            "axon_tools_test_{}_{}.db",
             std::process::id(),
             id
         ));
@@ -629,7 +917,17 @@ mod tests {
     #[test]
     fn test_list_tools_count() {
         let tools = list_tools();
-        assert_eq!(tools.len(), 9);
+        assert_eq!(tools.len(), 18);
+        let names: Vec<_> = tools.iter().map(|tool| tool.name.as_str()).collect();
+        assert!(names.contains(&"get_model"));
+        assert!(names.contains(&"model_health"));
+        assert!(names.contains(&"query_blast_radius"));
+        assert!(names.contains(&"can_delete_symbol"));
+        assert!(names.contains(&"check_architectural_invariant"));
+        assert!(names.contains(&"query_dependency_path"));
+        assert!(names.contains(&"explain_violation"));
+        assert!(names.contains(&"diff_models"));
+        assert!(names.contains(&"search_architecture"));
     }
 
     #[test]
@@ -663,8 +961,20 @@ mod tests {
             tech_stack: TechStack::default(),
             conventions: Conventions::default(),
             ast_edges: vec![],
-            source_files: vec![],
-            symbols: vec![],
+            source_files: vec![SourceFile {
+                path: "src/billing/service.rs".into(),
+                context: "Billing".into(),
+                language: "rust".into(),
+            }],
+            symbols: vec![SymbolDef {
+                name: "BillingService".into(),
+                kind: "struct".into(),
+                context: "Billing".into(),
+                file_path: "src/billing/service.rs".into(),
+                start_line: 1,
+                end_line: 12,
+                visibility: "public".into(),
+            }],
             import_edges: vec![],
             call_edges: vec![],
         };
@@ -677,7 +987,17 @@ mod tests {
         let ContentBlock::Text { text } = &result.content[0];
         let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
         assert_eq!(parsed["claim_kind"], "architecture");
-        assert_eq!(parsed["status"], "in_sync");
+        assert_eq!(parsed["status"], "ok");
+        assert!(parsed["implemented"].is_object());
+        assert_eq!(
+            parsed["implemented"]["ontology_contract"]["ground_truth"],
+            "rust"
+        );
+        assert_eq!(parsed["implemented"]["rust_ontology"]["available"], true);
+        assert_eq!(
+            parsed["implemented"]["rust_ontology"]["counts"]["structs"],
+            1
+        );
         assert_eq!(parsed["health"]["score"], 98);
     }
 
@@ -922,8 +1242,13 @@ mod tests {
         // Order has no references, so it should be deletable
         assert_eq!(parsed["status"], "true");
         assert_eq!(parsed["claim_kind"], "safe_to_delete");
-        assert_eq!(parsed["provenance"]["state"], "desired_vs_actual");
-        assert!(parsed["proof"]["rule"].as_str().unwrap().contains("deletable"));
+        assert_eq!(parsed["provenance"]["state"], "actual");
+        assert!(
+            parsed["proof"]["rule"]
+                .as_str()
+                .unwrap()
+                .contains("deletable")
+        );
         assert!(!parsed["limitations"].as_array().unwrap().is_empty());
     }
 
@@ -945,7 +1270,7 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
         assert_eq!(parsed["status"], "true");
         assert_eq!(parsed["count"], 0);
-        assert_eq!(parsed["provenance"]["state"], "desired");
+        assert_eq!(parsed["provenance"]["state"], "actual");
         assert_eq!(parsed["proof"]["derived_from"][0], "context_dep");
         assert!(!parsed["limitations"].as_array().unwrap().is_empty());
     }
@@ -1039,7 +1364,7 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
         assert_eq!(parsed["reachable"], true);
         assert_eq!(parsed["claim_kind"], "how_connected");
-        assert_eq!(parsed["provenance"]["state"], "desired");
+        assert_eq!(parsed["provenance"]["state"], "actual");
         assert_eq!(parsed["proof"]["derived_from"][0], "context_dep");
         assert!(!parsed["limitations"].as_array().unwrap().is_empty());
     }

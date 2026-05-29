@@ -15,9 +15,9 @@ if [[ -z "$version" ]]; then
 fi
 
 root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-formula_path="$root_dir/Formula/dendrites.rb"
+formula_path="$root_dir/Formula/axon.rb"
 tag="v$version"
-archive_url="https://github.com/flavioaiello/dendrites/archive/refs/tags/$tag.tar.gz"
+archive_url="https://github.com/flavioaiello/axon/archive/refs/tags/$tag.tar.gz"
 
 if [[ ! -f "$formula_path" ]]; then
   echo "Formula not found: $formula_path" >&2
@@ -36,7 +36,7 @@ if ! git -C "$root_dir" ls-remote --exit-code --tags "$remote" "refs/tags/$tag" 
   exit 1
 fi
 
-archive_path="$(mktemp "/tmp/dendrites-${version}.XXXXXX.tar.gz")"
+archive_path="$(mktemp "/tmp/axon-${version}.XXXXXX.tar.gz")"
 trap 'rm -f "$archive_path"' EXIT
 
 curl -fsSL "$archive_url" -o "$archive_path"

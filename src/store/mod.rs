@@ -8,9 +8,9 @@ use std::sync::Arc;
 
 // ─── Crate Entry ───────────────────────────────────────────────────────────
 
-/// A discovered crate within a workspace, with its own CozoDB store.
+/// A discovered crate within a workspace, with its own in-memory CozoDB store.
 ///
-/// Each crate gets an independent database at `<crate_root>/.dendrites/store.db`.
+/// Each crate gets an independent store for the lifetime of the current process.
 /// The `workspace_key()` value is the canonical crate root path, used as the
 /// `workspace` column value in all CozoDB relations.
 pub struct CrateEntry {
@@ -33,11 +33,11 @@ impl CrateEntry {
 
 /// Registry of per-crate CozoDB stores for a workspace.
 ///
-/// Replaces the old global `~/.dendrites/dendrites.db` with one database per
-/// crate at `<crate_root>/.dendrites/store.db`. This provides:
+/// Replaces the old global `~/.axon/axon.db` with one in-memory store
+/// per crate. This provides:
 ///
 /// - **Multi-project isolation**: different VS Code projects → different crate
-///   roots → independent databases.
+///   roots → independent stores.
 /// - **Multi-crate support**: a workspace with multiple crates gets one store
 ///   per crate, each tracking its own domain model independently.
 pub struct CrateRegistry {
@@ -62,12 +62,11 @@ impl CrateRegistry {
 
         let mut crates = Vec::with_capacity(crate_roots.len());
         for (name, root) in crate_roots {
-            let db_path = root.join(".dendrites").join("store.db");
-            let store = Arc::new(Store::open(&db_path).with_context(|| {
+            let store = Arc::new(Store::open(&root).with_context(|| {
                 format!(
-                    "Failed to open store for crate '{}' at {}",
+                    "Failed to open in-memory store for crate '{}' rooted at {}",
                     name,
-                    db_path.display()
+                    root.display()
                 )
             })?);
             crates.push(CrateEntry { name, root, store });

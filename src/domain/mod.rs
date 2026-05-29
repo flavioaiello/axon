@@ -1,6 +1,5 @@
 pub mod analyze;
 pub mod model;
-pub mod polyglot;
 pub mod rust_syn;
 pub mod scanner;
 

@@ -13,23 +13,21 @@ use crate::domain::model::*;
 /// - Every domain element is stored as a **first-class relational tuple**.
 /// - Sub-structures (fields, methods, parameters, invariants, validation rules)
 ///   are their own relations — not JSON blobs. Datalog can reason about them directly.
-/// - All domain relations carry `state: 'desired' | 'actual'` for set-theoretic diffing.
-/// - Diff, accept, and reset are **pure Datalog set operations**.
+/// - Domain/source relations use Cozo `Validity` for point-in-time actual-state history.
+/// - Diffs are temporal comparisons over the implemented graph, not desired-vs-actual slices.
 /// - `DomainModel` structs are reconstructed on-demand from relations.
 pub struct Store {
     db: DbInstance,
 }
 
 impl Store {
-    /// Open (or create) the store at a specific path.
-    pub fn open(path: &Path) -> Result<Self> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create directory: {}", parent.display()))?;
-        }
-
-        let db = DbInstance::new("sqlite", path.to_str().unwrap_or(""), Default::default())
-            .map_err(|e| anyhow::anyhow!("Failed to open CozoDB: {:?}", e))?;
+    /// Open an in-memory store.
+    ///
+    /// The path parameter is retained for callers that still derive a crate-local
+    /// store location, but CozoDB data now lives only for the process lifetime.
+    pub fn open(_path: &Path) -> Result<Self> {
+        let db = DbInstance::new("mem", "", Default::default())
+            .map_err(|e| anyhow::anyhow!("Failed to open in-memory CozoDB: {:?}", e))?;
 
         Self::init_schema(&db)?;
         Ok(Self { db })
@@ -191,49 +189,49 @@ impl Store {
         let schemas = vec![
             // Project metadata (rules/tech/conventions as JSON — config, not domain topology)
             ":create project { workspace: String => name: String, description: String default '', updated_at: String, rules_json: String default '[]', tech_stack_json: String default '{}', conventions_json: String default '{}' }",
-            // ── Domain element headers (all with Validity for time-travel) ──
-            ":create context { workspace: String, name: String, state: String, vld: Validity default 'ASSERT' => description: String default '', module_path: String default '' }",
-            ":create context_dep { workspace: String, from_ctx: String, to_ctx: String, state: String, vld: Validity default 'ASSERT' }",
-            ":create owner_meta { workspace: String, context: String, owner_kind: String, owner: String, state: String, vld: Validity default 'ASSERT' => team: String default '', owners_json: String default '[]', rationale: String default '' }",
-            ":create aggregate { workspace: String, context: String, name: String, state: String, vld: Validity default 'ASSERT' => description: String default '', root_entity: String default '' }",
-            ":create aggregate_member { workspace: String, context: String, aggregate: String, member_kind: String, member: String, state: String, vld: Validity default 'ASSERT' }",
-            ":create entity { workspace: String, context: String, name: String, state: String, vld: Validity default 'ASSERT' => description: String default '', aggregate_root: Bool default false, file_path: String default '', start_line: Int default 0, end_line: Int default 0 }",
-            ":create policy { workspace: String, context: String, name: String, state: String, vld: Validity default 'ASSERT' => description: String default '', kind: String default 'domain' }",
-            ":create policy_link { workspace: String, context: String, policy: String, link_kind: String, link: String, idx: Int, state: String, vld: Validity default 'ASSERT' }",
-            ":create read_model { workspace: String, context: String, name: String, state: String, vld: Validity default 'ASSERT' => description: String default '', source: String default '' }",
-            ":create service { workspace: String, context: String, name: String, state: String, vld: Validity default 'ASSERT' => description: String default '', kind: String default 'domain', file_path: String default '', start_line: Int default 0, end_line: Int default 0 }",
-            ":create service_dep { workspace: String, context: String, service: String, dep: String, state: String, vld: Validity default 'ASSERT' }",
-            ":create event { workspace: String, context: String, name: String, state: String, vld: Validity default 'ASSERT' => description: String default '', source: String default '', file_path: String default '', start_line: Int default 0, end_line: Int default 0 }",
-            ":create value_object { workspace: String, context: String, name: String, state: String, vld: Validity default 'ASSERT' => description: String default '', file_path: String default '', start_line: Int default 0, end_line: Int default 0 }",
-            ":create repository { workspace: String, context: String, name: String, state: String, vld: Validity default 'ASSERT' => aggregate: String default '', file_path: String default '', start_line: Int default 0, end_line: Int default 0 }",
-            ":create module { workspace: String, context: String, name: String, state: String, vld: Validity default 'ASSERT' => path: String default '', public: Bool default false, file_path: String default '', description: String default '' }",
-            ":create external_system { workspace: String, name: String, state: String, vld: Validity default 'ASSERT' => description: String default '', kind: String default '', rationale: String default '' }",
-            ":create external_system_context { workspace: String, system: String, context: String, idx: Int, state: String, vld: Validity default 'ASSERT' }",
-            ":create api_endpoint { workspace: String, context: String, id: String, state: String, vld: Validity default 'ASSERT' => service_id: String default '', method: String default '', route_pattern: String default '', description: String default '' }",
-            ":create invokes_endpoint { workspace: String, caller_context: String, caller_method: String, endpoint_id: String, state: String, vld: Validity default 'ASSERT' }",
-            ":create calls_external_system { workspace: String, caller_context: String, caller_method: String, ext_id: String, state: String, vld: Validity default 'ASSERT' }",
-            ":create architectural_decision { workspace: String, id: String, state: String, vld: Validity default 'ASSERT' => title: String default '', status: String default 'proposed', scope: String default '', date: String default '', rationale: String default '' }",
-            ":create decision_context { workspace: String, decision_id: String, context: String, idx: Int, state: String, vld: Validity default 'ASSERT' }",
-            ":create decision_consequence { workspace: String, decision_id: String, idx: Int, state: String, vld: Validity default 'ASSERT' => text: String default '' }",
+            // ── Domain element headers (all with Validity for actual-state time-travel) ──
+            ":create context { workspace: String, name: String, vld: Validity default 'ASSERT' => description: String default '', module_path: String default '' }",
+            ":create context_dep { workspace: String, from_ctx: String, to_ctx: String, vld: Validity default 'ASSERT' }",
+            ":create owner_meta { workspace: String, context: String, owner_kind: String, owner: String, vld: Validity default 'ASSERT' => team: String default '', owners_json: String default '[]', rationale: String default '' }",
+            ":create aggregate { workspace: String, context: String, name: String, vld: Validity default 'ASSERT' => description: String default '', root_entity: String default '' }",
+            ":create aggregate_member { workspace: String, context: String, aggregate: String, member_kind: String, member: String, vld: Validity default 'ASSERT' }",
+            ":create entity { workspace: String, context: String, name: String, vld: Validity default 'ASSERT' => description: String default '', aggregate_root: Bool default false, file_path: String default '', start_line: Int default 0, end_line: Int default 0 }",
+            ":create policy { workspace: String, context: String, name: String, vld: Validity default 'ASSERT' => description: String default '', kind: String default 'domain' }",
+            ":create policy_link { workspace: String, context: String, policy: String, link_kind: String, link: String, idx: Int, vld: Validity default 'ASSERT' }",
+            ":create read_model { workspace: String, context: String, name: String, vld: Validity default 'ASSERT' => description: String default '', source: String default '' }",
+            ":create service { workspace: String, context: String, name: String, vld: Validity default 'ASSERT' => description: String default '', kind: String default 'domain', file_path: String default '', start_line: Int default 0, end_line: Int default 0 }",
+            ":create service_dep { workspace: String, context: String, service: String, dep: String, vld: Validity default 'ASSERT' }",
+            ":create event { workspace: String, context: String, name: String, vld: Validity default 'ASSERT' => description: String default '', source: String default '', file_path: String default '', start_line: Int default 0, end_line: Int default 0 }",
+            ":create value_object { workspace: String, context: String, name: String, vld: Validity default 'ASSERT' => description: String default '', file_path: String default '', start_line: Int default 0, end_line: Int default 0 }",
+            ":create repository { workspace: String, context: String, name: String, vld: Validity default 'ASSERT' => aggregate: String default '', file_path: String default '', start_line: Int default 0, end_line: Int default 0 }",
+            ":create module { workspace: String, context: String, name: String, vld: Validity default 'ASSERT' => path: String default '', public: Bool default false, file_path: String default '', description: String default '' }",
+            ":create external_system { workspace: String, name: String, vld: Validity default 'ASSERT' => description: String default '', kind: String default '', rationale: String default '' }",
+            ":create external_system_context { workspace: String, system: String, context: String, idx: Int, vld: Validity default 'ASSERT' }",
+            ":create api_endpoint { workspace: String, context: String, id: String, vld: Validity default 'ASSERT' => service_id: String default '', method: String default '', route_pattern: String default '', description: String default '' }",
+            ":create invokes_endpoint { workspace: String, caller_context: String, caller_method: String, endpoint_id: String, vld: Validity default 'ASSERT' }",
+            ":create calls_external_system { workspace: String, caller_context: String, caller_method: String, ext_id: String, vld: Validity default 'ASSERT' }",
+            ":create architectural_decision { workspace: String, id: String, vld: Validity default 'ASSERT' => title: String default '', status: String default 'proposed', scope: String default '', date: String default '', rationale: String default '' }",
+            ":create decision_context { workspace: String, decision_id: String, context: String, idx: Int, vld: Validity default 'ASSERT' }",
+            ":create decision_consequence { workspace: String, decision_id: String, idx: Int, vld: Validity default 'ASSERT' => text: String default '' }",
             // ── First-class sub-structures ──
-            ":create invariant { workspace: String, context: String, entity: String, idx: Int, state: String, vld: Validity default 'ASSERT' => text: String }",
-            ":create field { workspace: String, context: String, owner_kind: String, owner: String, name: String, state: String, vld: Validity default 'ASSERT' => field_type: String default '', required: Bool default false, description: String default '', idx: Int default 0 }",
-            ":create method { workspace: String, context: String, owner_kind: String, owner: String, name: String, state: String, vld: Validity default 'ASSERT' => description: String default '', return_type: String default '', idx: Int default 0 }",
-            ":create method_param { workspace: String, context: String, owner_kind: String, owner: String, method: String, name: String, state: String, vld: Validity default 'ASSERT' => param_type: String default '', required: Bool default false, description: String default '', idx: Int default 0 }",
-            ":create vo_rule { workspace: String, context: String, value_object: String, idx: Int, state: String, vld: Validity default 'ASSERT' => text: String }",
+            ":create invariant { workspace: String, context: String, entity: String, idx: Int, vld: Validity default 'ASSERT' => text: String }",
+            ":create field { workspace: String, context: String, owner_kind: String, owner: String, name: String, vld: Validity default 'ASSERT' => field_type: String default '', required: Bool default false, description: String default '', idx: Int default 0 }",
+            ":create method { workspace: String, context: String, owner_kind: String, owner: String, name: String, vld: Validity default 'ASSERT' => description: String default '', return_type: String default '', idx: Int default 0 }",
+            ":create method_param { workspace: String, context: String, owner_kind: String, owner: String, method: String, name: String, vld: Validity default 'ASSERT' => param_type: String default '', required: Bool default false, description: String default '', idx: Int default 0 }",
+            ":create vo_rule { workspace: String, context: String, value_object: String, idx: Int, vld: Validity default 'ASSERT' => text: String }",
             // ── Architecture policy relations (no state, no Validity) ──
             ":create layer_assignment { workspace: String, context: String => layer: String }",
             ":create dependency_constraint { workspace: String, constraint_kind: String, source: String, target: String => rule: String default 'forbidden' }",
             // Ephemeral — no state column
             ":create live_import { workspace: String, from_file: String, to_module: String }",
             // AST structural edges (extends, implements, decorators)
-            ":create ast_edge { workspace: String, state: String, from_node: String, to_node: String, edge_type: String, vld: Validity default 'ASSERT' }",
+            ":create ast_edge { workspace: String, from_node: String, to_node: String, edge_type: String, vld: Validity default 'ASSERT' }",
             // ── Source-level relations ──
-            ":create source_file { workspace: String, path: String, state: String, vld: Validity default 'ASSERT' => context: String default '', language: String default '' }",
-            ":create symbol { workspace: String, name: String, state: String, vld: Validity default 'ASSERT' => kind: String default '', context: String default '', file_path: String default '', start_line: Int default 0, end_line: Int default 0, visibility: String default 'public' }",
-            ":create import_edge { workspace: String, from_file: String, to_module: String, state: String, vld: Validity default 'ASSERT' => context: String default '' }",
+            ":create source_file { workspace: String, path: String, vld: Validity default 'ASSERT' => context: String default '', language: String default '' }",
+            ":create symbol { workspace: String, name: String, vld: Validity default 'ASSERT' => kind: String default '', context: String default '', file_path: String default '', start_line: Int default 0, end_line: Int default 0, visibility: String default 'public' }",
+            ":create import_edge { workspace: String, from_file: String, to_module: String, vld: Validity default 'ASSERT' => context: String default '' }",
             // ── Symbol-level call graph ──
-            ":create calls_symbol { workspace: String, caller: String, callee: String, state: String, vld: Validity default 'ASSERT' => file_path: String default '', line: Int default 0, context: String default '' }",
+            ":create calls_symbol { workspace: String, caller: String, callee: String, vld: Validity default 'ASSERT' => file_path: String default '', line: Int default 0, context: String default '' }",
             // ── Drift model ──
             ":create drift { workspace: String, category: String, context: String, name: String, change_type: String, vld: Validity default 'ASSERT' => detail: String default '' }",
             ":create drift_meta { workspace: String => computed_at_us: Int default 0 }",
@@ -245,11 +243,14 @@ impl Store {
             ":create reasoning_dependency { workspace: String, claim_id: String, idx: Int => dependency_kind: String default '', dependency_state: String default '', basis_timestamp_us: Int default 0 }",
             ":create reasoning_justification { workspace: String, claim_id: String, idx: Int => fact_kind: String default '', fact_key: String default '', fact_state: String default '', basis_timestamp_us: Int default 0 }",
             // ── Snapshot log (explicit timestamp tracking for list_snapshots) ──
-            ":create snapshot_log { workspace: String, state: String, timestamp_us: Int => label: String default '' }",
+            ":create snapshot_log { workspace: String, timestamp_us: Int => label: String default '' }",
         ];
 
         for schema in schemas {
-            let _ = db.run_script(schema, Default::default(), ScriptMutability::Mutable);
+            db.run_script(schema, Default::default(), ScriptMutability::Mutable)
+                .map_err(|e| {
+                    anyhow::anyhow!("Failed to create Cozo schema relation from `{schema}`: {e:?}")
+                })?;
         }
 
         // ── Secondary indices ──
@@ -294,7 +295,10 @@ impl Store {
             "::index create calls_symbol:by_context {context}",
         ];
         for idx in indices {
-            let _ = db.run_script(idx, Default::default(), ScriptMutability::Mutable);
+            db.run_script(idx, Default::default(), ScriptMutability::Mutable)
+                .map_err(|e| {
+                    anyhow::anyhow!("Failed to create Cozo secondary index from `{idx}`: {e:?}")
+                })?;
         }
 
         // ── Full-text search indices ──
@@ -343,7 +347,10 @@ impl Store {
             }",
         ];
         for idx in fts_indices {
-            let _ = db.run_script(idx, Default::default(), ScriptMutability::Mutable);
+            db.run_script(idx, Default::default(), ScriptMutability::Mutable)
+                .map_err(|e| {
+                    anyhow::anyhow!("Failed to create Cozo full-text index from `{idx}`: {e:?}")
+                })?;
         }
 
         Ok(())
@@ -351,15 +358,15 @@ impl Store {
 
     // ── Core State Operations ──────────────────────────────────────────────
 
-    /// Save the desired domain model: decomposes into relational rows with `state='desired'`.
+    /// Compatibility alias for saving the current implemented model.
     pub fn save_desired(&self, workspace_path: &str, model: &DomainModel) -> Result<()> {
         let ws = canonicalize_path(workspace_path);
-        self.save_state(&ws, model, "desired")
+        self.save_state(&ws, model, "actual")
     }
 
-    /// Load the desired domain model (reconstructed from relations).
+    /// Compatibility alias for loading the current implemented model.
     pub fn load_desired(&self, workspace_path: &str) -> Result<Option<DomainModel>> {
-        self.reconstruct_model(workspace_path, "desired")
+        self.reconstruct_model(workspace_path, "actual")
     }
 
     /// Load the actual domain model (reconstructed from relations).
@@ -373,6 +380,12 @@ impl Store {
         self.save_state(&ws, model, "actual")
     }
 
+    /// Record a temporal checkpoint for the current implemented graph.
+    pub fn record_actual_snapshot(&self, workspace_path: &str) -> Result<i64> {
+        let ws = canonicalize_path(workspace_path);
+        self.record_snapshot(&ws, "actual")
+    }
+
     fn run_mutation_script(
         &self,
         script: &str,
@@ -380,10 +393,19 @@ impl Store {
         context: impl Into<String>,
     ) -> Result<()> {
         let context = context.into();
-        self.db
-            .run_script(script, params, ScriptMutability::Mutable)
+        self.run_script(script, params, ScriptMutability::Mutable)
             .map(|_| ())
             .map_err(|e| anyhow::anyhow!("{context}: {:?}", e))
+    }
+
+    fn run_script(
+        &self,
+        script: &str,
+        params: BTreeMap<String, cozo::DataValue>,
+        mutability: ScriptMutability,
+    ) -> std::result::Result<cozo::NamedRows, cozo::Error> {
+        let script = strip_state_dimension_from_script(script);
+        self.db.run_script(&script, params, mutability)
     }
 
     fn save_project_metadata(&self, workspace: &str, model: &DomainModel) -> Result<()> {
@@ -409,24 +431,16 @@ impl Store {
         )
     }
 
-    /// Accept: promote desired → actual via Datalog state copy.
+    /// Compatibility no-op: actual-first storage has no desired graph to promote.
     pub fn accept(&self, workspace_path: &str) -> Result<()> {
-        let ws = canonicalize_path(workspace_path);
-        self.copy_state(&ws, "desired", "actual")?;
         self.invalidate_reasoning_claims_for_dependency(workspace_path, "actual")?;
         Ok(())
     }
 
-    /// Reset: revert desired → actual via Datalog state copy, return the restored model.
+    /// Compatibility no-op: actual-first storage returns the current implemented model.
     pub fn reset(&self, workspace_path: &str) -> Result<Option<DomainModel>> {
-        let ws = canonicalize_path(workspace_path);
-        let has_actual = self.load_actual(workspace_path)?.is_some();
-        if !has_actual {
-            return Ok(None);
-        }
-        self.copy_state(&ws, "actual", "desired")?;
-        self.invalidate_reasoning_claims_for_dependency(workspace_path, "desired")?;
-        self.load_desired(workspace_path)
+        self.invalidate_reasoning_claims_for_dependency(workspace_path, "actual")?;
+        self.load_actual(workspace_path)
     }
 
     // ── Private: Sub-structure Helpers ──────────────────────────────────────
@@ -454,7 +468,7 @@ impl Store {
             ]);
             params.insert("req".into(), cozo::DataValue::Bool(f.required));
             params.insert("idx".into(), int_dv(i as i64));
-            self.db
+            self
                 .run_script(
                     "?[workspace, context, owner_kind, owner, name, state, field_type, required, description, idx] <- \
                         [[$ws, $ctx, $ok, $ow, $name, $st, $ft, $req, $desc, $idx]] \
@@ -489,7 +503,7 @@ impl Store {
                 ("rt", &m.return_type),
             ]);
             params.insert("idx".into(), int_dv(i as i64));
-            self.db
+            self
                 .run_script(
                     "?[workspace, context, owner_kind, owner, name, state, description, return_type, idx] <- \
                         [[$ws, $ctx, $ok, $ow, $name, $st, $desc, $rt, $idx]] \
@@ -514,7 +528,7 @@ impl Store {
                 ]);
                 pp.insert("req".into(), cozo::DataValue::Bool(p.required));
                 pp.insert("idx".into(), int_dv(j as i64));
-                self.db
+                self
                     .run_script(
                         "?[workspace, context, owner_kind, owner, method, name, state, param_type, required, description, idx] <- \
                             [[$ws, $ctx, $ok, $ow, $method, $name, $st, $pt, $req, $desc, $idx]] \
@@ -546,7 +560,7 @@ impl Store {
         state: &str,
     ) -> Result<()> {
         let owners_json = serde_json::to_string(&ownership.owners).unwrap_or_else(|_| "[]".into());
-        self.db
+        self
             .run_script(
                 "?[workspace, context, owner_kind, owner, state, team, owners_json, rationale] <- [[$ws, $ctx, $ok, $owner, $st, $team, $owners, $rationale]] :put owner_meta { workspace, context, owner_kind, owner, state => team, owners_json, rationale }",
                 params_map(&[
@@ -630,7 +644,7 @@ impl Store {
                 ("text", invariant),
             ]);
             params.insert("idx".into(), int_dv(idx as i64));
-            self.db.run_script(
+            self.run_script(
                 "?[workspace, context, entity, idx, state, text] <- [[$ws, $ctx, $entity, $idx, 'desired', $text]] :put invariant { workspace, context, entity, idx, state => text }",
                 params,
                 ScriptMutability::Mutable,
@@ -659,7 +673,7 @@ impl Store {
                 ("text", rule),
             ]);
             params.insert("idx".into(), int_dv(idx as i64));
-            self.db.run_script(
+            self.run_script(
                 "?[workspace, context, value_object, idx, state, text] <- [[$ws, $ctx, $vo, $idx, 'desired', $text]] :put vo_rule { workspace, context, value_object, idx, state => text }",
                 params,
                 ScriptMutability::Mutable,
@@ -681,7 +695,7 @@ impl Store {
             format!("replace service dependencies for {service}"),
         )?;
         for dep in dependencies {
-            self.db.run_script(
+            self.run_script(
                 "?[workspace, context, service, dep, state] <- [[$ws, $ctx, $service, $dep, 'desired']] :put service_dep { workspace, context, service, dep, state }",
                 params_map(&[("ws", ws), ("ctx", ctx), ("service", service), ("dep", dep)]),
                 ScriptMutability::Mutable,
@@ -693,7 +707,6 @@ impl Store {
     fn ensure_project(&self, workspace_path: &str) -> Result<()> {
         let ws = canonicalize_path(workspace_path);
         let has_project = self
-            .db
             .run_script(
                 "?[name] := *project{workspace: $ws, name}",
                 params_map(&[("ws", &ws)]),
@@ -729,7 +742,6 @@ impl Store {
             ("st", state),
         ]);
         let rows = self
-            .db
             .run_script(
                 "?[name, field_type, required, description, idx] := \
                     *field{workspace: $ws, context: $ctx, owner_kind: $ok, owner: $ow, \
@@ -775,7 +787,6 @@ impl Store {
             ("st", state),
         ]);
         let rows = self
-            .db
             .run_script(
                 "?[name, description, return_type, idx] := \
                     *method{workspace: $ws, context: $ctx, owner_kind: $ok, owner: $ow, \
@@ -799,7 +810,6 @@ impl Store {
                     ("st", state),
                 ]);
                 let param_rows = self
-                    .db
                     .run_script(
                         "?[name, param_type, required, description, idx] := \
                             *method_param{workspace: $ws, context: $ctx, owner_kind: $ok, \
@@ -854,7 +864,6 @@ impl Store {
         state: &str,
     ) -> Ownership {
         let rows = self
-            .db
             .run_script(
                 "?[team, owners_json, rationale] := *owner_meta{workspace: $ws, context: $ctx, owner_kind: $ok, owner: $owner, state: $st, team, owners_json, rationale @ 'NOW'}",
                 params_map(&[("ws", ws), ("ctx", ctx), ("ok", owner_kind), ("owner", owner), ("st", state)]),
@@ -881,7 +890,6 @@ impl Store {
         params: BTreeMap<String, cozo::DataValue>,
     ) -> Vec<String> {
         let rows = self
-            .db
             .run_script(query, params, ScriptMutability::Immutable)
             .map(|r| r.rows)
             .unwrap_or_default();
@@ -906,7 +914,6 @@ impl Store {
     fn query_invariants(&self, ws: &str, ctx: &str, entity: &str, state: &str) -> Vec<String> {
         let params = params_map(&[("ws", ws), ("ctx", ctx), ("ent", entity), ("st", state)]);
         let rows = self
-            .db
             .run_script(
                 "?[idx, text] := \
                     *invariant{workspace: $ws, context: $ctx, entity: $ent, \
@@ -929,7 +936,6 @@ impl Store {
     fn query_vo_rules(&self, ws: &str, ctx: &str, vo: &str, state: &str) -> Vec<String> {
         let params = params_map(&[("ws", ws), ("ctx", ctx), ("vo", vo), ("st", state)]);
         let rows = self
-            .db
             .run_script(
                 "?[idx, text] := \
                     *vo_rule{workspace: $ws, context: $ctx, value_object: $vo, \
@@ -971,7 +977,7 @@ impl Store {
                 ("desc", &bc.description),
                 ("mp", &bc.module_path),
             ]);
-            self.db.run_script(
+            self.run_script(
                 "?[workspace, name, state, description, module_path] <- [[$ws, $name, $st, $desc, $mp]] :put context { workspace, name, state => description, module_path }",
                 params,
                 ScriptMutability::Mutable,
@@ -987,7 +993,7 @@ impl Store {
             )?;
 
             for dep in &bc.dependencies {
-                self.db.run_script(
+                self.run_script(
                     "?[workspace, from_ctx, to_ctx, state] <- [[$ws, $from, $to, $st]] :put context_dep { workspace, from_ctx, to_ctx, state }",
                     params_map(&[("ws", workspace), ("from", &bc.name), ("to", dep), ("st", state)]),
                     ScriptMutability::Mutable,
@@ -995,7 +1001,7 @@ impl Store {
             }
 
             for aggregate in &bc.aggregates {
-                self.db.run_script(
+                self.run_script(
                     "?[workspace, context, name, state, description, root_entity] <- [[$ws, $ctx, $name, $st, $desc, $root]] :put aggregate { workspace, context, name, state => description, root_entity }",
                     params_map(&[("ws", workspace), ("ctx", &bc.name), ("name", &aggregate.name), ("st", state), ("desc", &aggregate.description), ("root", &aggregate.root_entity)]),
                     ScriptMutability::Mutable,
@@ -1009,14 +1015,14 @@ impl Store {
                     state,
                 )?;
                 for entity in &aggregate.entities {
-                    self.db.run_script(
+                    self.run_script(
                         "?[workspace, context, aggregate, member_kind, member, state] <- [[$ws, $ctx, $agg, 'entity', $member, $st]] :put aggregate_member { workspace, context, aggregate, member_kind, member, state }",
                         params_map(&[("ws", workspace), ("ctx", &bc.name), ("agg", &aggregate.name), ("member", entity), ("st", state)]),
                         ScriptMutability::Mutable,
                     ).map_err(|e| anyhow::anyhow!("save aggregate entity member: {:?}", e))?;
                 }
                 for value_object in &aggregate.value_objects {
-                    self.db.run_script(
+                    self.run_script(
                         "?[workspace, context, aggregate, member_kind, member, state] <- [[$ws, $ctx, $agg, 'value_object', $member, $st]] :put aggregate_member { workspace, context, aggregate, member_kind, member, state }",
                         params_map(&[("ws", workspace), ("ctx", &bc.name), ("agg", &aggregate.name), ("member", value_object), ("st", state)]),
                         ScriptMutability::Mutable,
@@ -1039,7 +1045,7 @@ impl Store {
                 );
                 params.insert("sl".into(), int_dv(entity.start_line.unwrap_or(0) as i64));
                 params.insert("el".into(), int_dv(entity.end_line.unwrap_or(0) as i64));
-                self.db.run_script(
+                self.run_script(
                     "?[workspace, context, name, state, description, aggregate_root, file_path, start_line, end_line] <- [[$ws, $ctx, $name, $st, $desc, $agg, $file, $sl, $el]] :put entity { workspace, context, name, state => description, aggregate_root, file_path, start_line, end_line }",
                     params,
                     ScriptMutability::Mutable,
@@ -1069,7 +1075,7 @@ impl Store {
                         ("text", inv),
                     ]);
                     params.insert("idx".into(), int_dv(idx as i64));
-                    self.db.run_script(
+                    self.run_script(
                         "?[workspace, context, entity, idx, state, text] <- [[$ws, $ctx, $ent, $idx, $st, $text]] :put invariant { workspace, context, entity, idx, state => text }",
                         params,
                         ScriptMutability::Mutable,
@@ -1079,7 +1085,7 @@ impl Store {
 
             for policy in &bc.policies {
                 let kind_str = Self::policy_kind_key(&policy.kind).to_string();
-                self.db.run_script(
+                self.run_script(
                     "?[workspace, context, name, state, description, kind] <- [[$ws, $ctx, $name, $st, $desc, $kind]] :put policy { workspace, context, name, state => description, kind }",
                     params_map(&[("ws", workspace), ("ctx", &bc.name), ("name", &policy.name), ("st", state), ("desc", &policy.description), ("kind", &kind_str)]),
                     ScriptMutability::Mutable,
@@ -1101,7 +1107,7 @@ impl Store {
                         ("st", state),
                     ]);
                     params.insert("idx".into(), int_dv(idx as i64));
-                    self.db.run_script(
+                    self.run_script(
                         "?[workspace, context, policy, link_kind, link, idx, state] <- [[$ws, $ctx, $policy, 'trigger', $link, $idx, $st]] :put policy_link { workspace, context, policy, link_kind, link, idx, state }",
                         params,
                         ScriptMutability::Mutable,
@@ -1116,7 +1122,7 @@ impl Store {
                         ("st", state),
                     ]);
                     params.insert("idx".into(), int_dv(idx as i64));
-                    self.db.run_script(
+                    self.run_script(
                         "?[workspace, context, policy, link_kind, link, idx, state] <- [[$ws, $ctx, $policy, 'command', $link, $idx, $st]] :put policy_link { workspace, context, policy, link_kind, link, idx, state }",
                         params,
                         ScriptMutability::Mutable,
@@ -1125,7 +1131,7 @@ impl Store {
             }
 
             for read_model in &bc.read_models {
-                self.db.run_script(
+                self.run_script(
                     "?[workspace, context, name, state, description, source] <- [[$ws, $ctx, $name, $st, $desc, $src]] :put read_model { workspace, context, name, state => description, source }",
                     params_map(&[("ws", workspace), ("ctx", &bc.name), ("name", &read_model.name), ("st", state), ("desc", &read_model.description), ("src", &read_model.source)]),
                     ScriptMutability::Mutable,
@@ -1159,7 +1165,7 @@ impl Store {
                     ("path", &ep.route_pattern),
                     ("desc", &ep.description),
                 ]);
-                self.db.run_script(
+                self.run_script(
                     "?[workspace, context, id, state, service_id, method, route_pattern, description] <- \
                      [[$ws, $ctx, $id, $st, $svc, $met, $path, $desc]] \
                      :put api_endpoint { workspace, context, id, state => service_id, method, route_pattern, description }",
@@ -1183,7 +1189,7 @@ impl Store {
                 );
                 params.insert("sl".into(), int_dv(svc.start_line.unwrap_or(0) as i64));
                 params.insert("el".into(), int_dv(svc.end_line.unwrap_or(0) as i64));
-                self.db.run_script(
+                self.run_script(
                     "?[workspace, context, name, state, description, kind, file_path, start_line, end_line] <- [[$ws, $ctx, $name, $st, $desc, $kind, $file, $sl, $el]] :put service { workspace, context, name, state => description, kind, file_path, start_line, end_line }",
                     params,
                     ScriptMutability::Mutable,
@@ -1197,7 +1203,7 @@ impl Store {
                     state,
                 )?;
                 for dep in &svc.dependencies {
-                    self.db.run_script(
+                    self.run_script(
                         "?[workspace, context, service, dep, state] <- [[$ws, $ctx, $svc, $dep, $st]] :put service_dep { workspace, context, service, dep, state }",
                         params_map(&[("ws", workspace), ("ctx", &bc.name), ("svc", &svc.name), ("dep", dep), ("st", state)]),
                         ScriptMutability::Mutable,
@@ -1220,7 +1226,7 @@ impl Store {
                 );
                 params.insert("sl".into(), int_dv(evt.start_line.unwrap_or(0) as i64));
                 params.insert("el".into(), int_dv(evt.end_line.unwrap_or(0) as i64));
-                self.db.run_script(
+                self.run_script(
                     "?[workspace, context, name, state, description, source, file_path, start_line, end_line] <- [[$ws, $ctx, $name, $st, $desc, $src, $file, $sl, $el]] :put event { workspace, context, name, state => description, source, file_path, start_line, end_line }",
                     params,
                     ScriptMutability::Mutable,
@@ -1242,7 +1248,7 @@ impl Store {
                 );
                 params.insert("sl".into(), int_dv(vo.start_line.unwrap_or(0) as i64));
                 params.insert("el".into(), int_dv(vo.end_line.unwrap_or(0) as i64));
-                self.db.run_script(
+                self.run_script(
                     "?[workspace, context, name, state, description, file_path, start_line, end_line] <- [[$ws, $ctx, $name, $st, $desc, $file, $sl, $el]] :put value_object { workspace, context, name, state => description, file_path, start_line, end_line }",
                     params,
                     ScriptMutability::Mutable,
@@ -1264,7 +1270,7 @@ impl Store {
                         ("text", rule),
                     ]);
                     p.insert("idx".into(), int_dv(idx as i64));
-                    self.db.run_script(
+                    self.run_script(
                         "?[workspace, context, value_object, idx, state, text] <- [[$ws, $ctx, $vo, $idx, $st, $text]] :put vo_rule { workspace, context, value_object, idx, state => text }",
                         p,
                         ScriptMutability::Mutable,
@@ -1286,7 +1292,7 @@ impl Store {
                 );
                 params.insert("sl".into(), int_dv(repo.start_line.unwrap_or(0) as i64));
                 params.insert("el".into(), int_dv(repo.end_line.unwrap_or(0) as i64));
-                self.db.run_script(
+                self.run_script(
                     "?[workspace, context, name, state, aggregate, file_path, start_line, end_line] <- [[$ws, $ctx, $name, $st, $agg, $file, $sl, $el]] :put repository { workspace, context, name, state => aggregate, file_path, start_line, end_line }",
                     params,
                     ScriptMutability::Mutable,
@@ -1312,7 +1318,7 @@ impl Store {
                     ("desc", &module.description),
                 ]);
                 params.insert("public".into(), cozo::DataValue::Bool(module.public));
-                self.db.run_script(
+                self.run_script(
                     "?[workspace, context, name, state, path, public, file_path, description] <- [[$ws, $ctx, $name, $st, $path, $public, $fp, $desc]] :put module { workspace, context, name, state => path, public, file_path, description }",
                     params,
                     ScriptMutability::Mutable,
@@ -1321,7 +1327,7 @@ impl Store {
         }
 
         for system in &model.external_systems {
-            self.db.run_script(
+            self.run_script(
                 "?[workspace, name, state, description, kind, rationale] <- [[$ws, $name, $st, $desc, $kind, $rationale]] :put external_system { workspace, name, state => description, kind, rationale }",
                 params_map(&[("ws", workspace), ("name", &system.name), ("st", state), ("desc", &system.description), ("kind", &system.kind), ("rationale", &system.rationale)]),
                 ScriptMutability::Mutable,
@@ -1342,7 +1348,7 @@ impl Store {
                     ("st", state),
                 ]);
                 params.insert("idx".into(), int_dv(idx as i64));
-                self.db.run_script(
+                self.run_script(
                     "?[workspace, system, context, idx, state] <- [[$ws, $name, $ctx, $idx, $st]] :put external_system_context { workspace, system, context, idx, state }",
                     params,
                     ScriptMutability::Mutable,
@@ -1352,7 +1358,7 @@ impl Store {
 
         for decision in &model.architectural_decisions {
             let status = format!("{:?}", decision.status).to_lowercase();
-            self.db.run_script(
+            self.run_script(
                 "?[workspace, id, state, title, status, scope, date, rationale] <- [[$ws, $id, $st, $title, $status, $scope, $date, $rationale]] :put architectural_decision { workspace, id, state => title, status, scope, date, rationale }",
                 params_map(&[("ws", workspace), ("id", &decision.id), ("st", state), ("title", &decision.title), ("status", &status), ("scope", &decision.scope), ("date", &decision.date), ("rationale", &decision.rationale)]),
                 ScriptMutability::Mutable,
@@ -1373,7 +1379,7 @@ impl Store {
                     ("st", state),
                 ]);
                 params.insert("idx".into(), int_dv(idx as i64));
-                self.db.run_script(
+                self.run_script(
                     "?[workspace, decision_id, context, idx, state] <- [[$ws, $id, $ctx, $idx, $st]] :put decision_context { workspace, decision_id, context, idx, state }",
                     params,
                     ScriptMutability::Mutable,
@@ -1387,7 +1393,7 @@ impl Store {
                     ("st", state),
                 ]);
                 params.insert("idx".into(), int_dv(idx as i64));
-                self.db.run_script(
+                self.run_script(
                     "?[workspace, decision_id, idx, state, text] <- [[$ws, $id, $idx, $st, $text]] :put decision_consequence { workspace, decision_id, idx, state => text }",
                     params,
                     ScriptMutability::Mutable,
@@ -1397,7 +1403,7 @@ impl Store {
 
         // Save AST edges
         for edge in &model.ast_edges {
-            self.db.run_script(
+            self.run_script(
                 "?[workspace, state, from_node, to_node, edge_type] <- [[$ws, $st, $from, $to, $kind]] :put ast_edge { workspace, state, from_node, to_node, edge_type }",
                 params_map(&[
                     ("ws", workspace),
@@ -1412,7 +1418,7 @@ impl Store {
 
         // Save source files
         for sf in &model.source_files {
-            self.db.run_script(
+            self.run_script(
                 "?[workspace, path, state, context, language] <- [[$ws, $path, $st, $ctx, $lang]] \
                  :put source_file { workspace, path, state => context, language }",
                 params_map(&[
@@ -1423,7 +1429,8 @@ impl Store {
                     ("lang", &sf.language),
                 ]),
                 ScriptMutability::Mutable,
-            ).map_err(|e| anyhow::anyhow!("save source_file '{}': {:?}", sf.path, e))?;
+            )
+            .map_err(|e| anyhow::anyhow!("save source_file '{}': {:?}", sf.path, e))?;
         }
 
         // Save symbols
@@ -1439,7 +1446,7 @@ impl Store {
             ]);
             params.insert("sl".into(), int_dv(sym.start_line as i64));
             params.insert("el".into(), int_dv(sym.end_line as i64));
-            self.db.run_script(
+            self.run_script(
                 "?[workspace, name, state, kind, context, file_path, start_line, end_line, visibility] <- \
                  [[$ws, $name, $st, $kind, $ctx, $fp, $sl, $el, $vis]] \
                  :put symbol { workspace, name, state => kind, context, file_path, start_line, end_line, visibility }",
@@ -1450,7 +1457,7 @@ impl Store {
 
         // Save import edges
         for ie in &model.import_edges {
-            self.db.run_script(
+            self.run_script(
                 "?[workspace, from_file, to_module, state, context] <- [[$ws, $ff, $tm, $st, $ctx]] \
                  :put import_edge { workspace, from_file, to_module, state => context }",
                 params_map(&[
@@ -1475,7 +1482,7 @@ impl Store {
                 ("ctx", &ce.context),
             ]);
             params.insert("line".into(), int_dv(ce.line as i64));
-            self.db.run_script(
+            self.run_script(
                 "?[workspace, caller, callee, state, file_path, line, context] <- [[$ws, $caller, $callee, $st, $fp, $line, $ctx]] \
                  :put calls_symbol { workspace, caller, callee, state => file_path, line, context }",
                 params,
@@ -1490,10 +1497,16 @@ impl Store {
     }
 
     fn record_snapshot(&self, workspace: &str, state: &str) -> Result<i64> {
-        let ts_us = std::time::SystemTime::now()
+        let now_us = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_micros() as i64;
+        let latest_ts = self
+            .list_snapshots(workspace, state)?
+            .into_iter()
+            .next()
+            .unwrap_or(0);
+        let ts_us = now_us.max(latest_ts.saturating_add(1));
         let mut snap_params = params_map(&[("ws", workspace), ("st", state)]);
         snap_params.insert("ts".into(), int_dv(ts_us));
         self.run_mutation_script(
@@ -1535,10 +1548,7 @@ impl Store {
             ("value_object", "workspace, context, name, state"),
             ("repository", "workspace, context, name, state"),
             ("module", "workspace, context, name, state"),
-            (
-                "api_endpoint",
-                "workspace, context, id, state",
-            ),
+            ("api_endpoint", "workspace, context, id, state"),
             (
                 "invokes_endpoint",
                 "workspace, caller_context, caller_method, endpoint_id, state",
@@ -1603,167 +1613,6 @@ impl Store {
         Ok(())
     }
 
-    /// Copy all rows from one state to another via Datalog (with temporal snapshots).
-    fn copy_state(&self, workspace: &str, from: &str, to: &str) -> Result<()> {
-        let backup = self.reconstruct_model(workspace, to)?;
-        self.clear_state(workspace, to)?;
-        let params = params_map(&[("ws", workspace), ("from", from), ("to", to)]);
-
-        let scripts = vec![
-            // owner_meta
-            "src[ws, c, ok, ow, team, owners, rationale] := *owner_meta{workspace: ws, context: c, owner_kind: ok, owner: ow, state: $from, team, owners_json: owners, rationale @ 'NOW'}, ws = $ws \
-             ?[workspace, context, owner_kind, owner, state, team, owners_json, rationale] := src[workspace, context, owner_kind, owner, team, owners_json, rationale], state = $to \
-             :put owner_meta {workspace, context, owner_kind, owner, state => team, owners_json, rationale}",
-            // context
-            "src[ws, n, d, m] := *context{workspace: ws, name: n, state: $from, description: d, module_path: m @ 'NOW'}, ws = $ws \
-             ?[workspace, name, state, description, module_path] := src[workspace, name, description, module_path], state = $to \
-             :put context {workspace, name, state => description, module_path}",
-            // context_dep
-            "src[ws, f, t] := *context_dep{workspace: ws, from_ctx: f, to_ctx: t, state: $from @ 'NOW'}, ws = $ws \
-             ?[workspace, from_ctx, to_ctx, state] := src[workspace, from_ctx, to_ctx], state = $to \
-             :put context_dep {workspace, from_ctx, to_ctx, state}",
-            // aggregate
-            "src[ws, c, n, d, root] := *aggregate{workspace: ws, context: c, name: n, state: $from, description: d, root_entity: root @ 'NOW'}, ws = $ws \
-             ?[workspace, context, name, state, description, root_entity] := src[workspace, context, name, description, root_entity], state = $to \
-             :put aggregate {workspace, context, name, state => description, root_entity}",
-            // aggregate_member
-            "src[ws, c, a, mk, m] := *aggregate_member{workspace: ws, context: c, aggregate: a, member_kind: mk, member: m, state: $from @ 'NOW'}, ws = $ws \
-             ?[workspace, context, aggregate, member_kind, member, state] := src[workspace, context, aggregate, member_kind, member], state = $to \
-             :put aggregate_member {workspace, context, aggregate, member_kind, member, state}",
-            // entity
-            "src[ws, c, n, d, a, fp, sl, el] := *entity{workspace: ws, context: c, name: n, state: $from, description: d, aggregate_root: a, file_path: fp, start_line: sl, end_line: el @ 'NOW'}, ws = $ws \
-             ?[workspace, context, name, state, description, aggregate_root, file_path, start_line, end_line] := src[workspace, context, name, description, aggregate_root, file_path, start_line, end_line], state = $to \
-             :put entity {workspace, context, name, state => description, aggregate_root, file_path, start_line, end_line}",
-            // policy
-            "src[ws, c, n, d, k] := *policy{workspace: ws, context: c, name: n, state: $from, description: d, kind: k @ 'NOW'}, ws = $ws \
-             ?[workspace, context, name, state, description, kind] := src[workspace, context, name, description, kind], state = $to \
-             :put policy {workspace, context, name, state => description, kind}",
-            // policy_link
-            "src[ws, c, p, lk, l, i] := *policy_link{workspace: ws, context: c, policy: p, link_kind: lk, link: l, idx: i, state: $from @ 'NOW'}, ws = $ws \
-             ?[workspace, context, policy, link_kind, link, idx, state] := src[workspace, context, policy, link_kind, link, idx], state = $to \
-             :put policy_link {workspace, context, policy, link_kind, link, idx, state}",
-            // read_model
-            "src[ws, c, n, d, s] := *read_model{workspace: ws, context: c, name: n, state: $from, description: d, source: s @ 'NOW'}, ws = $ws \
-             ?[workspace, context, name, state, description, source] := src[workspace, context, name, description, source], state = $to \
-             :put read_model {workspace, context, name, state => description, source}",
-            // service
-            "src[ws, c, n, d, k, fp, sl, el] := *service{workspace: ws, context: c, name: n, state: $from, description: d, kind: k, file_path: fp, start_line: sl, end_line: el @ 'NOW'}, ws = $ws \
-             ?[workspace, context, name, state, description, kind, file_path, start_line, end_line] := src[workspace, context, name, description, kind, file_path, start_line, end_line], state = $to \
-             :put service {workspace, context, name, state => description, kind, file_path, start_line, end_line}",
-            // service_dep
-            "src[ws, c, s, d] := *service_dep{workspace: ws, context: c, service: s, dep: d, state: $from @ 'NOW'}, ws = $ws \
-             ?[workspace, context, service, dep, state] := src[workspace, context, service, dep], state = $to \
-             :put service_dep {workspace, context, service, dep, state}",
-            // event
-            "src[ws, c, n, d, s, fp, sl, el] := *event{workspace: ws, context: c, name: n, state: $from, description: d, source: s, file_path: fp, start_line: sl, end_line: el @ 'NOW'}, ws = $ws \
-             ?[workspace, context, name, state, description, source, file_path, start_line, end_line] := src[workspace, context, name, description, source, file_path, start_line, end_line], state = $to \
-             :put event {workspace, context, name, state => description, source, file_path, start_line, end_line}",
-            // value_object
-            "src[ws, c, n, d, fp, sl, el] := *value_object{workspace: ws, context: c, name: n, state: $from, description: d, file_path: fp, start_line: sl, end_line: el @ 'NOW'}, ws = $ws \
-             ?[workspace, context, name, state, description, file_path, start_line, end_line] := src[workspace, context, name, description, file_path, start_line, end_line], state = $to \
-             :put value_object {workspace, context, name, state => description, file_path, start_line, end_line}",
-            // repository
-            "src[ws, c, n, a, fp, sl, el] := *repository{workspace: ws, context: c, name: n, state: $from, aggregate: a, file_path: fp, start_line: sl, end_line: el @ 'NOW'}, ws = $ws \
-             ?[workspace, context, name, state, aggregate, file_path, start_line, end_line] := src[workspace, context, name, aggregate, file_path, start_line, end_line], state = $to \
-             :put repository {workspace, context, name, state => aggregate, file_path, start_line, end_line}",
-            // external_system
-            "src[ws, n, d, k, r] := *external_system{workspace: ws, name: n, state: $from, description: d, kind: k, rationale: r @ 'NOW'}, ws = $ws \
-             ?[workspace, name, state, description, kind, rationale] := src[workspace, name, description, kind, rationale], state = $to \
-             :put external_system {workspace, name, state => description, kind, rationale}",
-            // external_system_context
-            "src[ws, s, c, i] := *external_system_context{workspace: ws, system: s, context: c, idx: i, state: $from @ 'NOW'}, ws = $ws \
-             ?[workspace, system, context, idx, state] := src[workspace, system, context, idx], state = $to \
-             :put external_system_context {workspace, system, context, idx, state}",
-            // architectural_decision
-            "src[ws, id, title, status, scope, date, rationale] := *architectural_decision{workspace: ws, id, state: $from, title, status, scope, date, rationale @ 'NOW'}, ws = $ws \
-             ?[workspace, id, state, title, status, scope, date, rationale] := src[workspace, id, title, status, scope, date, rationale], state = $to \
-             :put architectural_decision {workspace, id, state => title, status, scope, date, rationale}",
-            // decision_context
-            "src[ws, id, c, i] := *decision_context{workspace: ws, decision_id: id, context: c, idx: i, state: $from @ 'NOW'}, ws = $ws \
-             ?[workspace, decision_id, context, idx, state] := src[workspace, decision_id, context, idx], state = $to \
-             :put decision_context {workspace, decision_id, context, idx, state}",
-            // decision_consequence
-            "src[ws, id, i, text] := *decision_consequence{workspace: ws, decision_id: id, idx: i, state: $from, text @ 'NOW'}, ws = $ws \
-             ?[workspace, decision_id, idx, state, text] := src[workspace, decision_id, idx, text], state = $to \
-             :put decision_consequence {workspace, decision_id, idx, state => text}",
-            // invariant
-            "src[ws, c, e, i, t] := *invariant{workspace: ws, context: c, entity: e, idx: i, state: $from, text: t @ 'NOW'}, ws = $ws \
-             ?[workspace, context, entity, idx, state, text] := src[workspace, context, entity, idx, text], state = $to \
-             :put invariant {workspace, context, entity, idx, state => text}",
-            // field
-            "src[ws, c, ok, ow, n, ft, req, desc, idx] := *field{workspace: ws, context: c, owner_kind: ok, owner: ow, name: n, state: $from, field_type: ft, required: req, description: desc, idx @ 'NOW'}, ws = $ws \
-             ?[workspace, context, owner_kind, owner, name, state, field_type, required, description, idx] := src[workspace, context, owner_kind, owner, name, field_type, required, description, idx], state = $to \
-             :put field {workspace, context, owner_kind, owner, name, state => field_type, required, description, idx}",
-            // method
-            "src[ws, c, ok, ow, n, desc, rt, idx] := *method{workspace: ws, context: c, owner_kind: ok, owner: ow, name: n, state: $from, description: desc, return_type: rt, idx @ 'NOW'}, ws = $ws \
-             ?[workspace, context, owner_kind, owner, name, state, description, return_type, idx] := src[workspace, context, owner_kind, owner, name, description, return_type, idx], state = $to \
-             :put method {workspace, context, owner_kind, owner, name, state => description, return_type, idx}",
-            // method_param
-            "src[ws, c, ok, ow, m, n, pt, req, desc, idx] := *method_param{workspace: ws, context: c, owner_kind: ok, owner: ow, method: m, name: n, state: $from, param_type: pt, required: req, description: desc, idx @ 'NOW'}, ws = $ws \
-             ?[workspace, context, owner_kind, owner, method, name, state, param_type, required, description, idx] := src[workspace, context, owner_kind, owner, method, name, param_type, required, description, idx], state = $to \
-             :put method_param {workspace, context, owner_kind, owner, method, name, state => param_type, required, description, idx}",
-            // vo_rule
-            "src[ws, c, vo, i, t] := *vo_rule{workspace: ws, context: c, value_object: vo, idx: i, state: $from, text: t @ 'NOW'}, ws = $ws \
-             ?[workspace, context, value_object, idx, state, text] := src[workspace, context, value_object, idx, text], state = $to \
-             :put vo_rule {workspace, context, value_object, idx, state => text}",
-            // source_file
-            "src[ws, p, ctx, lang] := *source_file{workspace: ws, path: p, state: $from, context: ctx, language: lang @ 'NOW'}, ws = $ws \
-             ?[workspace, path, state, context, language] := src[workspace, path, context, language], state = $to \
-             :put source_file {workspace, path, state => context, language}",
-            // symbol
-            "src[ws, n, k, ctx, fp, sl, el, vis] := *symbol{workspace: ws, name: n, state: $from, kind: k, context: ctx, file_path: fp, start_line: sl, end_line: el, visibility: vis @ 'NOW'}, ws = $ws \
-             ?[workspace, name, state, kind, context, file_path, start_line, end_line, visibility] := src[workspace, name, kind, context, file_path, start_line, end_line, visibility], state = $to \
-             :put symbol {workspace, name, state => kind, context, file_path, start_line, end_line, visibility}",
-            // import_edge
-            "src[ws, ff, tm, ctx] := *import_edge{workspace: ws, from_file: ff, to_module: tm, state: $from, context: ctx @ 'NOW'}, ws = $ws \
-             ?[workspace, from_file, to_module, state, context] := src[workspace, from_file, to_module, context], state = $to \
-             :put import_edge {workspace, from_file, to_module, state => context}",
-            // calls_symbol
-            "src[ws, caller, callee, fp, ln, ctx] := *calls_symbol{workspace: ws, caller, callee, state: $from, file_path: fp, line: ln, context: ctx @ 'NOW'}, ws = $ws \
-             ?[workspace, caller, callee, state, file_path, line, context] := src[workspace, caller, callee, file_path, line, context], state = $to \
-             :put calls_symbol {workspace, caller, callee, state => file_path, line, context}",
-            // module
-            "src[ws, c, n, path, public, fp, desc] := *module{workspace: ws, context: c, name: n, state: $from, path, public, file_path: fp, description: desc @ 'NOW'}, ws = $ws \
-             ?[workspace, context, name, state, path, public, file_path, description] := src[workspace, context, name, path, public, file_path, description], state = $to \
-             :put module {workspace, context, name, state => path, public, file_path, description}",
-            // api_endpoint
-            "src[ws, c, id, svc, met, rp, desc] := *api_endpoint{workspace: ws, context: c, id, state: $from, service_id: svc, method: met, route_pattern: rp, description: desc @ 'NOW'}, ws = $ws \
-             ?[workspace, context, id, state, service_id, method, route_pattern, description] := src[workspace, context, id, service_id, method, route_pattern, description], state = $to \
-             :put api_endpoint {workspace, context, id, state => service_id, method, route_pattern, description}",
-            // invokes_endpoint
-            "src[ws, cc, cm, eid] := *invokes_endpoint{workspace: ws, caller_context: cc, caller_method: cm, endpoint_id: eid, state: $from @ 'NOW'}, ws = $ws \
-             ?[workspace, caller_context, caller_method, endpoint_id, state] := src[workspace, caller_context, caller_method, endpoint_id], state = $to \
-             :put invokes_endpoint {workspace, caller_context, caller_method, endpoint_id, state}",
-            // calls_external_system
-            "src[ws, cc, cm, eid] := *calls_external_system{workspace: ws, caller_context: cc, caller_method: cm, ext_id: eid, state: $from @ 'NOW'}, ws = $ws \
-             ?[workspace, caller_context, caller_method, ext_id, state] := src[workspace, caller_context, caller_method, ext_id], state = $to \
-             :put calls_external_system {workspace, caller_context, caller_method, ext_id, state}",
-            // ast_edge
-            "src[ws, fn_node, tn, et] := *ast_edge{workspace: ws, state: $from, from_node: fn_node, to_node: tn, edge_type: et @ 'NOW'}, ws = $ws \
-             ?[workspace, state, from_node, to_node, edge_type] := src[workspace, from_node, to_node, edge_type], state = $to \
-             :put ast_edge {workspace, state, from_node, to_node, edge_type}",
-        ];
-
-        for (index, script) in scripts.iter().enumerate() {
-            if let Err(err) = self.run_mutation_script(
-                script,
-                params.clone(),
-                format!("copy_state {from}->{to} step {}", index + 1),
-            ) {
-                if let Some(model) = backup.as_ref()
-                    && let Err(restore_err) = self.save_state(workspace, model, to)
-                {
-                    return Err(anyhow::anyhow!(
-                        "{err}; rollback to '{to}' failed: {restore_err}"
-                    ));
-                }
-                return Err(err);
-            }
-        }
-        self.record_snapshot(workspace, to)?;
-        Ok(())
-    }
-
     /// Reconstruct a DomainModel from relational rows for a given state.
     fn reconstruct_model(&self, workspace_path: &str, state: &str) -> Result<Option<DomainModel>> {
         let ws = canonicalize_path(workspace_path);
@@ -1771,7 +1620,6 @@ impl Store {
 
         // Project metadata
         let proj = self
-            .db
             .run_script(
                 "?[name, description, rules_json, tech_stack_json, conventions_json] := \
                     *project{workspace: $ws, name, description, rules_json, tech_stack_json, conventions_json}",
@@ -1782,7 +1630,6 @@ impl Store {
 
         // Contexts for this state
         let ctxs = self
-            .db
             .run_script(
                 "?[name, description, module_path] := \
                     *context{workspace: $ws, name, state: $st, description, module_path @ 'NOW'}",
@@ -1794,12 +1641,14 @@ impl Store {
         let project_row = proj.as_ref().and_then(|rows| rows.rows.first());
         let has_project = project_row.is_some();
 
-        if ctxs.rows.is_empty() && (state == "actual" || !has_project) {
+        if ctxs.rows.is_empty() && !has_project {
             return Ok(None);
         }
 
         // Extract project-level metadata
-        let (project_name, description, rules, tech_stack, conventions) = if let Some(r) = project_row {
+        let (project_name, description, rules, tech_stack, conventions) = if let Some(r) =
+            project_row
+        {
             (
                 dv_str(&r[0]),
                 dv_str(&r[1]),
@@ -1830,7 +1679,6 @@ impl Store {
 
             // Dependencies
             let deps = self
-                .db
                 .run_script(
                     "?[to_ctx] := *context_dep{workspace: $ws, from_ctx: $ctx, to_ctx, state: $st @ 'NOW'}",
                     params_map(&[("ws", &ws), ("ctx", &ctx_name), ("st", state)]),
@@ -1843,7 +1691,6 @@ impl Store {
             let ownership = self.query_ownership(&ws, &ctx_name, "context", &ctx_name, state);
 
             let aggs = self
-                .db
                 .run_script(
                     "?[name, description, root_entity] := *aggregate{workspace: $ws, context: $ctx, name, state: $st, description, root_entity @ 'NOW'}",
                     params_map(&[("ws", &ws), ("ctx", &ctx_name), ("st", state)]),
@@ -1856,7 +1703,6 @@ impl Store {
                 .map(|r| {
                     let aggregate_name = dv_str(&r[0]);
                     let members = self
-                        .db
                         .run_script(
                             "?[member_kind, member] := *aggregate_member{workspace: $ws, context: $ctx, aggregate: $agg, member_kind, member, state: $st @ 'NOW'}",
                             params_map(&[("ws", &ws), ("ctx", &ctx_name), ("agg", &aggregate_name), ("st", state)]),
@@ -1877,7 +1723,6 @@ impl Store {
 
             // Entities
             let ents = self
-                .db
                 .run_script(
                     "?[name, description, aggregate_root, file_path, start_line, end_line] := \
                         *entity{workspace: $ws, context: $ctx, name, state: $st, \
@@ -1906,7 +1751,6 @@ impl Store {
                 .collect();
 
             let policy_rows = self
-                .db
                 .run_script(
                     "?[name, description, kind] := *policy{workspace: $ws, context: $ctx, name, state: $st, description, kind @ 'NOW'}",
                     params_map(&[("ws", &ws), ("ctx", &ctx_name), ("st", state)]),
@@ -1919,7 +1763,6 @@ impl Store {
                 .map(|r| {
                     let policy_name = dv_str(&r[0]);
                     let links = self
-                        .db
                         .run_script(
                             "?[idx, link_kind, link] := *policy_link{workspace: $ws, context: $ctx, policy: $policy, idx, state: $st, link_kind, link @ 'NOW'}",
                             params_map(&[("ws", &ws), ("ctx", &ctx_name), ("policy", &policy_name), ("st", state)]),
@@ -1945,7 +1788,6 @@ impl Store {
                 .collect();
 
             let read_model_rows = self
-                .db
                 .run_script(
                     "?[name, description, source] := *read_model{workspace: $ws, context: $ctx, name, state: $st, description, source @ 'NOW'}",
                     params_map(&[("ws", &ws), ("ctx", &ctx_name), ("st", state)]),
@@ -1975,7 +1817,6 @@ impl Store {
 
             // Services
             let svcs = self
-                .db
                 .run_script(
                     "?[name, description, kind, file_path, start_line, end_line] := \
                         *service{workspace: $ws, context: $ctx, name, state: $st, \
@@ -1990,7 +1831,6 @@ impl Store {
                 .map(|r| {
                     let svc_name = dv_str(&r[0]);
                     let svc_deps = self
-                        .db
                         .run_script(
                             "?[dep] := *service_dep{workspace: $ws, context: $ctx, service: $svc, dep, state: $st @ 'NOW'}",
                             params_map(&[
@@ -2022,7 +1862,6 @@ impl Store {
 
             // Events
             let evts = self
-                .db
                 .run_script(
                     "?[name, description, source, file_path, start_line, end_line] := \
                         *event{workspace: $ws, context: $ctx, name, state: $st, \
@@ -2032,7 +1871,7 @@ impl Store {
                 )
                 .map(|r| r.rows)
                 .unwrap_or_default();
-            let api_endpoints_rows = self.db.run_script(
+            let api_endpoints_rows = self.run_script(
                 "?[id, service_id, method, route_pattern, description] := *api_endpoint{workspace: $ws, context: $ctx, id, state: $st, service_id, method, route_pattern, description @ 'NOW'}",
                 params_map(&[("ws", &ws), ("ctx", &ctx_name), ("st", state)]),
                 ScriptMutability::Immutable,
@@ -2066,7 +1905,6 @@ impl Store {
 
             // Value objects
             let vos = self
-                .db
                 .run_script(
                     "?[name, description, file_path, start_line, end_line] := \
                         *value_object{workspace: $ws, context: $ctx, name, state: $st, description, file_path, start_line, end_line @ 'NOW'}",
@@ -2093,7 +1931,6 @@ impl Store {
 
             // Repositories
             let repos = self
-                .db
                 .run_script(
                     "?[name, aggregate, file_path, start_line, end_line] := \
                         *repository{workspace: $ws, context: $ctx, name, state: $st, aggregate, file_path, start_line, end_line @ 'NOW'}",
@@ -2119,7 +1956,6 @@ impl Store {
 
             // Modules
             let mods = self
-                .db
                 .run_script(
                     "?[name, path, public, file_path, description] := \
                         *module{workspace: $ws, context: $ctx, name, state: $st, path, public, file_path, description @ 'NOW'}",
@@ -2159,7 +1995,6 @@ impl Store {
         }
 
         let external_system_rows = self
-            .db
             .run_script(
                 "?[name, description, kind, rationale] := *external_system{workspace: $ws, name, state: $st, description, kind, rationale @ 'NOW'}",
                 params_map(&[("ws", &ws), ("st", state)]),
@@ -2186,7 +2021,6 @@ impl Store {
             .collect();
 
         let decision_rows = self
-            .db
             .run_script(
                 "?[id, title, status, scope, date, rationale] := *architectural_decision{workspace: $ws, id, state: $st, title, status, scope, date, rationale @ 'NOW'}",
                 params_map(&[("ws", &ws), ("st", state)]),
@@ -2234,7 +2068,7 @@ impl Store {
             tech_stack,
             conventions,
             ast_edges: {
-                let rows = self.db.run_script(
+                let rows = self.run_script(
                     "?[from_node, to_node, edge_type] := *ast_edge{workspace: $ws, state: $st, from_node, to_node, edge_type @ 'NOW'}",
                     params_map(&[("ws", &ws), ("st", state)]),
                     ScriptMutability::Immutable,
@@ -2248,7 +2082,7 @@ impl Store {
                     .collect()
             },
             source_files: {
-                let rows = self.db.run_script(
+                let rows = self.run_script(
                     "?[path, context, language] := *source_file{workspace: $ws, path, state: $st, context, language @ 'NOW'}",
                     params_map(&[("ws", &ws), ("st", state)]),
                     ScriptMutability::Immutable,
@@ -2262,7 +2096,7 @@ impl Store {
                     .collect()
             },
             symbols: {
-                let rows = self.db.run_script(
+                let rows = self.run_script(
                     "?[name, kind, context, file_path, start_line, end_line, visibility] := \
                      *symbol{workspace: $ws, name, state: $st, kind, context, file_path, start_line, end_line, visibility @ 'NOW'}",
                     params_map(&[("ws", &ws), ("st", state)]),
@@ -2281,7 +2115,7 @@ impl Store {
                     .collect()
             },
             import_edges: {
-                let rows = self.db.run_script(
+                let rows = self.run_script(
                     "?[from_file, to_module, context] := *import_edge{workspace: $ws, from_file, to_module, state: $st, context @ 'NOW'}",
                     params_map(&[("ws", &ws), ("st", state)]),
                     ScriptMutability::Immutable,
@@ -2295,7 +2129,7 @@ impl Store {
                     .collect()
             },
             call_edges: {
-                let rows = self.db.run_script(
+                let rows = self.run_script(
                     "?[caller, callee, file_path, line, context] := *calls_symbol{workspace: $ws, caller, callee, state: $st, file_path, line, context @ 'NOW'}",
                     params_map(&[("ws", &ws), ("st", state)]),
                     ScriptMutability::Immutable,
@@ -2317,7 +2151,7 @@ impl Store {
 
     pub fn query_entity(&self, ws: &str, ctx: &str, name: &str) -> Option<Entity> {
         let ws = canonicalize_path(ws);
-        let rows = self.db.run_script(
+        let rows = self.run_script(
             "?[description, aggregate_root, file_path, start_line, end_line] := *entity{workspace: $ws, context: $ctx, name: $name, state: 'desired', description, aggregate_root, file_path, start_line, end_line @ 'NOW'}",
             params_map(&[("ws", &ws), ("ctx", ctx), ("name", name)]),
             ScriptMutability::Immutable,
@@ -2338,13 +2172,13 @@ impl Store {
 
     pub fn query_service(&self, ws: &str, ctx: &str, name: &str) -> Option<Service> {
         let ws = canonicalize_path(ws);
-        let rows = self.db.run_script(
+        let rows = self.run_script(
             "?[description, kind, file_path, start_line, end_line] := *service{workspace: $ws, context: $ctx, name: $name, state: 'desired', description, kind, file_path, start_line, end_line @ 'NOW'}",
             params_map(&[("ws", &ws), ("ctx", ctx), ("name", name)]),
             ScriptMutability::Immutable,
         ).ok()?.rows;
         let row = rows.first()?;
-        let dep_rows = self.db.run_script(
+        let dep_rows = self.run_script(
             "?[dep] := *service_dep{workspace: $ws, context: $ctx, service: $name, dep, state: 'desired' @ 'NOW'}",
             params_map(&[("ws", &ws), ("ctx", ctx), ("name", name)]),
             ScriptMutability::Immutable,
@@ -2367,7 +2201,7 @@ impl Store {
 
     pub fn query_event(&self, ws: &str, ctx: &str, name: &str) -> Option<DomainEvent> {
         let ws = canonicalize_path(ws);
-        let rows = self.db.run_script(
+        let rows = self.run_script(
             "?[description, source, file_path, start_line, end_line] := *event{workspace: $ws, context: $ctx, name: $name, state: 'desired', description, source, file_path, start_line, end_line @ 'NOW'}",
             params_map(&[("ws", &ws), ("ctx", ctx), ("name", name)]),
             ScriptMutability::Immutable,
@@ -2386,7 +2220,7 @@ impl Store {
 
     pub fn query_value_object(&self, ws: &str, ctx: &str, name: &str) -> Option<ValueObject> {
         let ws = canonicalize_path(ws);
-        let rows = self.db.run_script(
+        let rows = self.run_script(
             "?[description, file_path, start_line, end_line] := *value_object{workspace: $ws, context: $ctx, name: $name, state: 'desired', description, file_path, start_line, end_line @ 'NOW'}",
             params_map(&[("ws", &ws), ("ctx", ctx), ("name", name)]),
             ScriptMutability::Immutable,
@@ -2405,7 +2239,7 @@ impl Store {
 
     pub fn query_repository(&self, ws: &str, ctx: &str, name: &str) -> Option<Repository> {
         let ws = canonicalize_path(ws);
-        let rows = self.db.run_script(
+        let rows = self.run_script(
             "?[aggregate, file_path, start_line, end_line] := *repository{workspace: $ws, context: $ctx, name: $name, state: 'desired', aggregate, file_path, start_line, end_line @ 'NOW'}",
             params_map(&[("ws", &ws), ("ctx", ctx), ("name", name)]),
             ScriptMutability::Immutable,
@@ -2423,13 +2257,13 @@ impl Store {
 
     pub fn query_aggregate(&self, ws: &str, ctx: &str, name: &str) -> Option<Aggregate> {
         let ws = canonicalize_path(ws);
-        let rows = self.db.run_script(
+        let rows = self.run_script(
             "?[description, root_entity] := *aggregate{workspace: $ws, context: $ctx, name: $name, state: 'desired', description, root_entity @ 'NOW'}",
             params_map(&[("ws", &ws), ("ctx", ctx), ("name", name)]),
             ScriptMutability::Immutable,
         ).ok()?.rows;
         let row = rows.first()?;
-        let members = self.db.run_script(
+        let members = self.run_script(
             "?[member_kind, member] := *aggregate_member{workspace: $ws, context: $ctx, aggregate: $name, member_kind, member, state: 'desired' @ 'NOW'}",
             params_map(&[("ws", &ws), ("ctx", ctx), ("name", name)]),
             ScriptMutability::Immutable,
@@ -2454,13 +2288,13 @@ impl Store {
 
     pub fn query_policy(&self, ws: &str, ctx: &str, name: &str) -> Option<Policy> {
         let ws = canonicalize_path(ws);
-        let rows = self.db.run_script(
+        let rows = self.run_script(
             "?[description, kind] := *policy{workspace: $ws, context: $ctx, name: $name, state: 'desired', description, kind @ 'NOW'}",
             params_map(&[("ws", &ws), ("ctx", ctx), ("name", name)]),
             ScriptMutability::Immutable,
         ).ok()?.rows;
         let row = rows.first()?;
-        let links = self.db.run_script(
+        let links = self.run_script(
             "?[idx, link_kind, link] := *policy_link{workspace: $ws, context: $ctx, policy: $name, idx, state: 'desired', link_kind, link @ 'NOW'}",
             params_map(&[("ws", &ws), ("ctx", ctx), ("name", name)]),
             ScriptMutability::Immutable,
@@ -2494,7 +2328,7 @@ impl Store {
 
     pub fn query_read_model(&self, ws: &str, ctx: &str, name: &str) -> Option<ReadModel> {
         let ws = canonicalize_path(ws);
-        let rows = self.db.run_script(
+        let rows = self.run_script(
             "?[description, source] := *read_model{workspace: $ws, context: $ctx, name: $name, state: 'desired', description, source @ 'NOW'}",
             params_map(&[("ws", &ws), ("ctx", ctx), ("name", name)]),
             ScriptMutability::Immutable,
@@ -2511,7 +2345,7 @@ impl Store {
 
     pub fn query_external_system(&self, ws: &str, name: &str) -> Option<ExternalSystem> {
         let ws = canonicalize_path(ws);
-        let rows = self.db.run_script(
+        let rows = self.run_script(
             "?[description, kind, rationale] := *external_system{workspace: $ws, name: $name, state: 'desired', description, kind, rationale @ 'NOW'}",
             params_map(&[("ws", &ws), ("name", name)]),
             ScriptMutability::Immutable,
@@ -2536,7 +2370,7 @@ impl Store {
         id: &str,
     ) -> Option<ArchitecturalDecision> {
         let ws = canonicalize_path(ws);
-        let rows = self.db.run_script(
+        let rows = self.run_script(
             "?[title, status, scope, date, rationale] := *architectural_decision{workspace: $ws, id: $id, state: 'desired', title, status, scope, date, rationale @ 'NOW'}",
             params_map(&[("ws", &ws), ("id", id)]),
             ScriptMutability::Immutable,
@@ -2577,7 +2411,7 @@ impl Store {
     ) -> Result<()> {
         let ws = canonicalize_path(workspace_path);
         self.ensure_project(workspace_path)?;
-        self.db.run_script(
+        self.run_script(
             "?[workspace, name, state, description, module_path] <- [[$ws, $name, 'desired', $desc, $mp]] :put context { workspace, name, state => description, module_path }",
             params_map(&[("ws", &ws), ("name", name), ("desc", description), ("mp", module_path)]),
             ScriptMutability::Mutable,
@@ -2588,7 +2422,7 @@ impl Store {
             format!("retract context dependencies for {name}"),
         )?;
         for dep in dependencies {
-            self.db.run_script(
+            self.run_script(
                 "?[workspace, from_ctx, to_ctx, state] <- [[$ws, $from, $to, 'desired']] :put context_dep { workspace, from_ctx, to_ctx, state }",
                 params_map(&[("ws", &ws), ("from", name), ("to", dep)]),
                 ScriptMutability::Mutable,
@@ -2601,7 +2435,7 @@ impl Store {
     pub fn remove_context(&self, workspace_path: &str, name: &str) -> Result<bool> {
         let ws = canonicalize_path(workspace_path);
         let p = params_map(&[("ws", &ws), ("name", name)]);
-        let exists = self.db.run_script(
+        let exists = self.run_script(
             "?[n] := *context{workspace: $ws, name: $name, state: 'desired' @ 'NOW'}, n = $name",
             p.clone(),
             ScriptMutability::Immutable,
@@ -2620,7 +2454,7 @@ impl Store {
             format!("remove incoming context dependencies for {name}"),
         )?;
         self.remove_owner_meta(&ws, name, "context", name)?;
-        self.db.run_script(
+        self.run_script(
             "?[workspace, name, state, vld] := workspace = $ws, name = $name, state = 'desired', vld = 'RETRACT' :put context { workspace, name, state, vld }",
             p,
             ScriptMutability::Mutable,
@@ -2647,7 +2481,7 @@ impl Store {
         );
         params.insert("sl".into(), int_dv(entity.start_line.unwrap_or(0) as i64));
         params.insert("el".into(), int_dv(entity.end_line.unwrap_or(0) as i64));
-        self.db.run_script(
+        self.run_script(
             "?[workspace, context, name, state, description, aggregate_root, file_path, start_line, end_line] <- [[$ws, $ctx, $name, 'desired', $desc, $aggregate_root, $file, $sl, $el]] :put entity { workspace, context, name, state => description, aggregate_root, file_path, start_line, end_line }",
             params,
             ScriptMutability::Mutable,
@@ -2661,7 +2495,7 @@ impl Store {
     pub fn remove_entity(&self, workspace_path: &str, ctx: &str, name: &str) -> Result<bool> {
         let ws = canonicalize_path(workspace_path);
         let p = params_map(&[("ws", &ws), ("ctx", ctx), ("name", name)]);
-        let exists = self.db.run_script(
+        let exists = self.run_script(
             "?[n] := *entity{workspace: $ws, context: $ctx, name: $name, state: 'desired' @ 'NOW'}, n = $name",
             p.clone(),
             ScriptMutability::Immutable,
@@ -2673,7 +2507,7 @@ impl Store {
         self.run_mutation_script("?[workspace, context, owner_kind, owner, name, state, vld] := *method{workspace, context, owner_kind, owner, name, state @ 'NOW'}, workspace = $ws, context = $ctx, owner_kind = 'entity', owner = $name, state = 'desired', vld = 'RETRACT' :put method { workspace, context, owner_kind, owner, name, state, vld }", p.clone(), format!("remove entity methods for {name}"))?;
         self.run_mutation_script("?[workspace, context, owner_kind, owner, method, name, state, vld] := *method_param{workspace, context, owner_kind, owner, method, name, state @ 'NOW'}, workspace = $ws, context = $ctx, owner_kind = 'entity', owner = $name, state = 'desired', vld = 'RETRACT' :put method_param { workspace, context, owner_kind, owner, method, name, state, vld }", p.clone(), format!("remove entity method params for {name}"))?;
         self.run_mutation_script("?[workspace, context, entity, idx, state, text, vld] := *invariant{workspace, context, entity, idx, state, text @ 'NOW'}, workspace = $ws, context = $ctx, entity = $name, state = 'desired', vld = 'RETRACT' :put invariant { workspace, context, entity, idx, state, vld => text }", p.clone(), format!("remove entity invariants for {name}"))?;
-        self.db.run_script("?[workspace, context, name, state, vld] := workspace = $ws, context = $ctx, name = $name, state = 'desired', vld = 'RETRACT' :put entity { workspace, context, name, state, vld }", p, ScriptMutability::Mutable).map_err(|e| anyhow::anyhow!("remove_entity: {:?}", e))?;
+        self.run_script("?[workspace, context, name, state, vld] := workspace = $ws, context = $ctx, name = $name, state = 'desired', vld = 'RETRACT' :put entity { workspace, context, name, state, vld }", p, ScriptMutability::Mutable).map_err(|e| anyhow::anyhow!("remove_entity: {:?}", e))?;
         Ok(true)
     }
 
@@ -2694,7 +2528,7 @@ impl Store {
             ("path", &ep.route_pattern),
             ("desc", &ep.description),
         ]);
-        self.db.run_script(
+        self.run_script(
             "?[workspace, context, id, state, service_id, method, route_pattern, description] <- \
              [[$ws, $ctx, $id, 'desired', $svc, $met, $path, $desc]] :put api_endpoint { workspace, context, id, state => service_id, method, route_pattern, description }",
             params, ScriptMutability::Mutable
@@ -2705,7 +2539,7 @@ impl Store {
     pub fn remove_api_endpoint(&self, workspace_path: &str, ctx: &str, id: &str) -> Result<bool> {
         let ws = canonicalize_path(workspace_path);
         let params = params_map(&[("ws", &ws), ("ctx", ctx), ("id", id)]);
-        let _ = self.db.run_script(
+        let _ = self.run_script(
             "?[workspace, context, id, state, vld] := *api_endpoint{workspace, context, id, state @ 'NOW'}, workspace = $ws, context = $ctx, id = $id, state = 'desired', vld = 'RETRACT' :put api_endpoint { workspace, context, id, state, vld }",
             params, ScriptMutability::Mutable
         ).map_err(|e| anyhow::anyhow!("remove_api_endpoint: {:?}", e))?;
@@ -2714,7 +2548,7 @@ impl Store {
 
     pub fn query_api_endpoint(&self, ws: &str, ctx: &str, id: &str) -> Option<APIEndpoint> {
         let ws = canonicalize_path(ws);
-        let rows = self.db.run_script(
+        let rows = self.run_script(
             "?[service_id, method, route_pattern, description] := *api_endpoint{workspace: $ws, context: $ctx, id: $id, state: 'desired', service_id, method, route_pattern, description @ 'NOW'}",
             params_map(&[("ws", &ws), ("ctx", ctx), ("id", id)]),
             ScriptMutability::Immutable
@@ -2737,14 +2571,20 @@ impl Store {
             ServiceKind::Infrastructure => "infrastructure",
             ServiceKind::Domain => "domain",
         };
-        let mut params = params_map(&[("ws", &ws), ("ctx", ctx), ("name", &service.name), ("desc", &service.description), ("kind", kind)]);
+        let mut params = params_map(&[
+            ("ws", &ws),
+            ("ctx", ctx),
+            ("name", &service.name),
+            ("desc", &service.description),
+            ("kind", kind),
+        ]);
         params.insert(
             "file".into(),
             cozo::DataValue::Str(service.file_path.as_deref().unwrap_or("").into()),
         );
         params.insert("sl".into(), int_dv(service.start_line.unwrap_or(0) as i64));
         params.insert("el".into(), int_dv(service.end_line.unwrap_or(0) as i64));
-        self.db.run_script(
+        self.run_script(
             "?[workspace, context, name, state, description, kind, file_path, start_line, end_line] <- [[$ws, $ctx, $name, 'desired', $desc, $kind, $file, $sl, $el]] :put service { workspace, context, name, state => description, kind, file_path, start_line, end_line }",
             params,
             ScriptMutability::Mutable,
@@ -2757,28 +2597,34 @@ impl Store {
     pub fn remove_service(&self, workspace_path: &str, ctx: &str, name: &str) -> Result<bool> {
         let ws = canonicalize_path(workspace_path);
         let p = params_map(&[("ws", &ws), ("ctx", ctx), ("name", name)]);
-        let exists = self.db.run_script("?[n] := *service{workspace: $ws, context: $ctx, name: $name, state: 'desired' @ 'NOW'}, n = $name", p.clone(), ScriptMutability::Immutable).map(|r| !r.rows.is_empty()).unwrap_or(false);
+        let exists = self.run_script("?[n] := *service{workspace: $ws, context: $ctx, name: $name, state: 'desired' @ 'NOW'}, n = $name", p.clone(), ScriptMutability::Immutable).map(|r| !r.rows.is_empty()).unwrap_or(false);
         if !exists {
             return Ok(false);
         }
         self.run_mutation_script("?[workspace, context, owner_kind, owner, name, state, vld] := *method{workspace, context, owner_kind, owner, name, state @ 'NOW'}, workspace = $ws, context = $ctx, owner_kind = 'service', owner = $name, state = 'desired', vld = 'RETRACT' :put method { workspace, context, owner_kind, owner, name, state, vld }", p.clone(), format!("remove service methods for {name}"))?;
         self.run_mutation_script("?[workspace, context, owner_kind, owner, method, name, state, vld] := *method_param{workspace, context, owner_kind, owner, method, name, state @ 'NOW'}, workspace = $ws, context = $ctx, owner_kind = 'service', owner = $name, state = 'desired', vld = 'RETRACT' :put method_param { workspace, context, owner_kind, owner, method, name, state, vld }", p.clone(), format!("remove service method params for {name}"))?;
         self.run_mutation_script("?[workspace, context, service, dep, state, vld] := *service_dep{workspace, context, service, dep, state @ 'NOW'}, workspace = $ws, context = $ctx, service = $name, state = 'desired', vld = 'RETRACT' :put service_dep { workspace, context, service, dep, state, vld }", p.clone(), format!("remove service dependencies for {name}"))?;
-        self.db.run_script("?[workspace, context, name, state, vld] := workspace = $ws, context = $ctx, name = $name, state = 'desired', vld = 'RETRACT' :put service { workspace, context, name, state, vld }", p, ScriptMutability::Mutable).map_err(|e| anyhow::anyhow!("remove_service: {:?}", e))?;
+        self.run_script("?[workspace, context, name, state, vld] := workspace = $ws, context = $ctx, name = $name, state = 'desired', vld = 'RETRACT' :put service { workspace, context, name, state, vld }", p, ScriptMutability::Mutable).map_err(|e| anyhow::anyhow!("remove_service: {:?}", e))?;
         Ok(true)
     }
 
     pub fn upsert_event(&self, workspace_path: &str, ctx: &str, event: &DomainEvent) -> Result<()> {
         let ws = canonicalize_path(workspace_path);
         self.ensure_project(workspace_path)?;
-        let mut params = params_map(&[("ws", &ws), ("ctx", ctx), ("name", &event.name), ("desc", &event.description), ("source", &event.source)]);
+        let mut params = params_map(&[
+            ("ws", &ws),
+            ("ctx", ctx),
+            ("name", &event.name),
+            ("desc", &event.description),
+            ("source", &event.source),
+        ]);
         params.insert(
             "file".into(),
             cozo::DataValue::Str(event.file_path.as_deref().unwrap_or("").into()),
         );
         params.insert("sl".into(), int_dv(event.start_line.unwrap_or(0) as i64));
         params.insert("el".into(), int_dv(event.end_line.unwrap_or(0) as i64));
-        self.db.run_script(
+        self.run_script(
             "?[workspace, context, name, state, description, source, file_path, start_line, end_line] <- [[$ws, $ctx, $name, 'desired', $desc, $source, $file, $sl, $el]] :put event { workspace, context, name, state => description, source, file_path, start_line, end_line }",
             params,
             ScriptMutability::Mutable,
@@ -2790,12 +2636,12 @@ impl Store {
     pub fn remove_event(&self, workspace_path: &str, ctx: &str, name: &str) -> Result<bool> {
         let ws = canonicalize_path(workspace_path);
         let p = params_map(&[("ws", &ws), ("ctx", ctx), ("name", name)]);
-        let exists = self.db.run_script("?[n] := *event{workspace: $ws, context: $ctx, name: $name, state: 'desired' @ 'NOW'}, n = $name", p.clone(), ScriptMutability::Immutable).map(|r| !r.rows.is_empty()).unwrap_or(false);
+        let exists = self.run_script("?[n] := *event{workspace: $ws, context: $ctx, name: $name, state: 'desired' @ 'NOW'}, n = $name", p.clone(), ScriptMutability::Immutable).map(|r| !r.rows.is_empty()).unwrap_or(false);
         if !exists {
             return Ok(false);
         }
         self.run_mutation_script("?[workspace, context, owner_kind, owner, name, state, vld] := *field{workspace, context, owner_kind, owner, name, state @ 'NOW'}, workspace = $ws, context = $ctx, owner_kind = 'event', owner = $name, state = 'desired', vld = 'RETRACT' :put field { workspace, context, owner_kind, owner, name, state, vld }", p.clone(), format!("remove event fields for {name}"))?;
-        self.db.run_script("?[workspace, context, name, state, vld] := workspace = $ws, context = $ctx, name = $name, state = 'desired', vld = 'RETRACT' :put event { workspace, context, name, state, vld }", p, ScriptMutability::Mutable).map_err(|e| anyhow::anyhow!("remove_event: {:?}", e))?;
+        self.run_script("?[workspace, context, name, state, vld] := workspace = $ws, context = $ctx, name = $name, state = 'desired', vld = 'RETRACT' :put event { workspace, context, name, state, vld }", p, ScriptMutability::Mutable).map_err(|e| anyhow::anyhow!("remove_event: {:?}", e))?;
         Ok(true)
     }
 
@@ -2807,14 +2653,25 @@ impl Store {
     ) -> Result<()> {
         let ws = canonicalize_path(workspace_path);
         self.ensure_project(workspace_path)?;
-        let mut params = params_map(&[("ws", &ws), ("ctx", ctx), ("name", &value_object.name), ("desc", &value_object.description)]);
+        let mut params = params_map(&[
+            ("ws", &ws),
+            ("ctx", ctx),
+            ("name", &value_object.name),
+            ("desc", &value_object.description),
+        ]);
         params.insert(
             "file".into(),
             cozo::DataValue::Str(value_object.file_path.as_deref().unwrap_or("").into()),
         );
-        params.insert("sl".into(), int_dv(value_object.start_line.unwrap_or(0) as i64));
-        params.insert("el".into(), int_dv(value_object.end_line.unwrap_or(0) as i64));
-        self.db.run_script(
+        params.insert(
+            "sl".into(),
+            int_dv(value_object.start_line.unwrap_or(0) as i64),
+        );
+        params.insert(
+            "el".into(),
+            int_dv(value_object.end_line.unwrap_or(0) as i64),
+        );
+        self.run_script(
             "?[workspace, context, name, state, description, file_path, start_line, end_line] <- [[$ws, $ctx, $name, 'desired', $desc, $file, $sl, $el]] :put value_object { workspace, context, name, state => description, file_path, start_line, end_line }",
             params,
             ScriptMutability::Mutable,
@@ -2833,13 +2690,13 @@ impl Store {
     pub fn remove_value_object(&self, workspace_path: &str, ctx: &str, name: &str) -> Result<bool> {
         let ws = canonicalize_path(workspace_path);
         let p = params_map(&[("ws", &ws), ("ctx", ctx), ("name", name)]);
-        let exists = self.db.run_script("?[n] := *value_object{workspace: $ws, context: $ctx, name: $name, state: 'desired' @ 'NOW'}, n = $name", p.clone(), ScriptMutability::Immutable).map(|r| !r.rows.is_empty()).unwrap_or(false);
+        let exists = self.run_script("?[n] := *value_object{workspace: $ws, context: $ctx, name: $name, state: 'desired' @ 'NOW'}, n = $name", p.clone(), ScriptMutability::Immutable).map(|r| !r.rows.is_empty()).unwrap_or(false);
         if !exists {
             return Ok(false);
         }
         self.run_mutation_script("?[workspace, context, owner_kind, owner, name, state, vld] := *field{workspace, context, owner_kind, owner, name, state @ 'NOW'}, workspace = $ws, context = $ctx, owner_kind = 'value_object', owner = $name, state = 'desired', vld = 'RETRACT' :put field { workspace, context, owner_kind, owner, name, state, vld }", p.clone(), format!("remove value object fields for {name}"))?;
         self.run_mutation_script("?[workspace, context, value_object, idx, state, text, vld] := *vo_rule{workspace, context, value_object, idx, state, text @ 'NOW'}, workspace = $ws, context = $ctx, value_object = $name, state = 'desired', vld = 'RETRACT' :put vo_rule { workspace, context, value_object, idx, state, vld => text }", p.clone(), format!("remove value object rules for {name}"))?;
-        self.db.run_script("?[workspace, context, name, state, vld] := workspace = $ws, context = $ctx, name = $name, state = 'desired', vld = 'RETRACT' :put value_object { workspace, context, name, state, vld }", p, ScriptMutability::Mutable).map_err(|e| anyhow::anyhow!("remove_value_object: {:?}", e))?;
+        self.run_script("?[workspace, context, name, state, vld] := workspace = $ws, context = $ctx, name = $name, state = 'desired', vld = 'RETRACT' :put value_object { workspace, context, name, state, vld }", p, ScriptMutability::Mutable).map_err(|e| anyhow::anyhow!("remove_value_object: {:?}", e))?;
         Ok(true)
     }
 
@@ -2851,14 +2708,22 @@ impl Store {
     ) -> Result<()> {
         let ws = canonicalize_path(workspace_path);
         self.ensure_project(workspace_path)?;
-        let mut params = params_map(&[("ws", &ws), ("ctx", ctx), ("name", &repository.name), ("aggregate", &repository.aggregate)]);
+        let mut params = params_map(&[
+            ("ws", &ws),
+            ("ctx", ctx),
+            ("name", &repository.name),
+            ("aggregate", &repository.aggregate),
+        ]);
         params.insert(
             "file".into(),
             cozo::DataValue::Str(repository.file_path.as_deref().unwrap_or("").into()),
         );
-        params.insert("sl".into(), int_dv(repository.start_line.unwrap_or(0) as i64));
+        params.insert(
+            "sl".into(),
+            int_dv(repository.start_line.unwrap_or(0) as i64),
+        );
         params.insert("el".into(), int_dv(repository.end_line.unwrap_or(0) as i64));
-        self.db.run_script(
+        self.run_script(
             "?[workspace, context, name, state, aggregate, file_path, start_line, end_line] <- [[$ws, $ctx, $name, 'desired', $aggregate, $file, $sl, $el]] :put repository { workspace, context, name, state => aggregate, file_path, start_line, end_line }",
             params,
             ScriptMutability::Mutable,
@@ -2876,19 +2741,19 @@ impl Store {
     pub fn remove_repository(&self, workspace_path: &str, ctx: &str, name: &str) -> Result<bool> {
         let ws = canonicalize_path(workspace_path);
         let p = params_map(&[("ws", &ws), ("ctx", ctx), ("name", name)]);
-        let exists = self.db.run_script("?[n] := *repository{workspace: $ws, context: $ctx, name: $name, state: 'desired' @ 'NOW'}, n = $name", p.clone(), ScriptMutability::Immutable).map(|r| !r.rows.is_empty()).unwrap_or(false);
+        let exists = self.run_script("?[n] := *repository{workspace: $ws, context: $ctx, name: $name, state: 'desired' @ 'NOW'}, n = $name", p.clone(), ScriptMutability::Immutable).map(|r| !r.rows.is_empty()).unwrap_or(false);
         if !exists {
             return Ok(false);
         }
         self.run_mutation_script("?[workspace, context, owner_kind, owner, name, state, vld] := *method{workspace, context, owner_kind, owner, name, state @ 'NOW'}, workspace = $ws, context = $ctx, owner_kind = 'repository', owner = $name, state = 'desired', vld = 'RETRACT' :put method { workspace, context, owner_kind, owner, name, state, vld }", p.clone(), format!("remove repository methods for {name}"))?;
         self.run_mutation_script("?[workspace, context, owner_kind, owner, method, name, state, vld] := *method_param{workspace, context, owner_kind, owner, method, name, state @ 'NOW'}, workspace = $ws, context = $ctx, owner_kind = 'repository', owner = $name, state = 'desired', vld = 'RETRACT' :put method_param { workspace, context, owner_kind, owner, method, name, state, vld }", p.clone(), format!("remove repository method params for {name}"))?;
-        self.db.run_script("?[workspace, context, name, state, vld] := workspace = $ws, context = $ctx, name = $name, state = 'desired', vld = 'RETRACT' :put repository { workspace, context, name, state, vld }", p, ScriptMutability::Mutable).map_err(|e| anyhow::anyhow!("remove_repository: {:?}", e))?;
+        self.run_script("?[workspace, context, name, state, vld] := workspace = $ws, context = $ctx, name = $name, state = 'desired', vld = 'RETRACT' :put repository { workspace, context, name, state, vld }", p, ScriptMutability::Mutable).map_err(|e| anyhow::anyhow!("remove_repository: {:?}", e))?;
         Ok(true)
     }
 
     pub fn query_module(&self, ws: &str, ctx: &str, name: &str) -> Option<Module> {
         let ws = canonicalize_path(ws);
-        let rows = self.db.run_script(
+        let rows = self.run_script(
             "?[path, public, file_path, description] := *module{workspace: $ws, context: $ctx, name: $name, state: 'desired', path, public, file_path, description @ 'NOW'}",
             params_map(&[("ws", &ws), ("ctx", ctx), ("name", name)]),
             ScriptMutability::Immutable,
@@ -2915,7 +2780,7 @@ impl Store {
             ("desc", &module.description),
         ]);
         params.insert("public".into(), cozo::DataValue::Bool(module.public));
-        self.db.run_script(
+        self.run_script(
             "?[workspace, context, name, state, path, public, file_path, description] <- [[$ws, $ctx, $name, 'desired', $path, $public, $fp, $desc]] :put module { workspace, context, name, state => path, public, file_path, description }",
             params,
             ScriptMutability::Mutable,
@@ -2926,7 +2791,7 @@ impl Store {
     pub fn remove_module(&self, workspace_path: &str, ctx: &str, name: &str) -> Result<bool> {
         let ws = canonicalize_path(workspace_path);
         let p = params_map(&[("ws", &ws), ("ctx", ctx), ("name", name)]);
-        let exists = self.db.run_script(
+        let exists = self.run_script(
             "?[n] := *module{workspace: $ws, context: $ctx, name: $name, state: 'desired' @ 'NOW'}, n = $name",
             p.clone(),
             ScriptMutability::Immutable,
@@ -2934,7 +2799,7 @@ impl Store {
         if !exists {
             return Ok(false);
         }
-        self.db.run_script(
+        self.run_script(
             "?[workspace, context, name, state, vld] := workspace = $ws, context = $ctx, name = $name, state = 'desired', vld = 'RETRACT' :put module { workspace, context, name, state, vld }",
             p,
             ScriptMutability::Mutable,
@@ -2949,7 +2814,7 @@ impl Store {
         aggregate: &Aggregate,
     ) -> Result<()> {
         let ws = canonicalize_path(workspace_path);
-        self.db.run_script(
+        self.run_script(
             "?[workspace, context, name, state, description, root_entity] <- [[$ws, $ctx, $name, 'desired', $desc, $root]] :put aggregate { workspace, context, name, state => description, root_entity }",
             params_map(&[("ws", &ws), ("ctx", ctx), ("name", &aggregate.name), ("desc", &aggregate.description), ("root", &aggregate.root_entity)]),
             ScriptMutability::Mutable,
@@ -2968,10 +2833,10 @@ impl Store {
             format!("retract aggregate members for {}", aggregate.name),
         )?;
         for entity in &aggregate.entities {
-            self.db.run_script("?[workspace, context, aggregate, member_kind, member, state] <- [[$ws, $ctx, $name, 'entity', $member, 'desired']] :put aggregate_member { workspace, context, aggregate, member_kind, member, state }", params_map(&[("ws", &ws), ("ctx", ctx), ("name", &aggregate.name), ("member", entity)]), ScriptMutability::Mutable).map_err(|e| anyhow::anyhow!("upsert_aggregate entity: {:?}", e))?;
+            self.run_script("?[workspace, context, aggregate, member_kind, member, state] <- [[$ws, $ctx, $name, 'entity', $member, 'desired']] :put aggregate_member { workspace, context, aggregate, member_kind, member, state }", params_map(&[("ws", &ws), ("ctx", ctx), ("name", &aggregate.name), ("member", entity)]), ScriptMutability::Mutable).map_err(|e| anyhow::anyhow!("upsert_aggregate entity: {:?}", e))?;
         }
         for vo in &aggregate.value_objects {
-            self.db.run_script("?[workspace, context, aggregate, member_kind, member, state] <- [[$ws, $ctx, $name, 'value_object', $member, 'desired']] :put aggregate_member { workspace, context, aggregate, member_kind, member, state }", params_map(&[("ws", &ws), ("ctx", ctx), ("name", &aggregate.name), ("member", vo)]), ScriptMutability::Mutable).map_err(|e| anyhow::anyhow!("upsert_aggregate vo: {:?}", e))?;
+            self.run_script("?[workspace, context, aggregate, member_kind, member, state] <- [[$ws, $ctx, $name, 'value_object', $member, 'desired']] :put aggregate_member { workspace, context, aggregate, member_kind, member, state }", params_map(&[("ws", &ws), ("ctx", ctx), ("name", &aggregate.name), ("member", vo)]), ScriptMutability::Mutable).map_err(|e| anyhow::anyhow!("upsert_aggregate vo: {:?}", e))?;
         }
         Ok(())
     }
@@ -2979,20 +2844,20 @@ impl Store {
     pub fn remove_aggregate(&self, workspace_path: &str, ctx: &str, name: &str) -> Result<bool> {
         let ws = canonicalize_path(workspace_path);
         let p = params_map(&[("ws", &ws), ("ctx", ctx), ("name", name)]);
-        let exists = self.db.run_script("?[n] := *aggregate{workspace: $ws, context: $ctx, name: $name, state: 'desired' @ 'NOW'}, n = $name", p.clone(), ScriptMutability::Immutable).map(|r| !r.rows.is_empty()).unwrap_or(false);
+        let exists = self.run_script("?[n] := *aggregate{workspace: $ws, context: $ctx, name: $name, state: 'desired' @ 'NOW'}, n = $name", p.clone(), ScriptMutability::Immutable).map(|r| !r.rows.is_empty()).unwrap_or(false);
         if !exists {
             return Ok(false);
         }
         self.run_mutation_script("?[workspace, context, aggregate, member_kind, member, state, vld] := *aggregate_member{workspace, context, aggregate, member_kind, member, state @ 'NOW'}, workspace = $ws, context = $ctx, aggregate = $name, state = 'desired', vld = 'RETRACT' :put aggregate_member { workspace, context, aggregate, member_kind, member, state, vld }", p.clone(), format!("remove aggregate members for {name}"))?;
         self.remove_owner_meta(&ws, ctx, "aggregate", name)?;
-        self.db.run_script("?[workspace, context, name, state, vld] := workspace = $ws, context = $ctx, name = $name, state = 'desired', vld = 'RETRACT' :put aggregate { workspace, context, name, state, vld }", p, ScriptMutability::Mutable).map_err(|e| anyhow::anyhow!("remove_aggregate: {:?}", e))?;
+        self.run_script("?[workspace, context, name, state, vld] := workspace = $ws, context = $ctx, name = $name, state = 'desired', vld = 'RETRACT' :put aggregate { workspace, context, name, state, vld }", p, ScriptMutability::Mutable).map_err(|e| anyhow::anyhow!("remove_aggregate: {:?}", e))?;
         Ok(true)
     }
 
     pub fn upsert_policy(&self, workspace_path: &str, ctx: &str, policy: &Policy) -> Result<()> {
         let ws = canonicalize_path(workspace_path);
         let kind = Self::policy_kind_key(&policy.kind).to_string();
-        self.db.run_script("?[workspace, context, name, state, description, kind] <- [[$ws, $ctx, $name, 'desired', $desc, $kind]] :put policy { workspace, context, name, state => description, kind }", params_map(&[("ws", &ws), ("ctx", ctx), ("name", &policy.name), ("desc", &policy.description), ("kind", &kind)]), ScriptMutability::Mutable).map_err(|e| anyhow::anyhow!("upsert_policy: {:?}", e))?;
+        self.run_script("?[workspace, context, name, state, description, kind] <- [[$ws, $ctx, $name, 'desired', $desc, $kind]] :put policy { workspace, context, name, state => description, kind }", params_map(&[("ws", &ws), ("ctx", ctx), ("name", &policy.name), ("desc", &policy.description), ("kind", &kind)]), ScriptMutability::Mutable).map_err(|e| anyhow::anyhow!("upsert_policy: {:?}", e))?;
         self.save_owner_meta(
             &ws,
             ctx,
@@ -3010,7 +2875,7 @@ impl Store {
                 ("link", trigger),
             ]);
             p.insert("idx".into(), int_dv(idx as i64));
-            self.db.run_script("?[workspace, context, policy, link_kind, link, idx, state] <- [[$ws, $ctx, $name, 'trigger', $link, $idx, 'desired']] :put policy_link { workspace, context, policy, link_kind, link, idx, state }", p, ScriptMutability::Mutable).map_err(|e| anyhow::anyhow!("upsert_policy trigger: {:?}", e))?;
+            self.run_script("?[workspace, context, policy, link_kind, link, idx, state] <- [[$ws, $ctx, $name, 'trigger', $link, $idx, 'desired']] :put policy_link { workspace, context, policy, link_kind, link, idx, state }", p, ScriptMutability::Mutable).map_err(|e| anyhow::anyhow!("upsert_policy trigger: {:?}", e))?;
         }
         for (idx, command) in policy.commands.iter().enumerate() {
             let mut p = params_map(&[
@@ -3020,7 +2885,7 @@ impl Store {
                 ("link", command),
             ]);
             p.insert("idx".into(), int_dv(idx as i64));
-            self.db.run_script("?[workspace, context, policy, link_kind, link, idx, state] <- [[$ws, $ctx, $name, 'command', $link, $idx, 'desired']] :put policy_link { workspace, context, policy, link_kind, link, idx, state }", p, ScriptMutability::Mutable).map_err(|e| anyhow::anyhow!("upsert_policy command: {:?}", e))?;
+            self.run_script("?[workspace, context, policy, link_kind, link, idx, state] <- [[$ws, $ctx, $name, 'command', $link, $idx, 'desired']] :put policy_link { workspace, context, policy, link_kind, link, idx, state }", p, ScriptMutability::Mutable).map_err(|e| anyhow::anyhow!("upsert_policy command: {:?}", e))?;
         }
         Ok(())
     }
@@ -3028,13 +2893,13 @@ impl Store {
     pub fn remove_policy(&self, workspace_path: &str, ctx: &str, name: &str) -> Result<bool> {
         let ws = canonicalize_path(workspace_path);
         let p = params_map(&[("ws", &ws), ("ctx", ctx), ("name", name)]);
-        let exists = self.db.run_script("?[n] := *policy{workspace: $ws, context: $ctx, name: $name, state: 'desired' @ 'NOW'}, n = $name", p.clone(), ScriptMutability::Immutable).map(|r| !r.rows.is_empty()).unwrap_or(false);
+        let exists = self.run_script("?[n] := *policy{workspace: $ws, context: $ctx, name: $name, state: 'desired' @ 'NOW'}, n = $name", p.clone(), ScriptMutability::Immutable).map(|r| !r.rows.is_empty()).unwrap_or(false);
         if !exists {
             return Ok(false);
         }
         self.run_mutation_script("?[workspace, context, policy, link_kind, link, idx, state, vld] := *policy_link{workspace, context, policy, link_kind, link, idx, state @ 'NOW'}, workspace = $ws, context = $ctx, policy = $name, state = 'desired', vld = 'RETRACT' :put policy_link { workspace, context, policy, link_kind, link, idx, state, vld }", p.clone(), format!("remove policy links for {name}"))?;
         self.remove_owner_meta(&ws, ctx, "policy", name)?;
-        self.db.run_script("?[workspace, context, name, state, vld] := workspace = $ws, context = $ctx, name = $name, state = 'desired', vld = 'RETRACT' :put policy { workspace, context, name, state, vld }", p, ScriptMutability::Mutable).map_err(|e| anyhow::anyhow!("remove_policy: {:?}", e))?;
+        self.run_script("?[workspace, context, name, state, vld] := workspace = $ws, context = $ctx, name = $name, state = 'desired', vld = 'RETRACT' :put policy { workspace, context, name, state, vld }", p, ScriptMutability::Mutable).map_err(|e| anyhow::anyhow!("remove_policy: {:?}", e))?;
         Ok(true)
     }
 
@@ -3045,7 +2910,7 @@ impl Store {
         read_model: &ReadModel,
     ) -> Result<()> {
         let ws = canonicalize_path(workspace_path);
-        self.db.run_script("?[workspace, context, name, state, description, source] <- [[$ws, $ctx, $name, 'desired', $desc, $src]] :put read_model { workspace, context, name, state => description, source }", params_map(&[("ws", &ws), ("ctx", ctx), ("name", &read_model.name), ("desc", &read_model.description), ("src", &read_model.source)]), ScriptMutability::Mutable).map_err(|e| anyhow::anyhow!("upsert_read_model: {:?}", e))?;
+        self.run_script("?[workspace, context, name, state, description, source] <- [[$ws, $ctx, $name, 'desired', $desc, $src]] :put read_model { workspace, context, name, state => description, source }", params_map(&[("ws", &ws), ("ctx", ctx), ("name", &read_model.name), ("desc", &read_model.description), ("src", &read_model.source)]), ScriptMutability::Mutable).map_err(|e| anyhow::anyhow!("upsert_read_model: {:?}", e))?;
         self.save_owner_meta(
             &ws,
             ctx,
@@ -3061,13 +2926,13 @@ impl Store {
     pub fn remove_read_model(&self, workspace_path: &str, ctx: &str, name: &str) -> Result<bool> {
         let ws = canonicalize_path(workspace_path);
         let p = params_map(&[("ws", &ws), ("ctx", ctx), ("name", name)]);
-        let exists = self.db.run_script("?[n] := *read_model{workspace: $ws, context: $ctx, name: $name, state: 'desired' @ 'NOW'}, n = $name", p.clone(), ScriptMutability::Immutable).map(|r| !r.rows.is_empty()).unwrap_or(false);
+        let exists = self.run_script("?[n] := *read_model{workspace: $ws, context: $ctx, name: $name, state: 'desired' @ 'NOW'}, n = $name", p.clone(), ScriptMutability::Immutable).map(|r| !r.rows.is_empty()).unwrap_or(false);
         if !exists {
             return Ok(false);
         }
         self.remove_owner_meta(&ws, ctx, "read_model", name)?;
         self.run_mutation_script("?[workspace, context, owner_kind, owner, name, state, vld] := *field{workspace, context, owner_kind, owner, name, state @ 'NOW'}, workspace = $ws, context = $ctx, owner_kind = 'read_model', owner = $name, state = 'desired', vld = 'RETRACT' :put field { workspace, context, owner_kind, owner, name, state, vld }", p.clone(), format!("remove read model fields for {name}"))?;
-        self.db.run_script("?[workspace, context, name, state, vld] := workspace = $ws, context = $ctx, name = $name, state = 'desired', vld = 'RETRACT' :put read_model { workspace, context, name, state, vld }", p, ScriptMutability::Mutable).map_err(|e| anyhow::anyhow!("remove_read_model: {:?}", e))?;
+        self.run_script("?[workspace, context, name, state, vld] := workspace = $ws, context = $ctx, name = $name, state = 'desired', vld = 'RETRACT' :put read_model { workspace, context, name, state, vld }", p, ScriptMutability::Mutable).map_err(|e| anyhow::anyhow!("remove_read_model: {:?}", e))?;
         Ok(true)
     }
 
@@ -3077,7 +2942,7 @@ impl Store {
         system: &ExternalSystem,
     ) -> Result<()> {
         let ws = canonicalize_path(workspace_path);
-        self.db.run_script("?[workspace, name, state, description, kind, rationale] <- [[$ws, $name, 'desired', $desc, $kind, $rationale]] :put external_system { workspace, name, state => description, kind, rationale }", params_map(&[("ws", &ws), ("name", &system.name), ("desc", &system.description), ("kind", &system.kind), ("rationale", &system.rationale)]), ScriptMutability::Mutable).map_err(|e| anyhow::anyhow!("upsert_external_system: {:?}", e))?;
+        self.run_script("?[workspace, name, state, description, kind, rationale] <- [[$ws, $name, 'desired', $desc, $kind, $rationale]] :put external_system { workspace, name, state => description, kind, rationale }", params_map(&[("ws", &ws), ("name", &system.name), ("desc", &system.description), ("kind", &system.kind), ("rationale", &system.rationale)]), ScriptMutability::Mutable).map_err(|e| anyhow::anyhow!("upsert_external_system: {:?}", e))?;
         self.save_owner_meta(
             &ws,
             "",
@@ -3090,7 +2955,7 @@ impl Store {
         for (idx, ctx) in system.consumed_by_contexts.iter().enumerate() {
             let mut p = params_map(&[("ws", &ws), ("name", &system.name), ("ctx", ctx)]);
             p.insert("idx".into(), int_dv(idx as i64));
-            self.db.run_script("?[workspace, system, context, idx, state] <- [[$ws, $name, $ctx, $idx, 'desired']] :put external_system_context { workspace, system, context, idx, state }", p, ScriptMutability::Mutable).map_err(|e| anyhow::anyhow!("upsert_external_system ctx: {:?}", e))?;
+            self.run_script("?[workspace, system, context, idx, state] <- [[$ws, $name, $ctx, $idx, 'desired']] :put external_system_context { workspace, system, context, idx, state }", p, ScriptMutability::Mutable).map_err(|e| anyhow::anyhow!("upsert_external_system ctx: {:?}", e))?;
         }
         Ok(())
     }
@@ -3098,13 +2963,13 @@ impl Store {
     pub fn remove_external_system(&self, workspace_path: &str, name: &str) -> Result<bool> {
         let ws = canonicalize_path(workspace_path);
         let p = params_map(&[("ws", &ws), ("name", name)]);
-        let exists = self.db.run_script("?[n] := *external_system{workspace: $ws, name: $name, state: 'desired' @ 'NOW'}, n = $name", p.clone(), ScriptMutability::Immutable).map(|r| !r.rows.is_empty()).unwrap_or(false);
+        let exists = self.run_script("?[n] := *external_system{workspace: $ws, name: $name, state: 'desired' @ 'NOW'}, n = $name", p.clone(), ScriptMutability::Immutable).map(|r| !r.rows.is_empty()).unwrap_or(false);
         if !exists {
             return Ok(false);
         }
         self.remove_owner_meta(&ws, "", "external_system", name)?;
         self.run_mutation_script("?[workspace, system, context, idx, state, vld] := *external_system_context{workspace, system, context, idx, state @ 'NOW'}, workspace = $ws, system = $name, state = 'desired', vld = 'RETRACT' :put external_system_context { workspace, system, context, idx, state, vld }", p.clone(), format!("remove external system contexts for {name}"))?;
-        self.db.run_script("?[workspace, name, state, vld] := workspace = $ws, name = $name, state = 'desired', vld = 'RETRACT' :put external_system { workspace, name, state, vld }", p, ScriptMutability::Mutable).map_err(|e| anyhow::anyhow!("remove_external_system: {:?}", e))?;
+        self.run_script("?[workspace, name, state, vld] := workspace = $ws, name = $name, state = 'desired', vld = 'RETRACT' :put external_system { workspace, name, state, vld }", p, ScriptMutability::Mutable).map_err(|e| anyhow::anyhow!("remove_external_system: {:?}", e))?;
         Ok(true)
     }
 
@@ -3115,7 +2980,7 @@ impl Store {
     ) -> Result<()> {
         let ws = canonicalize_path(workspace_path);
         let status = format!("{:?}", decision.status).to_lowercase();
-        self.db.run_script("?[workspace, id, state, title, status, scope, date, rationale] <- [[$ws, $id, 'desired', $title, $status, $scope, $date, $rationale]] :put architectural_decision { workspace, id, state => title, status, scope, date, rationale }", params_map(&[("ws", &ws), ("id", &decision.id), ("title", &decision.title), ("status", &status), ("scope", &decision.scope), ("date", &decision.date), ("rationale", &decision.rationale)]), ScriptMutability::Mutable).map_err(|e| anyhow::anyhow!("upsert_architectural_decision: {:?}", e))?;
+        self.run_script("?[workspace, id, state, title, status, scope, date, rationale] <- [[$ws, $id, 'desired', $title, $status, $scope, $date, $rationale]] :put architectural_decision { workspace, id, state => title, status, scope, date, rationale }", params_map(&[("ws", &ws), ("id", &decision.id), ("title", &decision.title), ("status", &status), ("scope", &decision.scope), ("date", &decision.date), ("rationale", &decision.rationale)]), ScriptMutability::Mutable).map_err(|e| anyhow::anyhow!("upsert_architectural_decision: {:?}", e))?;
         self.save_owner_meta(
             &ws,
             "",
@@ -3129,12 +2994,12 @@ impl Store {
         for (idx, ctx) in decision.contexts.iter().enumerate() {
             let mut p = params_map(&[("ws", &ws), ("id", &decision.id), ("ctx", ctx)]);
             p.insert("idx".into(), int_dv(idx as i64));
-            self.db.run_script("?[workspace, decision_id, context, idx, state] <- [[$ws, $id, $ctx, $idx, 'desired']] :put decision_context { workspace, decision_id, context, idx, state }", p, ScriptMutability::Mutable).map_err(|e| anyhow::anyhow!("upsert_architectural_decision ctx: {:?}", e))?;
+            self.run_script("?[workspace, decision_id, context, idx, state] <- [[$ws, $id, $ctx, $idx, 'desired']] :put decision_context { workspace, decision_id, context, idx, state }", p, ScriptMutability::Mutable).map_err(|e| anyhow::anyhow!("upsert_architectural_decision ctx: {:?}", e))?;
         }
         for (idx, consequence) in decision.consequences.iter().enumerate() {
             let mut p = params_map(&[("ws", &ws), ("id", &decision.id), ("text", consequence)]);
             p.insert("idx".into(), int_dv(idx as i64));
-            self.db.run_script("?[workspace, decision_id, idx, state, text] <- [[$ws, $id, $idx, 'desired', $text]] :put decision_consequence { workspace, decision_id, idx, state => text }", p, ScriptMutability::Mutable).map_err(|e| anyhow::anyhow!("upsert_architectural_decision consequence: {:?}", e))?;
+            self.run_script("?[workspace, decision_id, idx, state, text] <- [[$ws, $id, $idx, 'desired', $text]] :put decision_consequence { workspace, decision_id, idx, state => text }", p, ScriptMutability::Mutable).map_err(|e| anyhow::anyhow!("upsert_architectural_decision consequence: {:?}", e))?;
         }
         Ok(())
     }
@@ -3142,14 +3007,14 @@ impl Store {
     pub fn remove_architectural_decision(&self, workspace_path: &str, id: &str) -> Result<bool> {
         let ws = canonicalize_path(workspace_path);
         let p = params_map(&[("ws", &ws), ("id", id)]);
-        let exists = self.db.run_script("?[n] := *architectural_decision{workspace: $ws, id: $id, state: 'desired' @ 'NOW'}, n = $id", p.clone(), ScriptMutability::Immutable).map(|r| !r.rows.is_empty()).unwrap_or(false);
+        let exists = self.run_script("?[n] := *architectural_decision{workspace: $ws, id: $id, state: 'desired' @ 'NOW'}, n = $id", p.clone(), ScriptMutability::Immutable).map(|r| !r.rows.is_empty()).unwrap_or(false);
         if !exists {
             return Ok(false);
         }
         self.remove_owner_meta(&ws, "", "architectural_decision", id)?;
         self.run_mutation_script("?[workspace, decision_id, context, idx, state, vld] := *decision_context{workspace, decision_id, context, idx, state @ 'NOW'}, workspace = $ws, decision_id = $id, state = 'desired', vld = 'RETRACT' :put decision_context { workspace, decision_id, context, idx, state, vld }", p.clone(), format!("remove decision contexts for {id}"))?;
         self.run_mutation_script("?[workspace, decision_id, idx, state, vld] := *decision_consequence{workspace, decision_id, idx, state @ 'NOW'}, workspace = $ws, decision_id = $id, state = 'desired', vld = 'RETRACT' :put decision_consequence { workspace, decision_id, idx, state, vld }", p.clone(), format!("remove decision consequences for {id}"))?;
-        self.db.run_script("?[workspace, id, state, vld] := workspace = $ws, id = $id, state = 'desired', vld = 'RETRACT' :put architectural_decision { workspace, id, state, vld }", p, ScriptMutability::Mutable).map_err(|e| anyhow::anyhow!("remove_architectural_decision: {:?}", e))?;
+        self.run_script("?[workspace, id, state, vld] := workspace = $ws, id = $id, state = 'desired', vld = 'RETRACT' :put architectural_decision { workspace, id, state, vld }", p, ScriptMutability::Mutable).map_err(|e| anyhow::anyhow!("remove_architectural_decision: {:?}", e))?;
         Ok(true)
     }
 
@@ -3158,7 +3023,6 @@ impl Store {
     /// List all stored projects.
     pub fn list(&self) -> Result<Vec<ProjectInfo>> {
         let result = self
-            .db
             .run_script(
                 "?[workspace, name, updated_at] := *project{workspace, name, updated_at}",
                 Default::default(),
@@ -3180,7 +3044,7 @@ impl Store {
     }
 
     /// Export a domain model to a JSON file.
-    /// `state` can be `"desired"`, `"actual"`, or `"both"`.
+    /// `state` can be `"actual"`, `"both"`, or a compatibility alias such as `"desired"`.
     pub fn export_to_file(&self, workspace_path: &str, file_path: &str, state: &str) -> Result<()> {
         let json = match state {
             "actual" => {
@@ -3199,7 +3063,7 @@ impl Store {
             }
             _ => {
                 let model = self.load_desired(workspace_path)?.with_context(|| {
-                    format!("No desired model found for workspace: {workspace_path}")
+                    format!("No implemented model found for workspace: {workspace_path}")
                 })?;
                 serde_json::to_string_pretty(&model)?
             }
@@ -3209,104 +3073,51 @@ impl Store {
         Ok(())
     }
 
-    // ── Pure Datalog Differencing ──────────────────────────────────────────
+    // ── Temporal Differencing ──────────────────────────────────────────────
 
-    /// Compute the diff between desired and actual as a single Datalog union query.
-    /// Returns `{pending_changes: [{kind, action, context?, name, owner_kind?, owner?}]}`.
-    /// Covers ALL relation types: context, entity, service, event, value_object,
-    /// repository, field, method, and invariant.
+    /// Compute the diff between the two most recent actual graph snapshots.
     pub fn diff_graph(&self, workspace_path: &str) -> Result<serde_json::Value> {
-        let ws = canonicalize_path(workspace_path);
-        let params = params_map(&[("ws", &ws)]);
-
-        let rules: Vec<&str> = vec![
-            // ── Intermediate rules: temporal access separated from negation ──
-            "ctx_d[name] := *context{workspace: $ws, name, state: 'desired' @ 'NOW'}",
-            "ctx_a[name] := *context{workspace: $ws, name, state: 'actual' @ 'NOW'}",
-            "ent_d[ctx, name] := *entity{workspace: $ws, context: ctx, name, state: 'desired' @ 'NOW'}",
-            "ent_a[ctx, name] := *entity{workspace: $ws, context: ctx, name, state: 'actual' @ 'NOW'}",
-            "svc_d[ctx, name] := *service{workspace: $ws, context: ctx, name, state: 'desired' @ 'NOW'}",
-            "svc_a[ctx, name] := *service{workspace: $ws, context: ctx, name, state: 'actual' @ 'NOW'}",
-            "evt_d[ctx, name] := *event{workspace: $ws, context: ctx, name, state: 'desired' @ 'NOW'}",
-            "evt_a[ctx, name] := *event{workspace: $ws, context: ctx, name, state: 'actual' @ 'NOW'}",
-            "vo_d[ctx, name] := *value_object{workspace: $ws, context: ctx, name, state: 'desired' @ 'NOW'}",
-            "vo_a[ctx, name] := *value_object{workspace: $ws, context: ctx, name, state: 'actual' @ 'NOW'}",
-            "repo_d[ctx, name] := *repository{workspace: $ws, context: ctx, name, state: 'desired' @ 'NOW'}",
-            "repo_a[ctx, name] := *repository{workspace: $ws, context: ctx, name, state: 'actual' @ 'NOW'}",
-            "fld_d[ctx, ok, ow, name] := *field{workspace: $ws, context: ctx, owner_kind: ok, owner: ow, name, state: 'desired' @ 'NOW'}",
-            "fld_a[ctx, ok, ow, name] := *field{workspace: $ws, context: ctx, owner_kind: ok, owner: ow, name, state: 'actual' @ 'NOW'}",
-            "mth_d[ctx, ok, ow, name] := *method{workspace: $ws, context: ctx, owner_kind: ok, owner: ow, name, state: 'desired' @ 'NOW'}",
-            "mth_a[ctx, ok, ow, name] := *method{workspace: $ws, context: ctx, owner_kind: ok, owner: ow, name, state: 'actual' @ 'NOW'}",
-            "mod_d[ctx, name] := *module{workspace: $ws, context: ctx, name, state: 'desired' @ 'NOW'}",
-            "mod_a[ctx, name] := *module{workspace: $ws, context: ctx, name, state: 'actual' @ 'NOW'}",
-            "inv_d[ctx, ow, text] := *invariant{workspace: $ws, context: ctx, entity: ow, text, state: 'desired' @ 'NOW'}",
-            "inv_a[ctx, ow, text] := *invariant{workspace: $ws, context: ctx, entity: ow, text, state: 'actual' @ 'NOW'}",
-            // ── Context ──
-            "?[kind, action, ctx, name, owner_kind, owner] := ctx_d[name], not ctx_a[name], kind = 'context', action = 'add', ctx = '', owner_kind = '', owner = ''",
-            "?[kind, action, ctx, name, owner_kind, owner] := ctx_a[name], not ctx_d[name], kind = 'context', action = 'remove', ctx = '', owner_kind = '', owner = ''",
-            // ── Entity ──
-            "?[kind, action, ctx, name, owner_kind, owner] := ent_d[ctx, name], not ent_a[ctx, name], kind = 'entity', action = 'add', owner_kind = '', owner = ''",
-            "?[kind, action, ctx, name, owner_kind, owner] := ent_a[ctx, name], not ent_d[ctx, name], kind = 'entity', action = 'remove', owner_kind = '', owner = ''",
-            // ── Service ──
-            "?[kind, action, ctx, name, owner_kind, owner] := svc_d[ctx, name], not svc_a[ctx, name], kind = 'service', action = 'add', owner_kind = '', owner = ''",
-            "?[kind, action, ctx, name, owner_kind, owner] := svc_a[ctx, name], not svc_d[ctx, name], kind = 'service', action = 'remove', owner_kind = '', owner = ''",
-            // ── Event ──
-            "?[kind, action, ctx, name, owner_kind, owner] := evt_d[ctx, name], not evt_a[ctx, name], kind = 'event', action = 'add', owner_kind = '', owner = ''",
-            "?[kind, action, ctx, name, owner_kind, owner] := evt_a[ctx, name], not evt_d[ctx, name], kind = 'event', action = 'remove', owner_kind = '', owner = ''",
-            // ── Value Object ──
-            "?[kind, action, ctx, name, owner_kind, owner] := vo_d[ctx, name], not vo_a[ctx, name], kind = 'value_object', action = 'add', owner_kind = '', owner = ''",
-            "?[kind, action, ctx, name, owner_kind, owner] := vo_a[ctx, name], not vo_d[ctx, name], kind = 'value_object', action = 'remove', owner_kind = '', owner = ''",
-            // ── Repository ──
-            "?[kind, action, ctx, name, owner_kind, owner] := repo_d[ctx, name], not repo_a[ctx, name], kind = 'repository', action = 'add', owner_kind = '', owner = ''",
-            "?[kind, action, ctx, name, owner_kind, owner] := repo_a[ctx, name], not repo_d[ctx, name], kind = 'repository', action = 'remove', owner_kind = '', owner = ''",
-            // ── Module ──
-            "?[kind, action, ctx, name, owner_kind, owner] := mod_d[ctx, name], not mod_a[ctx, name], kind = 'module', action = 'add', owner_kind = '', owner = ''",
-            "?[kind, action, ctx, name, owner_kind, owner] := mod_a[ctx, name], not mod_d[ctx, name], kind = 'module', action = 'remove', owner_kind = '', owner = ''",
-            // ── Field ──
-            "?[kind, action, ctx, name, owner_kind, owner] := fld_d[ctx, owner_kind, owner, name], not fld_a[ctx, owner_kind, owner, name], kind = 'field', action = 'add'",
-            "?[kind, action, ctx, name, owner_kind, owner] := fld_a[ctx, owner_kind, owner, name], not fld_d[ctx, owner_kind, owner, name], kind = 'field', action = 'remove'",
-            // ── Method ──
-            "?[kind, action, ctx, name, owner_kind, owner] := mth_d[ctx, owner_kind, owner, name], not mth_a[ctx, owner_kind, owner, name], kind = 'method', action = 'add'",
-            "?[kind, action, ctx, name, owner_kind, owner] := mth_a[ctx, owner_kind, owner, name], not mth_d[ctx, owner_kind, owner, name], kind = 'method', action = 'remove'",
-            // ── Invariant ──
-            "?[kind, action, ctx, name, owner_kind, owner] := inv_d[ctx, owner, name], not inv_a[ctx, owner, name], kind = 'invariant', action = 'add', owner_kind = 'entity'",
-            "?[kind, action, ctx, name, owner_kind, owner] := inv_a[ctx, owner, name], not inv_d[ctx, owner, name], kind = 'invariant', action = 'remove', owner_kind = 'entity'",
-        ];
-
-        let script = rules.join(" ");
-        let result = self
-            .db
-            .run_script(&script, params, ScriptMutability::Immutable)
-            .map_err(|e| anyhow::anyhow!("diff_graph query: {:?}", e))?;
-
-        let changes: Vec<serde_json::Value> = result
-            .rows
-            .iter()
-            .map(|r| {
-                let ctx = dv_str(&r[2]);
-                let ok = dv_str(&r[4]);
-                let ow = dv_str(&r[5]);
-                let mut entry = json!({
-                    "kind": dv_str(&r[0]),
-                    "action": dv_str(&r[1]),
-                    "name": dv_str(&r[3]),
-                });
-                if !ctx.is_empty() {
-                    entry["context"] = json!(ctx);
+        let snapshots = self.list_snapshots(workspace_path, "actual")?;
+        if snapshots.len() < 2 {
+            return Ok(json!({
+                "basis": "actual_history",
+                "pending_changes": [],
+                "summary": {
+                    "total_changes": 0,
+                    "additions": 0,
+                    "removals": 0
                 }
-                if !ok.is_empty() {
-                    entry["owner_kind"] = json!(ok);
-                    entry["owner"] = json!(ow);
-                }
-                entry
-            })
-            .collect();
+            }));
+        }
 
-        Ok(json!({ "pending_changes": changes }))
+        let ts_new = snapshots[0];
+        let ts_old = snapshots[1];
+        let diff = self.diff_snapshots(workspace_path, "actual", ts_old, ts_new)?;
+        let mut pending_changes = Vec::new();
+        if let Some(added) = diff.get("added").and_then(Value::as_array) {
+            pending_changes.extend(added.iter().cloned());
+        }
+        if let Some(removed) = diff.get("removed").and_then(Value::as_array) {
+            pending_changes.extend(removed.iter().cloned());
+        }
+        let total_changes = pending_changes.len();
+
+        Ok(json!({
+            "basis": "actual_history",
+            "ts_old": ts_old,
+            "ts_new": ts_new,
+            "pending_changes": pending_changes,
+            "summary": diff.get("summary").cloned().unwrap_or_else(|| json!({
+                "total_changes": total_changes,
+                "additions": 0,
+                "removals": 0
+            })),
+            "added": diff.get("added").cloned().unwrap_or_else(|| json!([])),
+            "removed": diff.get("removed").cloned().unwrap_or_else(|| json!([])),
+        }))
     }
 
-    /// Compute desired-vs-actual drift and persist to the `drift` relation.
-    /// Returns the number of drift entries stored.
+    /// Persist the latest actual-history diff to the drift relation.
     pub fn compute_drift(&self, workspace_path: &str) -> Result<usize> {
         let ws = canonicalize_path(workspace_path);
         let params = params_map(&[("ws", &ws)]);
@@ -3320,42 +3131,33 @@ impl Store {
             format!("compute_drift retract previous drift entries for '{ws}'"),
         )?;
 
-        // 2. Compute diff via intermediate rules, insert into drift
-        let script = "\
-            ctx_d[name] := *context{workspace: $ws, name, state: 'desired' @ 'NOW'} \
-            ctx_a[name] := *context{workspace: $ws, name, state: 'actual' @ 'NOW'} \
-            ent_d[ctx, name] := *entity{workspace: $ws, context: ctx, name, state: 'desired' @ 'NOW'} \
-            ent_a[ctx, name] := *entity{workspace: $ws, context: ctx, name, state: 'actual' @ 'NOW'} \
-            svc_d[ctx, name] := *service{workspace: $ws, context: ctx, name, state: 'desired' @ 'NOW'} \
-            svc_a[ctx, name] := *service{workspace: $ws, context: ctx, name, state: 'actual' @ 'NOW'} \
-            evt_d[ctx, name] := *event{workspace: $ws, context: ctx, name, state: 'desired' @ 'NOW'} \
-            evt_a[ctx, name] := *event{workspace: $ws, context: ctx, name, state: 'actual' @ 'NOW'} \
-            vo_d[ctx, name] := *value_object{workspace: $ws, context: ctx, name, state: 'desired' @ 'NOW'} \
-            vo_a[ctx, name] := *value_object{workspace: $ws, context: ctx, name, state: 'actual' @ 'NOW'} \
-            repo_d[ctx, name] := *repository{workspace: $ws, context: ctx, name, state: 'desired' @ 'NOW'} \
-            repo_a[ctx, name] := *repository{workspace: $ws, context: ctx, name, state: 'actual' @ 'NOW'} \
-            ?[workspace, category, context, name, change_type] := ctx_d[name], not ctx_a[name], workspace = $ws, category = 'context', context = '', change_type = 'add' \
-            ?[workspace, category, context, name, change_type] := ctx_a[name], not ctx_d[name], workspace = $ws, category = 'context', context = '', change_type = 'remove' \
-            ?[workspace, category, context, name, change_type] := ent_d[context, name], not ent_a[context, name], workspace = $ws, category = 'entity', change_type = 'add' \
-            ?[workspace, category, context, name, change_type] := ent_a[context, name], not ent_d[context, name], workspace = $ws, category = 'entity', change_type = 'remove' \
-            ?[workspace, category, context, name, change_type] := svc_d[context, name], not svc_a[context, name], workspace = $ws, category = 'service', change_type = 'add' \
-            ?[workspace, category, context, name, change_type] := svc_a[context, name], not svc_d[context, name], workspace = $ws, category = 'service', change_type = 'remove' \
-            ?[workspace, category, context, name, change_type] := evt_d[context, name], not evt_a[context, name], workspace = $ws, category = 'event', change_type = 'add' \
-            ?[workspace, category, context, name, change_type] := evt_a[context, name], not evt_d[context, name], workspace = $ws, category = 'event', change_type = 'remove' \
-            ?[workspace, category, context, name, change_type] := vo_d[context, name], not vo_a[context, name], workspace = $ws, category = 'value_object', change_type = 'add' \
-            ?[workspace, category, context, name, change_type] := vo_a[context, name], not vo_d[context, name], workspace = $ws, category = 'value_object', change_type = 'remove' \
-            ?[workspace, category, context, name, change_type] := repo_d[context, name], not repo_a[context, name], workspace = $ws, category = 'repository', change_type = 'add' \
-            ?[workspace, category, context, name, change_type] := repo_a[context, name], not repo_d[context, name], workspace = $ws, category = 'repository', change_type = 'remove' \
-            mod_d[ctx, name] := *module{workspace: $ws, context: ctx, name, state: 'desired' @ 'NOW'} \
-            mod_a[ctx, name] := *module{workspace: $ws, context: ctx, name, state: 'actual' @ 'NOW'} \
-            ?[workspace, category, context, name, change_type] := mod_d[context, name], not mod_a[context, name], workspace = $ws, category = 'module', change_type = 'add' \
-            ?[workspace, category, context, name, change_type] := mod_a[context, name], not mod_d[context, name], workspace = $ws, category = 'module', change_type = 'remove' \
-            :put drift { workspace, category, context, name, change_type }";
+        // 2. Persist the most recent temporal diff as drift entries.
+        let diff = self.diff_graph(workspace_path)?;
+        let changes = diff
+            .get("pending_changes")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
 
-        let result = self
-            .db
-            .run_script(script, params, ScriptMutability::Mutable)
-            .map_err(|e| anyhow::anyhow!("compute_drift: {:?}", e))?;
+        for change in &changes {
+            let kind = change.get("kind").and_then(Value::as_str).unwrap_or("");
+            let action = change.get("action").and_then(Value::as_str).unwrap_or("");
+            let context = change.get("context").and_then(Value::as_str).unwrap_or("");
+            let name = change.get("name").and_then(Value::as_str).unwrap_or("");
+            let drift_params = params_map(&[
+                ("ws", &ws),
+                ("category", kind),
+                ("ctx", context),
+                ("name", name),
+                ("change", action),
+            ]);
+            self.run_mutation_script(
+                "?[workspace, category, context, name, change_type] <- [[$ws, $category, $ctx, $name, $change]] \
+                 :put drift { workspace, category, context, name, change_type }",
+                drift_params,
+                format!("compute_drift insert {kind}:{name}"),
+            )?;
+        }
 
         let drift_ts_us = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -3371,7 +3173,7 @@ impl Store {
 
         self.invalidate_reasoning_claims_for_dependency(&ws, "drift")?;
 
-        Ok(result.rows.len())
+        Ok(changes.len())
     }
 
     /// Load current drift entries for a workspace.
@@ -3382,7 +3184,6 @@ impl Store {
         let ws = canonicalize_path(workspace_path);
         let params = params_map(&[("ws", &ws)]);
         let result = self
-            .db
             .run_script(
                 "?[category, context, name, change_type] := \
              *drift{workspace: $ws, category, context, name, change_type @ 'NOW'}",
@@ -3402,7 +3203,6 @@ impl Store {
         let ws = canonicalize_path(workspace_path);
         let params = params_map(&[("ws", &ws)]);
         let result = self
-            .db
             .run_script(
                 "?[computed_at_us] := *drift_meta{workspace: $ws, computed_at_us}",
                 params,
@@ -3412,14 +3212,9 @@ impl Store {
         Ok(result.rows.first().map(|row| dv_i64(&row[0])))
     }
 
-    /// Report the current truth-maintenance state for asserted, scanned, and drift facts.
+    /// Report the current truth-maintenance state for implemented graph and drift facts.
     pub fn truth_maintenance_report(&self, workspace_path: &str) -> Result<TruthMaintenanceReport> {
-        let desired = self.load_desired(workspace_path)?;
         let actual = self.load_actual(workspace_path)?;
-        let desired_snapshot = self
-            .list_snapshots(workspace_path, "desired")?
-            .into_iter()
-            .next();
         let actual_snapshot = self
             .list_snapshots(workspace_path, "actual")?
             .into_iter()
@@ -3427,23 +3222,12 @@ impl Store {
         let drift_computed_at_us = self.load_drift_recomputed_at(workspace_path)?;
         let drift_entries = self.load_drift(workspace_path)?;
 
-        let asserted = summarize_fact_snapshot(
-            "asserted",
-            "desired",
-            desired_snapshot,
-            desired.as_ref(),
-        );
-        let scanned = summarize_fact_snapshot(
-            "scanned",
-            "actual",
-            actual_snapshot,
-            actual.as_ref(),
-        );
+        let asserted =
+            summarize_fact_snapshot("implemented", "actual", actual_snapshot, actual.as_ref());
+        let scanned =
+            summarize_fact_snapshot("scanned", "actual", actual_snapshot, actual.as_ref());
 
-        let basis_timestamp_us = match (desired_snapshot, actual_snapshot) {
-            (Some(desired_ts), Some(actual_ts)) => Some(desired_ts.max(actual_ts)),
-            _ => None,
-        };
+        let basis_timestamp_us = actual_snapshot;
 
         let drift_status = match (basis_timestamp_us, drift_computed_at_us) {
             (Some(basis_ts), Some(computed_at_us)) if computed_at_us >= basis_ts => "fresh",
@@ -3454,7 +3238,7 @@ impl Store {
         let mut assumptions = Vec::new();
         if !asserted.available {
             assumptions.push(
-                "No asserted planned model is stored; proofs about intended architecture are incomplete."
+                "No implemented architecture graph is stored; run a scan before requesting proofs."
                     .to_string(),
             );
         }
@@ -3575,9 +3359,14 @@ impl Store {
         Ok(())
     }
 
-    fn write_reasoning_claims(&self, workspace: &str, claims: &[PersistedReasoningClaim]) -> Result<()> {
+    fn write_reasoning_claims(
+        &self,
+        workspace: &str,
+        claims: &[PersistedReasoningClaim],
+    ) -> Result<()> {
         for claim in claims {
-            let payload_json = serde_json::to_string(&claim.payload).unwrap_or_else(|_| "{}".into());
+            let payload_json =
+                serde_json::to_string(&claim.payload).unwrap_or_else(|_| "{}".into());
             let mut claim_params = params_map(&[
                 ("ws", workspace),
                 ("claim_id", &claim.claim_id),
@@ -3600,8 +3389,8 @@ impl Store {
             )?;
 
             for (idx, derivation) in claim.derivations.iter().enumerate() {
-                let derived_from_json = serde_json::to_string(&derivation.derived_from)
-                    .unwrap_or_else(|_| "[]".into());
+                let derived_from_json =
+                    serde_json::to_string(&derivation.derived_from).unwrap_or_else(|_| "[]".into());
                 let mut params = params_map(&[
                     ("ws", workspace),
                     ("claim_id", &claim.claim_id),
@@ -3735,7 +3524,6 @@ impl Store {
     ) -> Result<Vec<PersistedReasoningClaim>> {
         let ws = canonicalize_path(workspace_path);
         let result = self
-            .db
             .run_script(
                 "?[claim_id] := *reasoning_claim{workspace: $ws, claim_id} :sort claim_id",
                 params_map(&[("ws", &ws)]),
@@ -3759,7 +3547,6 @@ impl Store {
     ) -> Result<Option<PersistedReasoningClaim>> {
         let ws = canonicalize_path(workspace_path);
         let header = self
-            .db
             .run_script(
                 "?[claim_kind, subject, status, summary, payload_json, provenance_source, provenance_state, stale, computed_at_us] := \
                  *reasoning_claim{workspace: $ws, claim_id: $claim_id, claim_kind, subject, status, summary, payload_json, provenance_source, provenance_state, stale, computed_at_us}",
@@ -3773,7 +3560,6 @@ impl Store {
         };
 
         let derivations = self
-            .db
             .run_script(
                 "?[idx, rule, derived_from_json, witness_count] := *reasoning_derivation{workspace: $ws, claim_id: $claim_id, idx, rule, derived_from_json, witness_count} :sort idx",
                 params_map(&[("ws", &ws), ("claim_id", claim_id)]),
@@ -3791,7 +3577,6 @@ impl Store {
             .collect();
 
         let assumptions = self
-            .db
             .run_script(
                 "?[idx, assumption_kind, text] := *reasoning_assumption{workspace: $ws, claim_id: $claim_id, idx, assumption_kind, text} :sort idx",
                 params_map(&[("ws", &ws), ("claim_id", claim_id)]),
@@ -3807,7 +3592,6 @@ impl Store {
             .collect();
 
         let supports = self
-            .db
             .run_script(
                 "?[idx, support_kind, summary, detail_json] := *reasoning_support{workspace: $ws, claim_id: $claim_id, idx, support_kind, summary, detail_json} :sort idx",
                 params_map(&[("ws", &ws), ("claim_id", claim_id)]),
@@ -3825,7 +3609,6 @@ impl Store {
             .collect();
 
         let dependencies = self
-            .db
             .run_script(
                 "?[idx, dependency_kind, dependency_state, basis_timestamp_us] := *reasoning_dependency{workspace: $ws, claim_id: $claim_id, idx, dependency_kind, dependency_state, basis_timestamp_us} :sort idx",
                 params_map(&[("ws", &ws), ("claim_id", claim_id)]),
@@ -3842,7 +3625,6 @@ impl Store {
             .collect();
 
         let justifications = self
-            .db
             .run_script(
                 "?[idx, fact_kind, fact_key, fact_state, basis_timestamp_us] := *reasoning_justification{workspace: $ws, claim_id: $claim_id, idx, fact_kind, fact_key, fact_state, basis_timestamp_us} :sort idx",
                 params_map(&[("ws", &ws), ("claim_id", claim_id)]),
@@ -3865,8 +3647,7 @@ impl Store {
             subject: dv_str(&row[1]),
             status: dv_str(&row[2]),
             summary: dv_str(&row[3]),
-            payload: serde_json::from_str::<Value>(&dv_str(&row[4]))
-                .unwrap_or_else(|_| json!({})),
+            payload: serde_json::from_str::<Value>(&dv_str(&row[4])).unwrap_or_else(|_| json!({})),
             provenance: ReasoningProvenance {
                 source: dv_str(&row[5]),
                 state: dv_str(&row[6]),
@@ -3881,10 +3662,12 @@ impl Store {
         }))
     }
 
-    pub fn load_stale_reasoning_claims(&self, workspace_path: &str) -> Result<Vec<PersistedReasoningClaim>> {
+    pub fn load_stale_reasoning_claims(
+        &self,
+        workspace_path: &str,
+    ) -> Result<Vec<PersistedReasoningClaim>> {
         let ws = canonicalize_path(workspace_path);
         let result = self
-            .db
             .run_script(
                 "?[claim_id] := *reasoning_claim{workspace: $ws, claim_id, claim_kind, subject, status, summary, payload_json, provenance_source, provenance_state, stale: true, computed_at_us} :sort claim_id",
                 params_map(&[("ws", &ws)]),
@@ -3908,7 +3691,6 @@ impl Store {
     ) -> Result<Vec<PersistedReasoningClaim>> {
         let ws = canonicalize_path(workspace_path);
         let result = self
-            .db
             .run_script(
                 "?[claim_id] := \
                  *reasoning_dependency{workspace: $ws, claim_id, idx, dependency_kind, dependency_state: $dependency_state, basis_timestamp_us}, \
@@ -3946,7 +3728,6 @@ impl Store {
     ) -> Result<usize> {
         let ws = canonicalize_path(workspace_path);
         let result = self
-            .db
             .run_script(
                 "?[claim_id] := *reasoning_dependency{workspace: $ws, claim_id, idx, dependency_kind, dependency_state: $dependency_state, basis_timestamp_us} :sort claim_id",
                 params_map(&[("ws", &ws), ("dependency_state", dependency_state)]),
@@ -3990,7 +3771,6 @@ impl Store {
 
         for fact in facts {
             let result = self
-                .db
                 .run_script(
                     "?[claim_id, fact_key] := *reasoning_justification{workspace: $ws, claim_id, idx, fact_kind: $fact_kind, fact_key, fact_state: $fact_state, basis_timestamp_us}",
                     params_map(&[
@@ -4033,7 +3813,6 @@ impl Store {
         let ws = canonicalize_path(workspace_path);
         let params = params_map(&[("ws", &ws), ("st", state)]);
         let result = self
-            .db
             .run_script(
                 "?[ts] := *snapshot_log{workspace: $ws, state: $st, timestamp_us: ts} \
              :sort -ts",
@@ -4073,21 +3852,36 @@ impl Store {
             vo_old[ctx, name] := *value_object{workspace: $ws, context: ctx, name, state: $st @ $ts_old} \
             repo_new[ctx, name] := *repository{workspace: $ws, context: ctx, name, state: $st @ $ts_new} \
             repo_old[ctx, name] := *repository{workspace: $ws, context: ctx, name, state: $st @ $ts_old} \
-            ?[kind, action, ctx, name] := ctx_new[name], not ctx_old[name], kind = 'context', action = 'add', ctx = '' \
-            ?[kind, action, ctx, name] := ctx_old[name], not ctx_new[name], kind = 'context', action = 'remove', ctx = '' \
-            ?[kind, action, ctx, name] := ent_new[ctx, name], not ent_old[ctx, name], kind = 'entity', action = 'add' \
-            ?[kind, action, ctx, name] := ent_old[ctx, name], not ent_new[ctx, name], kind = 'entity', action = 'remove' \
-            ?[kind, action, ctx, name] := svc_new[ctx, name], not svc_old[ctx, name], kind = 'service', action = 'add' \
-            ?[kind, action, ctx, name] := svc_old[ctx, name], not svc_new[ctx, name], kind = 'service', action = 'remove' \
-            ?[kind, action, ctx, name] := evt_new[ctx, name], not evt_old[ctx, name], kind = 'event', action = 'add' \
-            ?[kind, action, ctx, name] := evt_old[ctx, name], not evt_new[ctx, name], kind = 'event', action = 'remove' \
-            ?[kind, action, ctx, name] := vo_new[ctx, name], not vo_old[ctx, name], kind = 'value_object', action = 'add' \
-            ?[kind, action, ctx, name] := vo_old[ctx, name], not vo_new[ctx, name], kind = 'value_object', action = 'remove' \
-            ?[kind, action, ctx, name] := repo_new[ctx, name], not repo_old[ctx, name], kind = 'repository', action = 'add' \
-            ?[kind, action, ctx, name] := repo_old[ctx, name], not repo_new[ctx, name], kind = 'repository', action = 'remove'";
+            mod_new[ctx, name] := *module{workspace: $ws, context: ctx, name, state: $st @ $ts_new} \
+            mod_old[ctx, name] := *module{workspace: $ws, context: ctx, name, state: $st @ $ts_old} \
+            fld_new[ctx, ok, ow, name] := *field{workspace: $ws, context: ctx, owner_kind: ok, owner: ow, name, state: $st @ $ts_new} \
+            fld_old[ctx, ok, ow, name] := *field{workspace: $ws, context: ctx, owner_kind: ok, owner: ow, name, state: $st @ $ts_old} \
+            mth_new[ctx, ok, ow, name] := *method{workspace: $ws, context: ctx, owner_kind: ok, owner: ow, name, state: $st @ $ts_new} \
+            mth_old[ctx, ok, ow, name] := *method{workspace: $ws, context: ctx, owner_kind: ok, owner: ow, name, state: $st @ $ts_old} \
+            inv_new[ctx, ow, text] := *invariant{workspace: $ws, context: ctx, entity: ow, text, state: $st @ $ts_new} \
+            inv_old[ctx, ow, text] := *invariant{workspace: $ws, context: ctx, entity: ow, text, state: $st @ $ts_old} \
+            ?[kind, action, ctx, name, owner_kind, owner] := ctx_new[name], not ctx_old[name], kind = 'context', action = 'add', ctx = '', owner_kind = '', owner = '' \
+            ?[kind, action, ctx, name, owner_kind, owner] := ctx_old[name], not ctx_new[name], kind = 'context', action = 'remove', ctx = '', owner_kind = '', owner = '' \
+            ?[kind, action, ctx, name, owner_kind, owner] := ent_new[ctx, name], not ent_old[ctx, name], kind = 'entity', action = 'add', owner_kind = '', owner = '' \
+            ?[kind, action, ctx, name, owner_kind, owner] := ent_old[ctx, name], not ent_new[ctx, name], kind = 'entity', action = 'remove', owner_kind = '', owner = '' \
+            ?[kind, action, ctx, name, owner_kind, owner] := svc_new[ctx, name], not svc_old[ctx, name], kind = 'service', action = 'add', owner_kind = '', owner = '' \
+            ?[kind, action, ctx, name, owner_kind, owner] := svc_old[ctx, name], not svc_new[ctx, name], kind = 'service', action = 'remove', owner_kind = '', owner = '' \
+            ?[kind, action, ctx, name, owner_kind, owner] := evt_new[ctx, name], not evt_old[ctx, name], kind = 'event', action = 'add', owner_kind = '', owner = '' \
+            ?[kind, action, ctx, name, owner_kind, owner] := evt_old[ctx, name], not evt_new[ctx, name], kind = 'event', action = 'remove', owner_kind = '', owner = '' \
+            ?[kind, action, ctx, name, owner_kind, owner] := vo_new[ctx, name], not vo_old[ctx, name], kind = 'value_object', action = 'add', owner_kind = '', owner = '' \
+            ?[kind, action, ctx, name, owner_kind, owner] := vo_old[ctx, name], not vo_new[ctx, name], kind = 'value_object', action = 'remove', owner_kind = '', owner = '' \
+            ?[kind, action, ctx, name, owner_kind, owner] := repo_new[ctx, name], not repo_old[ctx, name], kind = 'repository', action = 'add', owner_kind = '', owner = '' \
+            ?[kind, action, ctx, name, owner_kind, owner] := repo_old[ctx, name], not repo_new[ctx, name], kind = 'repository', action = 'remove', owner_kind = '', owner = '' \
+            ?[kind, action, ctx, name, owner_kind, owner] := mod_new[ctx, name], not mod_old[ctx, name], kind = 'module', action = 'add', owner_kind = '', owner = '' \
+            ?[kind, action, ctx, name, owner_kind, owner] := mod_old[ctx, name], not mod_new[ctx, name], kind = 'module', action = 'remove', owner_kind = '', owner = '' \
+            ?[kind, action, ctx, name, owner_kind, owner] := fld_new[ctx, owner_kind, owner, name], not fld_old[ctx, owner_kind, owner, name], kind = 'field', action = 'add' \
+            ?[kind, action, ctx, name, owner_kind, owner] := fld_old[ctx, owner_kind, owner, name], not fld_new[ctx, owner_kind, owner, name], kind = 'field', action = 'remove' \
+            ?[kind, action, ctx, name, owner_kind, owner] := mth_new[ctx, owner_kind, owner, name], not mth_old[ctx, owner_kind, owner, name], kind = 'method', action = 'add' \
+            ?[kind, action, ctx, name, owner_kind, owner] := mth_old[ctx, owner_kind, owner, name], not mth_new[ctx, owner_kind, owner, name], kind = 'method', action = 'remove' \
+            ?[kind, action, ctx, name, owner_kind, owner] := inv_new[ctx, owner, name], not inv_old[ctx, owner, name], kind = 'invariant', action = 'add', owner_kind = 'entity' \
+            ?[kind, action, ctx, name, owner_kind, owner] := inv_old[ctx, owner, name], not inv_new[ctx, owner, name], kind = 'invariant', action = 'remove', owner_kind = 'entity'";
 
         let result = self
-            .db
             .run_script(script, params, ScriptMutability::Immutable)
             .map_err(|e| anyhow::anyhow!("diff_snapshots: {:?}", e))?;
 
@@ -4103,6 +3897,11 @@ impl Store {
                 let ctx = dv_str(&r[2]);
                 if !ctx.is_empty() {
                     entry["context"] = json!(ctx);
+                }
+                let owner_kind = dv_str(&r[4]);
+                if !owner_kind.is_empty() {
+                    entry["owner_kind"] = json!(owner_kind);
+                    entry["owner"] = json!(dv_str(&r[5]));
                 }
                 entry
             })
@@ -4146,7 +3945,7 @@ impl Store {
 
         // 1. Clear previous live_import rows
         let clear_params = params_map(&[("ws", &ws)]);
-        let _ = self.db.run_script(
+        let _ = self.run_script(
             "?[workspace, from_file, to_module] := *live_import{workspace: $ws, from_file, to_module} :rm live_import { workspace, from_file, to_module }",
             clear_params,
             ScriptMutability::Mutable,
@@ -4163,20 +3962,18 @@ impl Store {
                 ]));
             }
             let params = BTreeMap::from([("rows".to_string(), cozo::DataValue::List(values))]);
-            self.db
-                .run_script(
-                    "?[workspace, from_file, to_module] <- $rows \
+            self.run_script(
+                "?[workspace, from_file, to_module] <- $rows \
                      :put live_import { workspace, from_file, to_module }",
-                    params,
-                    ScriptMutability::Mutable,
-                )
-                .map_err(|e| anyhow::anyhow!("insert live_imports: {:?}", e))?;
+                params,
+                ScriptMutability::Mutable,
+            )
+            .map_err(|e| anyhow::anyhow!("insert live_imports: {:?}", e))?;
         }
 
         // 3. Cross-reference against modeled contexts (desired state)
         let query_params = params_map(&[("ws", &ws)]);
         let result = self
-            .db
             .run_script(
                 "modeled[m] := *context{workspace: $ws, module_path: m, state: 'desired' @ 'NOW'}, m != '' \
                  ?[from_file, to_module] := *live_import{workspace: $ws, from_file, to_module}, \
@@ -4202,7 +3999,6 @@ impl Store {
     pub fn run_datalog(&self, script: &str, workspace: &str) -> Result<Vec<Vec<String>>> {
         let params = params_map(&[("ws", workspace)]);
         let result = self
-            .db
             .run_script(script, params, ScriptMutability::Immutable)
             .map_err(|e| anyhow::anyhow!("Datalog query failed: {:?}", e))?;
         Ok(result
@@ -4220,7 +4016,6 @@ impl Store {
     ) -> Result<(Vec<String>, Vec<Vec<String>>)> {
         let params = params_map(&[("ws", workspace)]);
         let result = self
-            .db
             .run_script(script, params, ScriptMutability::Immutable)
             .map_err(|e| anyhow::anyhow!("Datalog query failed: {:?}", e))?;
         let headers = result.headers.iter().map(|h| h.to_string()).collect();
@@ -4237,7 +4032,6 @@ impl Store {
     pub fn transitive_deps(&self, workspace: &str, context: &str) -> Result<Vec<String>> {
         let params = params_map(&[("ws", workspace), ("ctx", context)]);
         let result = self
-            .db
             .run_script(
                 "transitive[a, c] := *context_dep{workspace: $ws, from_ctx: a, to_ctx: c, state: 'desired' @ 'NOW'} \
                  transitive[a, c] := transitive[a, b], *context_dep{workspace: $ws, from_ctx: b, to_ctx: c, state: 'desired' @ 'NOW'} \
@@ -4252,7 +4046,6 @@ impl Store {
     pub fn circular_deps(&self, workspace: &str) -> Result<Vec<(String, String)>> {
         let params = params_map(&[("ws", workspace)]);
         let result = self
-            .db
             .run_script(
                 "transitive[a, c] := *context_dep{workspace: $ws, from_ctx: a, to_ctx: c, state: 'desired' @ 'NOW'} \
                  transitive[a, c] := transitive[a, b], *context_dep{workspace: $ws, from_ctx: b, to_ctx: c, state: 'desired' @ 'NOW'} \
@@ -4271,7 +4064,6 @@ impl Store {
     pub fn layer_violations(&self, workspace: &str) -> Result<Vec<(String, String, String)>> {
         let params = params_map(&[("ws", workspace)]);
         let result = self
-            .db
             .run_script(
                 "?[context, service, dep] := \
                     *service{workspace: $ws, context, name: service, kind: 'domain', state: 'desired' @ 'NOW'}, \
@@ -4299,14 +4091,13 @@ impl Store {
     ) -> Result<()> {
         let ws = canonicalize_path(workspace);
         let params = params_map(&[("ws", &ws), ("ctx", context), ("layer", layer)]);
-        self.db
-            .run_script(
-                "?[workspace, context, layer] <- [[$ws, $ctx, $layer]] \
+        self.run_script(
+            "?[workspace, context, layer] <- [[$ws, $ctx, $layer]] \
                  :put layer_assignment { workspace, context => layer }",
-                params,
-                ScriptMutability::Mutable,
-            )
-            .map_err(|e| anyhow::anyhow!("upsert_layer_assignment: {:?}", e))?;
+            params,
+            ScriptMutability::Mutable,
+        )
+        .map_err(|e| anyhow::anyhow!("upsert_layer_assignment: {:?}", e))?;
         Ok(())
     }
 
@@ -4315,7 +4106,6 @@ impl Store {
         let ws = canonicalize_path(workspace);
         let params = params_map(&[("ws", &ws), ("ctx", context)]);
         let existing = self
-            .db
             .run_script(
                 "?[workspace, context] := *layer_assignment{workspace: $ws, context: $ctx} :rm layer_assignment { workspace, context }",
                 params,
@@ -4344,7 +4134,7 @@ impl Store {
             ("tgt", target),
             ("rule", rule),
         ]);
-        self.db
+        self
             .run_script(
                 "?[workspace, constraint_kind, source, target, rule] <- [[$ws, $kind, $src, $tgt, $rule]] \
                  :put dependency_constraint { workspace, constraint_kind, source, target => rule }",
@@ -4371,7 +4161,6 @@ impl Store {
             ("tgt", target),
         ]);
         let existing = self
-            .db
             .run_script(
                 "?[workspace, constraint_kind, source, target] := \
                     *dependency_constraint{workspace: $ws, constraint_kind: $kind, source: $src, target: $tgt} \
@@ -4388,7 +4177,6 @@ impl Store {
         let ws = canonicalize_path(workspace);
         let params = params_map(&[("ws", &ws)]);
         let result = self
-            .db
             .run_script(
                 "?[context, layer] := *layer_assignment{workspace: $ws, context, layer}",
                 params,
@@ -4410,7 +4198,6 @@ impl Store {
         let ws = canonicalize_path(workspace);
         let params = params_map(&[("ws", &ws)]);
         let result = self
-            .db
             .run_script(
                 "?[constraint_kind, source, target, rule] := \
                     *dependency_constraint{workspace: $ws, constraint_kind, source, target, rule}",
@@ -4434,7 +4221,6 @@ impl Store {
         // Layer-based violations: context A (layer X) depends on context B (layer Y)
         // where X→Y is forbidden
         let layer_violations = self
-            .db
             .run_script(
                 "?[from_ctx, to_ctx, from_layer, to_layer] := \
                     *context_dep{workspace: $ws, from_ctx, to_ctx, state: 'desired' @ 'NOW'}, \
@@ -4449,7 +4235,6 @@ impl Store {
 
         // Context-level violations: context A depends on context B where A→B is forbidden
         let context_violations = self
-            .db
             .run_script(
                 "?[from_ctx, to_ctx] := \
                     *context_dep{workspace: $ws, from_ctx, to_ctx, state: 'desired' @ 'NOW'}, \
@@ -4507,7 +4292,6 @@ impl Store {
         let params = params_map(&[("ws", workspace), ("ctx", context), ("ent", entity_name)]);
 
         let events = self
-            .db
             .run_script(
                 "?[context, event_name] := \
                     *event{workspace: $ws, context, name: event_name, source: $ent, state: 'desired' @ 'NOW'}",
@@ -4517,7 +4301,6 @@ impl Store {
             .map_err(|e| anyhow::anyhow!("impact events: {:?}", e))?;
 
         let services = self
-            .db
             .run_script(
                 "?[context, service_name] := \
                     *repository{workspace: $ws, context: $ctx, aggregate: $ent, name: repo_name, state: 'desired' @ 'NOW'}, \
@@ -4529,7 +4312,6 @@ impl Store {
 
         let reverse_params = params_map(&[("ws", workspace), ("ctx", context)]);
         let dependents = self
-            .db
             .run_script(
                 "transitive[a, c] := *context_dep{workspace: $ws, from_ctx: a, to_ctx: c, state: 'desired' @ 'NOW'} \
                  transitive[a, c] := transitive[a, b], *context_dep{workspace: $ws, from_ctx: b, to_ctx: c, state: 'desired' @ 'NOW'} \
@@ -4540,7 +4322,6 @@ impl Store {
             .map_err(|e| anyhow::anyhow!("impact dependents: {:?}", e))?;
 
         let ast_impact = self
-            .db
             .run_script(
                 "ast[target, type] := *ast_edge{workspace: $ws, state: 'actual', from_node: $ent, to_node: target, edge_type: type @ 'NOW'} \
                  ast[target, type] := ast[mid, _], *ast_edge{workspace: $ws, state: 'actual', from_node: mid, to_node: target, edge_type: type @ 'NOW'} \
@@ -4552,7 +4333,6 @@ impl Store {
 
         // Symbol-level: find files that import modules containing this entity name
         let importing_files = self
-            .db
             .run_script(
                 "?[from_file, to_module, context] := *import_edge{workspace: $ws, from_file, to_module, state: 'actual', context @ 'NOW'}, \
                  is_in(to_module, $ent)",
@@ -4589,7 +4369,6 @@ impl Store {
     ) -> Result<Vec<(String, String)>> {
         let params = params_map(&[("ws", workspace)]);
         let result = self
-            .db
             .run_script(
                 "has_inv[ctx, ent] := *invariant{workspace: $ws, context: ctx, entity: ent, state: 'desired' @ 'NOW'} \
                  ?[context, entity] := \
@@ -4618,7 +4397,6 @@ impl Store {
             ("to_ctx", to_context),
         ]);
         let result = self
-            .db
             .run_script(
                 "reachable[a, b] := *context_dep{workspace: $ws, from_ctx: a, to_ctx: b, state: 'desired' @ 'NOW'} \
                  reachable[a, c] := reachable[a, b], *context_dep{workspace: $ws, from_ctx: b, to_ctx: c, state: 'desired' @ 'NOW'} \
@@ -4646,20 +4424,20 @@ impl Store {
     ) -> Result<serde_json::Value> {
         let params = params_map(&[("ws", workspace), ("ctx", context), ("ent", entity_name)]);
 
-        let aggreg = self.db.run_script(
+        let aggreg = self.run_script(
             "?[agg] := *aggregate_member{workspace: $ws, context: $ctx, member: $ent, state: 'desired', aggregate: agg @ 'NOW'}",
             params.clone(),
             ScriptMutability::Immutable,
         ).map_err(|e| anyhow::anyhow!("check aggregate: {:?}", e))?;
 
-        let events = self.db.run_script(
-            "?[evt] := *event{workspace: $ws, context: $ctx, source: $ent, state: 'desired', name: evt @ 'NOW'}",
+        let events = self.run_script(
+            "?[evt, file_path, start_line, end_line] := *event{workspace: $ws, context: $ctx, source: $ent, state: 'desired', name: evt, file_path, start_line, end_line @ 'NOW'}",
             params.clone(),
             ScriptMutability::Immutable,
         ).map_err(|e| anyhow::anyhow!("check events: {:?}", e))?;
 
-        let repos = self.db.run_script(
-            "?[repo] := *repository{workspace: $ws, context: $ctx, aggregate: $ent, state: 'desired', name: repo @ 'NOW'}",
+        let repos = self.run_script(
+            "?[repo, file_path, start_line, end_line] := *repository{workspace: $ws, context: $ctx, aggregate: $ent, state: 'desired', name: repo, file_path, start_line, end_line @ 'NOW'}",
             params.clone(),
             ScriptMutability::Immutable,
         ).map_err(|e| anyhow::anyhow!("check repo: {:?}", e))?;
@@ -4667,26 +4445,26 @@ impl Store {
         let has_deps = !aggreg.rows.is_empty() || !events.rows.is_empty() || !repos.rows.is_empty();
 
         // Symbol-level: check if any import edges reference this symbol
-        let import_refs = self.db.run_script(
+        let import_refs = self.run_script(
             "?[from_file, to_module] := *import_edge{workspace: $ws, from_file, to_module, state: 'actual' @ 'NOW'}, \
              is_in(to_module, $ent)",
             params.clone(),
             ScriptMutability::Immutable,
-        ).map(|r| r.rows).unwrap_or_default();
+        ).map_err(|e| anyhow::anyhow!("check import references: {:?}", e))?.rows;
 
         // AST edges: check if any node references this symbol
-        let ast_refs = self.db.run_script(
+        let ast_refs = self.run_script(
             "?[from_node, edge_type] := *ast_edge{workspace: $ws, state: 'actual', from_node, to_node: $ent, edge_type @ 'NOW'}",
             params.clone(),
             ScriptMutability::Immutable,
-        ).map(|r| r.rows).unwrap_or_default();
+        ).map_err(|e| anyhow::anyhow!("check ast references: {:?}", e))?.rows;
 
         // Call graph: check if any caller targets this symbol
-        let call_refs = self.db.run_script(
+        let call_refs = self.run_script(
             "?[caller, file_path, line] := *calls_symbol{workspace: $ws, caller, callee: $ent, state: 'actual', file_path, line @ 'NOW'}",
             params.clone(),
             ScriptMutability::Immutable,
-        ).map(|r| r.rows).unwrap_or_default();
+        ).map_err(|e| anyhow::anyhow!("check call references: {:?}", e))?.rows;
 
         let has_symbol_refs =
             !import_refs.is_empty() || !ast_refs.is_empty() || !call_refs.is_empty();
@@ -4696,6 +4474,18 @@ impl Store {
             "aggregates_referencing": aggreg.rows.iter().map(|r| dv_str(&r[0])).collect::<Vec<_>>(),
             "events_sourced": events.rows.iter().map(|r| dv_str(&r[0])).collect::<Vec<_>>(),
             "repositories_managing": repos.rows.iter().map(|r| dv_str(&r[0])).collect::<Vec<_>>(),
+            "event_references": events.rows.iter().map(|r| json!({
+                "event": dv_str(&r[0]),
+                "file": dv_str(&r[1]),
+                "start_line": dv_i64(&r[2]),
+                "end_line": dv_i64(&r[3]),
+            })).collect::<Vec<_>>(),
+            "repository_references": repos.rows.iter().map(|r| json!({
+                "repository": dv_str(&r[0]),
+                "file": dv_str(&r[1]),
+                "start_line": dv_i64(&r[2]),
+                "end_line": dv_i64(&r[3]),
+            })).collect::<Vec<_>>(),
             "import_references": import_refs.iter().map(|r| json!({"file": dv_str(&r[0]), "import": dv_str(&r[1])})).collect::<Vec<_>>(),
             "ast_references": ast_refs.iter().map(|r| json!({"from": dv_str(&r[0]), "edge_type": dv_str(&r[1])})).collect::<Vec<_>>(),
             "call_references": call_refs.iter().map(|r| json!({"caller": dv_str(&r[0]), "file": dv_str(&r[1]), "line": dv_i64(&r[2])})).collect::<Vec<_>>(),
@@ -4708,7 +4498,7 @@ impl Store {
     pub fn call_graph_callers(&self, workspace: &str, symbol: &str) -> Result<serde_json::Value> {
         let ws = canonicalize_path(workspace);
         let params = params_map(&[("ws", &ws), ("sym", symbol)]);
-        let rows = self.db.run_script(
+        let rows = self.run_script(
             "?[caller, file_path, line, context] := *calls_symbol{workspace: $ws, caller, callee: $sym, state: 'actual', file_path, line, context @ 'NOW'}",
             params,
             ScriptMutability::Immutable,
@@ -4729,7 +4519,7 @@ impl Store {
     pub fn call_graph_callees(&self, workspace: &str, symbol: &str) -> Result<serde_json::Value> {
         let ws = canonicalize_path(workspace);
         let params = params_map(&[("ws", &ws), ("sym", symbol)]);
-        let rows = self.db.run_script(
+        let rows = self.run_script(
             "?[callee, file_path, line, context] := *calls_symbol{workspace: $ws, caller: $sym, callee, state: 'actual', file_path, line, context @ 'NOW'}",
             params,
             ScriptMutability::Immutable,
@@ -4754,7 +4544,7 @@ impl Store {
     ) -> Result<serde_json::Value> {
         let ws = canonicalize_path(workspace);
         let params = params_map(&[("ws", &ws), ("sym", symbol)]);
-        let rows = self.db.run_script(
+        let rows = self.run_script(
             "reachable[callee] := *calls_symbol{workspace: $ws, caller: $sym, callee, state: 'actual' @ 'NOW'} \
              reachable[c] := reachable[b], *calls_symbol{workspace: $ws, caller: b, callee: c, state: 'actual' @ 'NOW'} \
              ?[callee] := reachable[callee]",
@@ -4773,26 +4563,26 @@ impl Store {
         let ws = canonicalize_path(workspace);
         let params = params_map(&[("ws", &ws)]);
 
-        let total = self.db.run_script(
+        let total = self.run_script(
             "?[count(caller)] := *calls_symbol{workspace: $ws, caller, state: 'actual' @ 'NOW'}",
             params.clone(),
             ScriptMutability::Immutable,
         ).map_err(|e| anyhow::anyhow!("call_graph_stats total: {:?}", e))?;
 
-        let unique_callers = self.db.run_script(
+        let unique_callers = self.run_script(
             "?[count_unique(caller)] := *calls_symbol{workspace: $ws, caller, state: 'actual' @ 'NOW'}",
             params.clone(),
             ScriptMutability::Immutable,
         ).map_err(|e| anyhow::anyhow!("call_graph_stats callers: {:?}", e))?;
 
-        let unique_callees = self.db.run_script(
+        let unique_callees = self.run_script(
             "?[count_unique(callee)] := *calls_symbol{workspace: $ws, callee, state: 'actual' @ 'NOW'}",
             params.clone(),
             ScriptMutability::Immutable,
         ).map_err(|e| anyhow::anyhow!("call_graph_stats callees: {:?}", e))?;
 
         // Top-10 most-called symbols
-        let hot_callees = self.db.run_script(
+        let hot_callees = self.run_script(
             "?[callee, count(caller)] := *calls_symbol{workspace: $ws, caller, callee, state: 'actual' @ 'NOW'} \
              :order -count(caller) \
              :limit 10",
@@ -4814,7 +4604,6 @@ impl Store {
     pub fn dependency_graph(&self, workspace: &str) -> Result<serde_json::Value> {
         let params = params_map(&[("ws", workspace)]);
         let contexts = self
-            .db
             .run_script(
                 "?[name, module_path] := *context{workspace: $ws, name, module_path, state: 'desired' @ 'NOW'}",
                 params.clone(),
@@ -4822,7 +4611,6 @@ impl Store {
             )
             .map_err(|e| anyhow::anyhow!("dependency_graph contexts: {:?}", e))?;
         let deps = self
-            .db
             .run_script(
                 "?[from_ctx, to_ctx] := *context_dep{workspace: $ws, from_ctx, to_ctx, state: 'desired' @ 'NOW'}",
                 params.clone(),
@@ -4861,7 +4649,7 @@ impl Store {
         let mut results: Vec<serde_json::Value> = Vec::new();
 
         // Search contexts
-        if let Ok(r) = self.db.run_script(
+        if let Ok(r) = self.run_script(
             "?[name, description, score] := ~context:fts{workspace, name, state | query: $q, k: $k, bind_score: score}, \
              workspace = $ws, state = 'desired', *context{workspace, name, state, description @ 'NOW'}",
             params.clone(), ScriptMutability::Immutable,
@@ -4872,7 +4660,7 @@ impl Store {
         }
 
         // Search entities
-        if let Ok(r) = self.db.run_script(
+        if let Ok(r) = self.run_script(
             "?[context, name, description, score] := ~entity:fts{workspace, context, name, state | query: $q, k: $k, bind_score: score}, \
              workspace = $ws, state = 'desired', *entity{workspace, context, name, state, description @ 'NOW'}",
             params.clone(), ScriptMutability::Immutable,
@@ -4883,7 +4671,7 @@ impl Store {
         }
 
         // Search services
-        if let Ok(r) = self.db.run_script(
+        if let Ok(r) = self.run_script(
             "?[context, name, description, score] := ~service:fts{workspace, context, name, state | query: $q, k: $k, bind_score: score}, \
              workspace = $ws, state = 'desired', *service{workspace, context, name, state, description @ 'NOW'}",
             params.clone(), ScriptMutability::Immutable,
@@ -4894,7 +4682,7 @@ impl Store {
         }
 
         // Search events
-        if let Ok(r) = self.db.run_script(
+        if let Ok(r) = self.run_script(
             "?[context, name, description, score] := ~event:fts{workspace, context, name, state | query: $q, k: $k, bind_score: score}, \
              workspace = $ws, state = 'desired', *event{workspace, context, name, state, description @ 'NOW'}",
             params.clone(), ScriptMutability::Immutable,
@@ -4905,7 +4693,7 @@ impl Store {
         }
 
         // Search decision titles
-        if let Ok(r) = self.db.run_script(
+        if let Ok(r) = self.run_script(
             "?[id, title, score] := ~architectural_decision:title_fts{workspace, id, state | query: $q, k: $k, bind_score: score}, \
              workspace = $ws, state = 'desired', *architectural_decision{workspace, id, state, title @ 'NOW'}",
             params.clone(), ScriptMutability::Immutable,
@@ -4916,7 +4704,7 @@ impl Store {
         }
 
         // Search decision rationales
-        if let Ok(r) = self.db.run_script(
+        if let Ok(r) = self.run_script(
             "?[id, title, rationale, score] := ~architectural_decision:rationale_fts{workspace, id, state | query: $q, k: $k, bind_score: score}, \
              workspace = $ws, state = 'desired', *architectural_decision{workspace, id, state, title, rationale @ 'NOW'}",
             params.clone(), ScriptMutability::Immutable,
@@ -4931,13 +4719,101 @@ impl Store {
         }
 
         // Search invariant text
-        if let Ok(r) = self.db.run_script(
+        if let Ok(r) = self.run_script(
             "?[context, entity, text, score] := ~invariant:text_fts{workspace, context, entity, idx, state | query: $q, k: $k, bind_score: score}, \
              workspace = $ws, state = 'desired', *invariant{workspace, context, entity, idx, state, text @ 'NOW'}",
             params.clone(), ScriptMutability::Immutable,
         ) {
             for row in &r.rows {
                 results.push(json!({"kind": "invariant", "context": dv_str(&row[0]), "entity": dv_str(&row[1]), "text": dv_str(&row[2]), "score": dv_str(&row[3])}));
+            }
+        }
+
+        if results.is_empty() && !query.trim().is_empty() {
+            let needle = query.to_lowercase();
+            if let Some(model) = self.load_actual(&ws)? {
+                for context in &model.bounded_contexts {
+                    if text_matches(&context.name, &needle)
+                        || text_matches(&context.description, &needle)
+                    {
+                        results.push(json!({
+                            "kind": "context",
+                            "name": &context.name,
+                            "description": &context.description,
+                            "score": "1.0",
+                            "search_mode": "model_scan",
+                        }));
+                    }
+                    for entity in &context.entities {
+                        if text_matches(&entity.name, &needle)
+                            || text_matches(&entity.description, &needle)
+                        {
+                            results.push(json!({
+                                "kind": "entity",
+                                "context": &context.name,
+                                "name": &entity.name,
+                                "description": &entity.description,
+                                "score": "1.0",
+                                "search_mode": "model_scan",
+                            }));
+                        }
+                        for invariant in &entity.invariants {
+                            if text_matches(invariant, &needle) {
+                                results.push(json!({
+                                    "kind": "invariant",
+                                    "context": &context.name,
+                                    "entity": &entity.name,
+                                    "text": invariant,
+                                    "score": "1.0",
+                                    "search_mode": "model_scan",
+                                }));
+                            }
+                        }
+                    }
+                    for service in &context.services {
+                        if text_matches(&service.name, &needle)
+                            || text_matches(&service.description, &needle)
+                        {
+                            results.push(json!({
+                                "kind": "service",
+                                "context": &context.name,
+                                "name": &service.name,
+                                "description": &service.description,
+                                "score": "1.0",
+                                "search_mode": "model_scan",
+                            }));
+                        }
+                    }
+                    for event in &context.events {
+                        if text_matches(&event.name, &needle)
+                            || text_matches(&event.description, &needle)
+                        {
+                            results.push(json!({
+                                "kind": "event",
+                                "context": &context.name,
+                                "name": &event.name,
+                                "description": &event.description,
+                                "score": "1.0",
+                                "search_mode": "model_scan",
+                            }));
+                        }
+                    }
+                }
+                for decision in &model.architectural_decisions {
+                    if text_matches(&decision.id, &needle)
+                        || text_matches(&decision.title, &needle)
+                        || text_matches(&decision.rationale, &needle)
+                    {
+                        results.push(json!({
+                            "kind": "architectural_decision",
+                            "id": &decision.id,
+                            "title": &decision.title,
+                            "rationale_match": &decision.rationale,
+                            "score": "1.0",
+                            "search_mode": "model_scan",
+                        }));
+                    }
+                }
             }
         }
 
@@ -4965,7 +4841,7 @@ impl Store {
     /// Compute PageRank over the context dependency graph.
     pub fn pagerank(&self, workspace: &str) -> Result<Vec<(String, f64)>> {
         let params = params_map(&[("ws", workspace)]);
-        let result = self.db.run_script(
+        let result = self.run_script(
             "edges[from, to] := *context_dep{workspace: $ws, from_ctx: from, to_ctx: to, state: 'desired' @ 'NOW'} \
              ?[node, rank] <~ PageRank(edges[])",
             params,
@@ -4990,7 +4866,7 @@ impl Store {
     /// Compute community detection (Louvain) over the context dependency graph.
     pub fn community_detection(&self, workspace: &str) -> Result<Vec<(String, u64)>> {
         let params = params_map(&[("ws", workspace)]);
-        let result = self.db.run_script(
+        let result = self.run_script(
             "edges[from, to] := *context_dep{workspace: $ws, from_ctx: from, to_ctx: to, state: 'desired' @ 'NOW'} \
              ?[node, community] <~ CommunityDetectionLouvain(edges[])",
             params,
@@ -5012,7 +4888,7 @@ impl Store {
     /// Compute betweenness centrality over the context dependency graph.
     pub fn betweenness_centrality(&self, workspace: &str) -> Result<Vec<(String, f64)>> {
         let params = params_map(&[("ws", workspace)]);
-        let result = self.db.run_script(
+        let result = self.run_script(
             "edges[from, to] := *context_dep{workspace: $ws, from_ctx: from, to_ctx: to, state: 'desired' @ 'NOW'} \
              ?[node, centrality] <~ BetweennessCentrality(edges[])",
             params,
@@ -5037,7 +4913,7 @@ impl Store {
     /// Compute in-degree and out-degree for each context in the dependency graph.
     pub fn degree_centrality(&self, workspace: &str) -> Result<Vec<(String, u32, u32)>> {
         let params = params_map(&[("ws", workspace)]);
-        let result = self.db.run_script(
+        let result = self.run_script(
             "ctx_now[ctx] := *context{workspace: $ws, name: ctx, state: 'desired' @ 'NOW'} \
              dep_from[ctx] := *context_dep{workspace: $ws, from_ctx: ctx, state: 'desired' @ 'NOW'} \
              dep_to[ctx] := *context_dep{workspace: $ws, to_ctx: ctx, state: 'desired' @ 'NOW'} \
@@ -5059,7 +4935,7 @@ impl Store {
     /// Compute topological ordering of context dependencies (if acyclic).
     pub fn topological_order(&self, workspace: &str) -> Result<serde_json::Value> {
         let params = params_map(&[("ws", workspace)]);
-        let result = self.db.run_script(
+        let result = self.run_script(
             "edges[from, to] := *context_dep{workspace: $ws, from_ctx: from, to_ctx: to, state: 'desired' @ 'NOW'} \
              nodes[name] := *context{workspace: $ws, name, state: 'desired' @ 'NOW'} \
              ?[node, order] <~ TopologicalSort(nodes[], edges[])",
@@ -5094,29 +4970,37 @@ impl Store {
 
     pub fn model_health(&self, workspace: &str) -> Result<ModelHealth> {
         let canonical = canonicalize_path(workspace);
-        let circular = self.circular_deps(&canonical).unwrap_or_default();
-        let violations = self.layer_violations(&canonical).unwrap_or_default();
-        let missing_invariants = self
-            .aggregate_roots_without_invariants(&canonical)
-            .unwrap_or_default();
-        let orphans = self.orphan_contexts(&canonical).unwrap_or_default();
-        let complexity = self.context_complexity(&canonical).unwrap_or_default();
+        let circular = self.circular_deps(&canonical)?;
+        let violations = self.layer_violations(&canonical)?;
+        let missing_invariants = self.aggregate_roots_without_invariants(&canonical)?;
+        let orphans = self.orphan_contexts(&canonical)?;
+        let complexity = self.context_complexity(&canonical)?;
         let god_contexts: Vec<String> = complexity
             .iter()
             .filter(|c| c.entity_count + c.service_count > 10)
             .map(|c| c.context.clone())
             .collect();
-        let unsourced_events = self.unsourced_events(&canonical).unwrap_or_default();
+        let unsourced_events = self.unsourced_events(&canonical)?;
 
         // Graph algorithms via CozoDB fixed rules
-        let bottleneck_contexts: Vec<String> = self
-            .betweenness_centrality(&canonical)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|(_, c)| *c > 0.0)
-            .map(|(name, _)| name)
-            .collect();
-        let communities = self.community_detection(&canonical).unwrap_or_default();
+        let bottleneck_contexts: Vec<String> = match self.betweenness_centrality(&canonical) {
+            Ok(rows) => rows
+                .into_iter()
+                .filter(|(_, c)| *c > 0.0)
+                .map(|(name, _)| name)
+                .collect(),
+            Err(e) => {
+                tracing::debug!("Betweenness centrality unavailable for model_health: {e}");
+                Vec::new()
+            }
+        };
+        let communities = match self.community_detection(&canonical) {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::debug!("Community detection unavailable for model_health: {e}");
+                Vec::new()
+            }
+        };
 
         let critical = circular.len() + violations.len();
         let warnings = missing_invariants.len() + god_contexts.len() + unsourced_events.len();
@@ -5157,7 +5041,6 @@ impl Store {
     fn orphan_contexts(&self, workspace: &str) -> Result<Vec<String>> {
         let params = params_map(&[("ws", workspace)]);
         let result = self
-            .db
             .run_script(
                 "has_dep[ctx] := *context_dep{workspace: $ws, from_ctx: ctx, state: 'desired' @ 'NOW'} \
                  has_dep[ctx] := *context_dep{workspace: $ws, to_ctx: ctx, state: 'desired' @ 'NOW'} \
@@ -5171,44 +5054,69 @@ impl Store {
 
     fn context_complexity(&self, workspace: &str) -> Result<Vec<ContextComplexity>> {
         let params = params_map(&[("ws", workspace)]);
-        let result = self
-            .db
+        let contexts = self
             .run_script(
-                "ctx_now[ctx] := *context{workspace: $ws, name: ctx, state: 'desired' @ 'NOW'} \
-                 has_ent[ctx] := *entity{workspace: $ws, context: ctx, state: 'desired' @ 'NOW'} \
-                 has_svc[ctx] := *service{workspace: $ws, context: ctx, state: 'desired' @ 'NOW'} \
-                 has_evt[ctx] := *event{workspace: $ws, context: ctx, state: 'desired' @ 'NOW'} \
-                 has_dep[ctx] := *context_dep{workspace: $ws, from_ctx: ctx, state: 'desired' @ 'NOW'} \
-                 ent_count[ctx, count(ent)] := *entity{workspace: $ws, context: ctx, name: ent, state: 'desired' @ 'NOW'} \
-                 ent_count[ctx, 0] := ctx_now[ctx], not has_ent[ctx] \
-                 svc_count[ctx, count(svc)] := *service{workspace: $ws, context: ctx, name: svc, state: 'desired' @ 'NOW'} \
-                 svc_count[ctx, 0] := ctx_now[ctx], not has_svc[ctx] \
-                 evt_count[ctx, count(evt)] := *event{workspace: $ws, context: ctx, name: evt, state: 'desired' @ 'NOW'} \
-                 evt_count[ctx, 0] := ctx_now[ctx], not has_evt[ctx] \
-                 dep_count[ctx, count(dep)] := *context_dep{workspace: $ws, from_ctx: ctx, to_ctx: dep, state: 'desired' @ 'NOW'} \
-                 dep_count[ctx, 0] := ctx_now[ctx], not has_dep[ctx] \
-                 ?[ctx, ents, svcs, evts, deps] := ent_count[ctx, ents], svc_count[ctx, svcs], evt_count[ctx, evts], dep_count[ctx, deps]",
+                "?[ctx] := *context{workspace: $ws, name: ctx, state: 'desired' @ 'NOW'}",
                 params,
                 ScriptMutability::Immutable,
             )
-            .map_err(|e| anyhow::anyhow!("context_complexity: {:?}", e))?;
-        Ok(result
-            .rows
-            .iter()
-            .map(|r| ContextComplexity {
-                context: dv_str(&r[0]),
-                entity_count: dv_u32(&r[1]),
-                service_count: dv_u32(&r[2]),
-                event_count: dv_u32(&r[3]),
-                dep_count: dv_u32(&r[4]),
-            })
-            .collect())
+            .map_err(|e| anyhow::anyhow!("context_complexity contexts: {:?}", e))?;
+
+        let mut complexity = Vec::with_capacity(contexts.rows.len());
+        for row in contexts.rows {
+            let context = dv_str(&row[0]);
+            let count_params = params_map(&[("ws", workspace), ("ctx", &context)]);
+            let entity_count = self
+                .run_script(
+                    "?[name] := *entity{workspace: $ws, context: $ctx, name, state: 'desired' @ 'NOW'}",
+                    count_params.clone(),
+                    ScriptMutability::Immutable,
+                )
+                .map_err(|e| anyhow::anyhow!("context_complexity entity count: {:?}", e))?
+                .rows
+                .len() as u32;
+            let service_count = self
+                .run_script(
+                    "?[name] := *service{workspace: $ws, context: $ctx, name, state: 'desired' @ 'NOW'}",
+                    count_params.clone(),
+                    ScriptMutability::Immutable,
+                )
+                .map_err(|e| anyhow::anyhow!("context_complexity service count: {:?}", e))?
+                .rows
+                .len() as u32;
+            let event_count = self
+                .run_script(
+                    "?[name] := *event{workspace: $ws, context: $ctx, name, state: 'desired' @ 'NOW'}",
+                    count_params.clone(),
+                    ScriptMutability::Immutable,
+                )
+                .map_err(|e| anyhow::anyhow!("context_complexity event count: {:?}", e))?
+                .rows
+                .len() as u32;
+            let dep_count = self
+                .run_script(
+                    "?[dep] := *context_dep{workspace: $ws, from_ctx: $ctx, to_ctx: dep, state: 'desired' @ 'NOW'}",
+                    count_params,
+                    ScriptMutability::Immutable,
+                )
+                .map_err(|e| anyhow::anyhow!("context_complexity dependency count: {:?}", e))?
+                .rows
+                .len() as u32;
+            complexity.push(ContextComplexity {
+                context,
+                entity_count,
+                service_count,
+                event_count,
+                dep_count,
+            });
+        }
+
+        Ok(complexity)
     }
 
     fn unsourced_events(&self, workspace: &str) -> Result<Vec<[String; 2]>> {
         let params = params_map(&[("ws", workspace)]);
         let result = self
-            .db
             .run_script(
                 "?[context, name] := *event{workspace: $ws, context, name, source: '', state: 'desired' @ 'NOW'}",
                 params,
@@ -5497,6 +5405,63 @@ pub fn canonicalize_path(path: &str) -> String {
     }
 }
 
+fn strip_state_dimension_from_script(script: &str) -> String {
+    let mut stripped = script.to_string();
+
+    for value in ["$st", "$from", "$to", "'desired'", "'actual'"] {
+        for pattern in [
+            format!(", state: {value}"),
+            format!("state: {value}, "),
+            format!(", state = {value}"),
+            format!("state = {value}, "),
+        ] {
+            stripped = stripped.replace(&pattern, "");
+        }
+    }
+
+    for value in ["$st", "'desired'", "'actual'"] {
+        for (pattern, replacement) in [
+            (format!(", {value},"), ",".to_string()),
+            (format!(", {value}]]"), "]]".to_string()),
+            (format!(", {value}]"), "]".to_string()),
+            (format!("[[{value}, "), "[[".to_string()),
+            (format!("[{value}, "), "[".to_string()),
+        ] {
+            stripped = stripped.replace(&pattern, &replacement);
+        }
+    }
+
+    for (pattern, replacement) in [
+        (", state,", ","),
+        (", state]", "]"),
+        (", state =>", " =>"),
+        (", state @", " @"),
+        (", state }", " }"),
+        (", state}", "}"),
+        ("[state, ", "["),
+        ("{state, ", "{"),
+        ("(state, ", "("),
+    ] {
+        stripped = stripped.replace(pattern, replacement);
+    }
+
+    loop {
+        let cleaned = stripped
+            .replace(", ,", ",")
+            .replace("[,", "[")
+            .replace("{,", "{")
+            .replace(",]", "]")
+            .replace(",}", "}")
+            .replace(", }", " }")
+            .replace("(,", "(")
+            .replace(",)", ")");
+        if cleaned == stripped {
+            return stripped;
+        }
+        stripped = cleaned;
+    }
+}
+
 fn params_map(pairs: &[(&str, &str)]) -> BTreeMap<String, cozo::DataValue> {
     pairs
         .iter()
@@ -5506,6 +5471,10 @@ fn params_map(pairs: &[(&str, &str)]) -> BTreeMap<String, cozo::DataValue> {
 
 fn int_dv(n: i64) -> cozo::DataValue {
     cozo::DataValue::Num(cozo::Num::Int(n))
+}
+
+fn text_matches(haystack: &str, needle_lowercase: &str) -> bool {
+    haystack.to_lowercase().contains(needle_lowercase)
 }
 
 /// Extract display string from a DataValue.
@@ -5544,11 +5513,7 @@ fn dv_i64(val: &cozo::DataValue) -> i64 {
 
 fn dv_opt_string(val: &cozo::DataValue) -> Option<String> {
     let value = dv_str(val);
-    if value.is_empty() {
-        None
-    } else {
-        Some(value)
-    }
+    if value.is_empty() { None } else { Some(value) }
 }
 
 fn dv_opt_usize(val: &cozo::DataValue) -> Option<usize> {
@@ -5934,7 +5899,7 @@ mod tests {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::SeqCst);
         let path = temp_dir().join(format!(
-            "dendrites_cozo_test_{}_{}.db",
+            "axon_cozo_test_{}_{}.db",
             std::process::id(),
             id
         ));
@@ -5981,7 +5946,10 @@ mod tests {
             .iter()
             .find(|e| e.name == "Product")
             .unwrap();
-        assert_eq!(product.file_path.as_deref(), Some("src/catalog/domain/product.rs"));
+        assert_eq!(
+            product.file_path.as_deref(),
+            Some("src/catalog/domain/product.rs")
+        );
         assert_eq!(product.start_line, Some(12));
         assert_eq!(product.end_line, Some(82));
         assert_eq!(product.fields.len(), 3);
@@ -6011,7 +5979,10 @@ mod tests {
             .iter()
             .find(|v| v.name == "Money")
             .unwrap();
-        assert_eq!(money.file_path.as_deref(), Some("src/catalog/domain/money.rs"));
+        assert_eq!(
+            money.file_path.as_deref(),
+            Some("src/catalog/domain/money.rs")
+        );
         assert_eq!(money.start_line, Some(3));
         assert_eq!(money.end_line, Some(27));
         assert_eq!(money.fields.len(), 2);
@@ -6062,7 +6033,10 @@ mod tests {
             .iter()
             .find(|e| e.name == "ProductCreated")
             .unwrap();
-        assert_eq!(evt.file_path.as_deref(), Some("src/catalog/domain/events.rs"));
+        assert_eq!(
+            evt.file_path.as_deref(),
+            Some("src/catalog/domain/events.rs")
+        );
         assert_eq!(evt.start_line, Some(4));
         assert_eq!(evt.end_line, Some(18));
         assert_eq!(evt.fields.len(), 2);
@@ -6095,7 +6069,7 @@ mod tests {
         assert_eq!(cat.repositories[0].methods.len(), 2);
         assert_eq!(cat.events[0].fields.len(), 2);
 
-        // Modify desired, then reset
+        // Modify implemented graph; reset is an actual-first compatibility no-op.
         let mut modified = rich_model();
         modified.bounded_contexts[0].entities[0].fields.push(Field {
             name: "sku".into(),
@@ -6108,7 +6082,7 @@ mod tests {
         assert_eq!(desired.bounded_contexts[0].entities[0].fields.len(), 4);
 
         let reset = store.reset(ws).unwrap().unwrap();
-        assert_eq!(reset.bounded_contexts[0].entities[0].fields.len(), 3);
+        assert_eq!(reset.bounded_contexts[0].entities[0].fields.len(), 4);
         assert_eq!(
             reset.bounded_contexts[0].entities[0].file_path.as_deref(),
             Some("src/catalog/domain/product.rs")
@@ -6124,7 +6098,10 @@ mod tests {
         store.save_desired(ws, &rich_model()).unwrap();
 
         let mut product = store.query_entity(ws, "Catalog", "Product").unwrap();
-        assert_eq!(product.file_path.as_deref(), Some("src/catalog/domain/product.rs"));
+        assert_eq!(
+            product.file_path.as_deref(),
+            Some("src/catalog/domain/product.rs")
+        );
         assert_eq!(product.start_line, Some(12));
         assert_eq!(product.end_line, Some(82));
 
@@ -6133,7 +6110,10 @@ mod tests {
 
         let queried = store.query_entity(ws, "Catalog", "Product").unwrap();
         assert_eq!(queried.description, "Updated product");
-        assert_eq!(queried.file_path.as_deref(), Some("src/catalog/domain/product.rs"));
+        assert_eq!(
+            queried.file_path.as_deref(),
+            Some("src/catalog/domain/product.rs")
+        );
         assert_eq!(queried.start_line, Some(12));
         assert_eq!(queried.end_line, Some(82));
 
@@ -6299,7 +6279,6 @@ mod tests {
         let ws = "/tmp/test-accept";
         let model = full_model();
         store.save_desired(ws, &model).unwrap();
-        assert!(store.load_actual(ws).unwrap().is_none());
         store.accept(ws).unwrap();
         let actual = store.load_actual(ws).unwrap().unwrap();
         assert_eq!(actual.bounded_contexts.len(), 2);
@@ -6334,7 +6313,7 @@ mod tests {
         let desired = store.load_desired(ws).unwrap().unwrap();
         assert_eq!(desired.bounded_contexts.len(), 3);
         let reset = store.reset(ws).unwrap().unwrap();
-        assert_eq!(reset.bounded_contexts.len(), 2);
+        assert_eq!(reset.bounded_contexts.len(), 3);
     }
 
     #[test]
@@ -6345,11 +6324,34 @@ mod tests {
         store.save_desired(ws, &model).unwrap();
         let diff = store.diff_graph(ws).unwrap();
         let changes = diff["pending_changes"].as_array().unwrap();
-        assert!(!changes.is_empty());
-        store.accept(ws).unwrap();
+        assert!(changes.is_empty());
+
+        let mut modified = full_model();
+        modified.bounded_contexts.push(BoundedContext {
+            api_endpoints: vec![],
+            name: "Telemetry".into(),
+            description: "Observed status context".into(),
+            module_path: "src/telemetry".into(),
+            ownership: Ownership::default(),
+            aggregates: vec![],
+            policies: vec![],
+            read_models: vec![],
+            entities: vec![],
+            value_objects: vec![],
+            services: vec![],
+            repositories: vec![],
+            events: vec![],
+            modules: vec![],
+            dependencies: vec![],
+        });
+        store.save_desired(ws, &modified).unwrap();
         let diff = store.diff_graph(ws).unwrap();
         let changes = diff["pending_changes"].as_array().unwrap();
-        assert!(changes.is_empty());
+        assert!(
+            changes
+                .iter()
+                .any(|change| change["kind"] == "context" && change["name"] == "Telemetry")
+        );
     }
 
     #[test]
@@ -6359,25 +6361,43 @@ mod tests {
         let model = full_model();
         store.save_desired(ws, &model).unwrap();
 
-        // Desired only, no actual → everything is drift
         store.compute_drift(ws).unwrap();
 
         let entries = store.load_drift(ws).unwrap();
         assert!(
-            !entries.is_empty(),
-            "Must have drift entries when desired exists but no actual"
-        );
-        assert!(
-            entries.iter().all(|(_, _, _, ct)| ct == "add"),
-            "All drift should be 'add' when no actual"
+            entries.is_empty(),
+            "First actual snapshot has no prior drift basis"
         );
 
-        // Accept → in sync, drift should be empty
-        store.accept(ws).unwrap();
+        let mut modified = full_model();
+        modified.bounded_contexts.push(BoundedContext {
+            api_endpoints: vec![],
+            name: "Telemetry".into(),
+            description: "Observed status context".into(),
+            module_path: "src/telemetry".into(),
+            ownership: Ownership::default(),
+            aggregates: vec![],
+            policies: vec![],
+            read_models: vec![],
+            entities: vec![],
+            value_objects: vec![],
+            services: vec![],
+            repositories: vec![],
+            events: vec![],
+            modules: vec![],
+            dependencies: vec![],
+        });
+        store.save_desired(ws, &modified).unwrap();
         store.compute_drift(ws).unwrap();
 
         let entries = store.load_drift(ws).unwrap();
-        assert!(entries.is_empty(), "No drift entries when in sync");
+        assert!(
+            entries
+                .iter()
+                .any(|(category, _, name, change_type)| category == "context"
+                    && name == "Telemetry"
+                    && change_type == "add")
+        );
     }
 
     #[test]
@@ -6393,14 +6413,8 @@ mod tests {
         store.save_desired(ws, &full_model()).unwrap();
         let desired_only = store.truth_maintenance_report(ws).unwrap();
         assert!(desired_only.asserted.available);
-        assert!(!desired_only.scanned.available);
+        assert!(desired_only.scanned.available);
         assert_eq!(desired_only.drift.status, "unavailable");
-        assert!(
-            desired_only
-                .assumptions
-                .iter()
-                .any(|assumption| assumption.contains("No scanned implementation model"))
-        );
 
         store.save_actual(ws, &full_model()).unwrap();
         let before_drift = store.truth_maintenance_report(ws).unwrap();
@@ -6464,7 +6478,7 @@ mod tests {
             }),
             provenance: ReasoningProvenance {
                 source: "datalog".into(),
-                state: "desired".into(),
+                state: "actual".into(),
             },
             stale: false,
             computed_at_us: 42,
@@ -6475,7 +6489,7 @@ mod tests {
             }],
             assumptions: vec![ReasoningAssumption {
                 assumption_kind: "limitation".into(),
-                text: "Only stored desired-state dependencies are considered.".into(),
+                text: "Only stored implemented dependencies are considered.".into(),
             }],
             supports: vec![ReasoningSupportEdge {
                 support_kind: "evidence".into(),
@@ -6605,8 +6619,14 @@ mod tests {
             .unwrap();
         assert_eq!(invalidated, 1);
 
-        let entity_claim = store.load_reasoning_claim(ws, "claim.entity").unwrap().unwrap();
-        let service_claim = store.load_reasoning_claim(ws, "claim.service").unwrap().unwrap();
+        let entity_claim = store
+            .load_reasoning_claim(ws, "claim.entity")
+            .unwrap()
+            .unwrap();
+        let service_claim = store
+            .load_reasoning_claim(ws, "claim.service")
+            .unwrap()
+            .unwrap();
         assert!(entity_claim.stale);
         assert!(!service_claim.stale);
     }

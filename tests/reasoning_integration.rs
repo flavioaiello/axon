@@ -14,15 +14,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 // We access the binary crate's public API through its library surface.
-use dendrites::domain::model::*;
-use dendrites::store::Store;
+use axon::domain::model::*;
+use axon::store::Store;
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
 fn temp_store() -> Store {
     static CTR: AtomicU64 = AtomicU64::new(0);
     let id = CTR.fetch_add(1, Ordering::SeqCst);
-    let path = temp_dir().join(format!("dendrites_integ_{}_{}.db", std::process::id(), id));
+    let path = temp_dir().join(format!("axon_integ_{}_{}.db", std::process::id(), id));
     Store::open(&path).unwrap()
 }
 
@@ -699,7 +699,7 @@ fn invariant_coverage_with_first_class_invariants() {
     let store = temp_store();
     let ws = ws();
     store.save_desired(&ws, &ecommerce_model()).unwrap();
-    let canonical = dendrites::store::cozo::canonicalize_path(&ws);
+    let canonical = axon::store::cozo::canonicalize_path(&ws);
 
     let missing = store
         .aggregate_roots_without_invariants(&canonical)

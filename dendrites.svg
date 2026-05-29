@@ -60,7 +60,7 @@
 
   <!-- ── Wordmark ── -->
   <text x="160" y="82" font-family="'SF Pro Display','Inter','Segoe UI',system-ui,sans-serif" font-size="48" font-weight="700" letter-spacing="-1" fill="#1e1b4b">
-    dendrites
+    axon
   </text>
 
   <!-- Tagline -->

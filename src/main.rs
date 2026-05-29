@@ -1,13 +1,13 @@
-use dendrites::domain;
-use dendrites::server;
-use dendrites::store;
+use axon::domain;
+use axon::server;
+use axon::store;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
-#[command(name = "dendrites", about = "Domain Model Context Protocol Server")]
+#[command(name = "axon", about = "Domain Model Context Protocol Server")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -20,6 +20,21 @@ enum Commands {
         /// Workspace path (defaults to current directory)
         #[arg(short, long)]
         workspace: Option<String>,
+
+        /// Local web graph port (falls back upward if occupied)
+        #[arg(long, default_value_t = server::web::DEFAULT_WEB_PORT)]
+        web_port: u16,
+    },
+
+    /// Start only the local web graph UI and live Rust indexer
+    Web {
+        /// Workspace path (defaults to current directory)
+        #[arg(short, long)]
+        workspace: Option<String>,
+
+        /// Local web graph port (falls back upward if occupied)
+        #[arg(short, long, default_value_t = server::web::DEFAULT_WEB_PORT)]
+        port: u16,
     },
 
     /// Export a workspace's domain model to a JSON file
@@ -31,8 +46,8 @@ enum Commands {
         #[arg(short, long)]
         workspace: String,
 
-        /// State to export: desired, actual, or both (default: desired)
-        #[arg(short, long, default_value = "desired")]
+        /// State to export: actual or both (compatibility aliases: desired/current/planned)
+        #[arg(short, long, default_value = "actual")]
         state: String,
     },
 
@@ -50,7 +65,7 @@ enum Commands {
         workspace: String,
     },
 
-    /// Scan the workspace source code and populate the actual domain model
+    /// Scan the workspace source code and populate the implemented domain model
     Scan {
         /// Workspace path
         #[arg(short, long)]
@@ -85,7 +100,7 @@ async fn main() -> Result<()> {
                 &workspace,
             ))?);
             tracing::info!(
-                "Dendrites Server starting for workspace: {} ({} crate(s))",
+                "Axon Server starting for workspace: {} ({} crate(s))",
                 workspace,
                 registry.crates().len()
             );
@@ -99,16 +114,24 @@ async fn main() -> Result<()> {
                 }
             });
 
+            spawn_web_graph(
+                std::sync::Arc::clone(&registry),
+                server::web::DEFAULT_WEB_PORT,
+            );
+
             server::stdio::run(registry).await?;
         }
 
-        Some(Commands::Serve { workspace }) => {
+        Some(Commands::Serve {
+            workspace,
+            web_port,
+        }) => {
             let workspace = resolve_workspace(workspace);
             let registry = std::sync::Arc::new(store::CrateRegistry::open(std::path::Path::new(
                 &workspace,
             ))?);
             tracing::info!(
-                "Dendrites Server starting for workspace: {} ({} crate(s))",
+                "Axon Server starting for workspace: {} ({} crate(s))",
                 workspace,
                 registry.crates().len()
             );
@@ -123,7 +146,31 @@ async fn main() -> Result<()> {
                 }
             });
 
+            spawn_web_graph(std::sync::Arc::clone(&registry), web_port);
+
             server::stdio::run(registry).await?;
+        }
+
+        Some(Commands::Web { workspace, port }) => {
+            let workspace = resolve_workspace(workspace);
+            let registry = std::sync::Arc::new(store::CrateRegistry::open(std::path::Path::new(
+                &workspace,
+            ))?);
+            tracing::info!(
+                "Axon web graph starting for workspace: {} ({} crate(s))",
+                workspace,
+                registry.crates().len()
+            );
+
+            let watcher =
+                server::watcher::ActualStateWatcher::new(std::sync::Arc::clone(&registry));
+            tokio::spawn(async move {
+                if let Err(e) = watcher.spawn().await {
+                    tracing::error!("AST Watcher failed: {}", e);
+                }
+            });
+
+            server::web::run(registry, port).await?;
         }
 
         Some(Commands::Export {
@@ -150,7 +197,7 @@ async fn main() -> Result<()> {
                 let ws = entry.workspace_key();
                 let has_model = entry
                     .store
-                    .load_desired(&ws)
+                    .load_actual(&ws)
                     .ok()
                     .flatten()
                     .is_some_and(|m| !m.bounded_contexts.is_empty());
@@ -183,8 +230,8 @@ async fn main() -> Result<()> {
             let registry = store::CrateRegistry::open(std::path::Path::new(&workspace))?;
             for entry in registry.crates() {
                 let ws = entry.workspace_key();
-                let desired = entry.store.load_desired(&ws)?;
-                let actual = domain::analyze::scan_actual_model(&entry.root, desired.as_ref())?;
+                let previous = entry.store.load_actual(&ws)?;
+                let actual = domain::analyze::scan_actual_model(&entry.root, previous.as_ref())?;
 
                 let entity_count: usize = actual
                     .bounded_contexts
@@ -211,35 +258,44 @@ async fn main() -> Result<()> {
                     .iter()
                     .map(|bc| bc.events.len())
                     .sum();
+                let source_file_count = actual.source_files.len();
+                let symbol_count = actual.symbols.len();
+                let import_edge_count = actual.import_edges.len();
+                let call_edge_count = actual.call_edges.len();
 
                 entry.store.save_actual(&ws, &actual)?;
-
-                // Auto-bootstrap: seed desired from actual on first scan
-                if entry.store.load_desired(&ws)?.is_none() {
-                    entry.store.reset(&ws)?;
-                    eprintln!(
-                        "  Bootstrapped desired model from actual for crate '{}'",
-                        entry.name
-                    );
-                }
+                let drift_count = entry.store.compute_drift(&ws)?;
 
                 eprintln!(
-                    "Crate '{}': {} contexts → {} entities, {} VOs, {} services, {} repos, {} events",
+                    "Crate '{}': {} contexts -> {} entities, {} VOs, {} services, {} repos, {} events; {} files, {} symbols, {} imports, {} calls; {} temporal changes",
                     entry.name,
                     actual.bounded_contexts.len(),
                     entity_count,
                     vo_count,
                     svc_count,
                     repo_count,
-                    event_count
+                    event_count,
+                    source_file_count,
+                    symbol_count,
+                    import_edge_count,
+                    call_edge_count,
+                    drift_count
                 );
             }
             eprintln!(
-                "Actual model saved for {} crate(s).",
+                "Implemented model saved for {} crate(s).",
                 registry.crates().len()
             );
         }
     }
 
     Ok(())
+}
+
+fn spawn_web_graph(registry: std::sync::Arc<store::CrateRegistry>, port: u16) {
+    tokio::spawn(async move {
+        if let Err(e) = server::web::run(registry, port).await {
+            tracing::warn!("Web graph unavailable: {e:#}");
+        }
+    });
 }

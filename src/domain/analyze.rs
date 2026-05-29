@@ -5,7 +5,6 @@ use syn::spanned::Spanned;
 use syn::visit::Visit;
 
 use super::model::*;
-use super::polyglot::TreeSitterScanner;
 use super::rust_syn::RustSynScanner;
 use super::scanner::AstScanner;
 
@@ -90,7 +89,6 @@ pub fn extract_live_dependencies(
 fn scanner_for_path(path: &Path) -> Option<Box<dyn AstScanner>> {
     match path.extension()?.to_str()? {
         "rs" => Some(Box::new(RustSynScanner)),
-        "py" | "ts" | "tsx" | "go" | "java" => Some(Box::new(TreeSitterScanner::new())),
         _ => None,
     }
 }
@@ -98,18 +96,22 @@ fn scanner_for_path(path: &Path) -> Option<Box<dyn AstScanner>> {
 pub fn scan_workspace(workspace_root: &Path) -> Result<Vec<LiveDependency>> {
     let mut all_deps = Vec::new();
 
-    for entry in ignore::WalkBuilder::new(workspace_root)
-        .build()
-        .filter_map(Result::ok)
-    {
+    for entry in ignore::WalkBuilder::new(workspace_root).build() {
+        let entry = entry
+            .with_context(|| format!("Failed to walk workspace: {}", workspace_root.display()))?;
         let path = entry.path();
-        if path.is_file()
-            && let Some(scanner) = scanner_for_path(path)
-            && let Ok(content) = std::fs::read_to_string(path)
-            && let Ok(deps) = scanner.extract_live_dependencies(path, &content)
-        {
-            all_deps.extend(deps);
+        if !path.is_file() {
+            continue;
         }
+        let Some(scanner) = scanner_for_path(path) else {
+            continue;
+        };
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("Failed to read source file: {}", path.display()))?;
+        let deps = scanner
+            .extract_live_dependencies(path, &content)
+            .with_context(|| format!("Failed to extract imports from: {}", path.display()))?;
+        all_deps.extend(deps);
     }
 
     Ok(all_deps)
@@ -399,18 +401,25 @@ fn scan_directory(dir: &Path) -> Result<ScanResult> {
         return Ok((all_structs, all_enums, all_methods, all_modules));
     }
 
-    for entry in ignore::WalkBuilder::new(dir).build().filter_map(Result::ok) {
+    for entry in ignore::WalkBuilder::new(dir).build() {
+        let entry =
+            entry.with_context(|| format!("Failed to walk source directory: {}", dir.display()))?;
         let path = entry.path();
-        if path.is_file()
-            && let Some(scanner) = scanner_for_path(path)
-            && let Ok(content) = std::fs::read_to_string(path)
-            && let Ok((structs, enums, methods, modules)) = scanner.scan_file(path, &content)
-        {
-            all_structs.extend(structs);
-            all_enums.extend(enums);
-            all_methods.extend(methods);
-            all_modules.extend(modules);
+        if !path.is_file() {
+            continue;
         }
+        let Some(scanner) = scanner_for_path(path) else {
+            continue;
+        };
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("Failed to read source file: {}", path.display()))?;
+        let (structs, enums, methods, modules) = scanner
+            .scan_file(path, &content)
+            .with_context(|| format!("Failed to scan source file: {}", path.display()))?;
+        all_structs.extend(structs);
+        all_enums.extend(enums);
+        all_methods.extend(methods);
+        all_modules.extend(modules);
     }
 
     Ok((all_structs, all_enums, all_methods, all_modules))
@@ -501,8 +510,8 @@ pub type ScanResult = (
 );
 
 /// Classification of a discovered struct based on naming conventions and
-/// structural heuristics. Used when no desired model is available or when a
-/// struct is not declared in the desired model.
+/// structural heuristics. Used when no enrichment model is available or when a
+/// struct is not declared in the enrichment model.
 #[derive(Debug, Clone, PartialEq)]
 enum StructKind {
     Entity,
@@ -525,8 +534,14 @@ fn classify_struct(name: &str, fields: &[Field], methods: &[DiscoveredMethod]) -
     // data fields (name, description, etc.) is a *model definition* for that
     // concept, not an instance of the DDD role itself.
     const ONTOLOGY_NAMES: &[&str] = &[
-        "SERVICE", "REPOSITORY", "DOMAINEVENT", "EVENT", "ENTITY",
-        "VALUEOBJECT", "AGGREGATE", "BOUNDEDCONTEXT",
+        "SERVICE",
+        "REPOSITORY",
+        "DOMAINEVENT",
+        "EVENT",
+        "ENTITY",
+        "VALUEOBJECT",
+        "AGGREGATE",
+        "BOUNDEDCONTEXT",
     ];
     if ONTOLOGY_NAMES.contains(&upper.as_str()) {
         let has_name_field = fields.iter().any(|f| f.name == "name");
@@ -607,12 +622,12 @@ fn classify_enum(name: &str) -> StructKind {
 /// Bounded contexts are derived from the top-level module directories under
 /// each `src/`. For multi-crate workspaces every crate is scanned.
 ///
-/// When a `desired` model is provided it is used as an enrichment overlay:
-///   - Structs matching a desired element inherit its classification, metadata
+/// When an enrichment model is provided it overlays explicit domain knowledge:
+///   - Structs matching an enriched element inherit its classification, metadata
 ///     (description, invariants, aggregate_root, etc.).
-///   - Structs NOT in the desired model are still discovered and classified
+///   - Structs NOT in the enrichment model are still discovered and classified
 ///     via naming conventions and structural heuristics.
-///   - Desired-only metadata (aggregates, policies, read_models, external
+///   - Model-only metadata (aggregates, policies, read_models, external
 ///     systems, architectural decisions, ownership, rules, etc.) is carried
 ///     forward into the actual model.
 pub fn scan_actual_model(
@@ -652,29 +667,39 @@ pub fn scan_actual_model(
         let module_dirs: Vec<(String, PathBuf, String)> = {
             let mut contexts = Vec::new();
 
-            if let Ok(entries) = std::fs::read_dir(&crate_src.src_dir) {
-                for entry in entries.filter_map(Result::ok) {
-                    let path = entry.path();
-                    if path.is_dir() {
-                        let dir_name = match path.file_name() {
-                            Some(n) => n.to_string_lossy().to_string(),
-                            None => continue,
-                        };
-                        if dir_name.starts_with('.') {
-                            continue;
-                        }
-                        let module_path = path
-                            .strip_prefix(workspace_root)
-                            .unwrap_or(&path)
-                            .to_string_lossy()
-                            .to_string();
-                        let ctx_name = if multi_crate {
-                            format!("{}::{}", crate_src.name, dir_name)
-                        } else {
-                            dir_name
-                        };
-                        contexts.push((ctx_name, path, module_path));
+            let entries = std::fs::read_dir(&crate_src.src_dir).with_context(|| {
+                format!(
+                    "Failed to read crate source directory: {}",
+                    crate_src.src_dir.display()
+                )
+            })?;
+            for entry in entries {
+                let entry = entry.with_context(|| {
+                    format!(
+                        "Failed to read entry from crate source directory: {}",
+                        crate_src.src_dir.display()
+                    )
+                })?;
+                let path = entry.path();
+                if path.is_dir() {
+                    let dir_name = match path.file_name() {
+                        Some(n) => n.to_string_lossy().to_string(),
+                        None => continue,
+                    };
+                    if dir_name.starts_with('.') {
+                        continue;
                     }
+                    let module_path = path
+                        .strip_prefix(workspace_root)
+                        .unwrap_or(&path)
+                        .to_string_lossy()
+                        .to_string();
+                    let ctx_name = if multi_crate {
+                        format!("{}::{}", crate_src.name, dir_name)
+                    } else {
+                        dir_name
+                    };
+                    contexts.push((ctx_name, path, module_path));
                 }
             }
 
@@ -706,58 +731,60 @@ pub fn scan_actual_model(
             // Extract file-level imports from this context's directory
             let mut ctx_deps = Vec::new();
             if scan_dir.exists() {
-                for entry in ignore::WalkBuilder::new(scan_dir)
-                    .build()
-                    .filter_map(Result::ok)
-                {
+                for entry in ignore::WalkBuilder::new(scan_dir).build() {
+                    let entry = entry.with_context(|| {
+                        format!("Failed to walk context directory: {}", scan_dir.display())
+                    })?;
                     let path = entry.path();
-                    if path.is_file()
-                        && let Some(scanner) = scanner_for_path(path)
-                        && let Ok(content) = std::fs::read_to_string(path)
-                    {
-                        // Collect source file
-                        let rel_path = path
-                            .strip_prefix(workspace_root)
-                            .unwrap_or(path)
-                            .to_string_lossy()
-                            .to_string();
-                        let lang = match path.extension().and_then(|e| e.to_str()) {
-                            Some("rs") => "rust",
-                            Some("py") => "python",
-                            Some("ts" | "tsx") => "typescript",
-                            Some("go") => "go",
-                            _ => "unknown",
-                        };
-                        actual.source_files.push(SourceFile {
-                            path: rel_path.clone(),
+                    if !path.is_file() {
+                        continue;
+                    }
+                    let Some(scanner) = scanner_for_path(path) else {
+                        continue;
+                    };
+                    let content = std::fs::read_to_string(path).with_context(|| {
+                        format!("Failed to read source file: {}", path.display())
+                    })?;
+
+                    // Collect source file
+                    let rel_path = path
+                        .strip_prefix(workspace_root)
+                        .unwrap_or(path)
+                        .to_string_lossy()
+                        .to_string();
+                    actual.source_files.push(SourceFile {
+                        path: rel_path.clone(),
+                        context: ctx_name.clone(),
+                        language: "rust".to_string(),
+                    });
+
+                    // Collect imports and import edges
+                    let deps = scanner
+                        .extract_live_dependencies(path, &content)
+                        .with_context(|| {
+                            format!("Failed to extract imports from: {}", path.display())
+                        })?;
+                    for dep in &deps {
+                        actual.import_edges.push(ImportEdge {
+                            from_file: rel_path.clone(),
+                            to_module: dep.to_module.clone(),
                             context: ctx_name.clone(),
-                            language: lang.to_string(),
                         });
+                    }
+                    ctx_deps.extend(deps);
 
-                        // Collect imports and import edges
-                        if let Ok(deps) = scanner.extract_live_dependencies(path, &content) {
-                            for dep in &deps {
-                                actual.import_edges.push(ImportEdge {
-                                    from_file: rel_path.clone(),
-                                    to_module: dep.to_module.clone(),
-                                    context: ctx_name.clone(),
-                                });
-                            }
-                            ctx_deps.extend(deps);
-                        }
-
-                        // Collect call edges
-                        if let Ok(file_calls) = scanner.extract_calls(path, &content) {
-                            for ci in file_calls {
-                                actual.call_edges.push(CallEdge {
-                                    caller: ci.caller,
-                                    callee: ci.callee,
-                                    file_path: rel_path.clone(),
-                                    line: ci.line,
-                                    context: ctx_name.clone(),
-                                });
-                            }
-                        }
+                    // Collect call edges
+                    let file_calls = scanner.extract_calls(path, &content).with_context(|| {
+                        format!("Failed to extract calls from: {}", path.display())
+                    })?;
+                    for ci in file_calls {
+                        actual.call_edges.push(CallEdge {
+                            caller: ci.caller,
+                            callee: ci.callee,
+                            file_path: rel_path.clone(),
+                            line: ci.line,
+                            context: ctx_name.clone(),
+                        });
                     }
                 }
             }
@@ -824,7 +851,7 @@ pub fn scan_actual_model(
                     })
                     .collect();
 
-                // Check if desired model provides an explicit classification
+                // Check if the enrichment model provides an explicit classification.
                 let desired_kind = desired_bc.and_then(|dbc| {
                     if dbc
                         .entities
@@ -971,7 +998,7 @@ pub fn scan_actual_model(
                     })
                     .collect();
 
-                // Check desired model for explicit classification
+                // Check the enrichment model for explicit classification.
                 let desired_kind = desired_bc.and_then(|dbc| {
                     if dbc
                         .entities
@@ -1140,7 +1167,7 @@ pub fn scan_actual_model(
 
             actual.bounded_contexts.push(bc);
 
-            // Harvest AST edges from polyglot structural relationships
+            // Harvest structural AST edges reported by the Rust scanner.
             for s in &structs {
                 for ext in &s.extends {
                     actual.ast_edges.push(crate::domain::model::ASTEdge {
@@ -1199,14 +1226,7 @@ pub fn scan_actual_model(
         for (ctx_name, imports) in &context_imports {
             let mut inferred_deps: Vec<String> = Vec::new();
             for dep in imports {
-                // Extract the first meaningful module segment from the import path.
-                //
-                // Rust:       `crate::domain::model`        → "domain"
-                // Python:     `domain.model`                 → "domain"
-                // TypeScript: `./domain/model`               → "domain"
-                //             `../domain/model`              → "domain"
-                //             `@scope/domain`                → "domain"
-                // Go:         `github.com/org/repo/domain`   → "domain" (last segment)
+                // Extract the first meaningful module segment from the Rust import path.
                 let raw = &dep.to_module;
 
                 // Rust: strip crate::/super:: prefix, split on ::
@@ -1215,30 +1235,8 @@ pub fn scan_actual_model(
                     .or_else(|| raw.strip_prefix("super::"))
                 {
                     stripped.split("::").next().unwrap_or("")
-                }
-                // Go: fully qualified paths like "github.com/org/repo/domain" → last segment
-                else if raw.contains("github.com/")
-                    || raw.contains("golang.org/")
-                    || raw.contains('/') && raw.contains('.') && !raw.starts_with('.')
-                {
-                    raw.rsplit('/').next().unwrap_or("")
-                }
-                // TypeScript: strip ./ or ../ prefix(es), then split on /
-                else if raw.starts_with("./") || raw.starts_with("../") {
-                    let stripped = raw.trim_start_matches("../").trim_start_matches("./");
-                    stripped.split('/').next().unwrap_or("")
-                }
-                // TypeScript scoped packages: @scope/pkg → pkg
-                else if raw.starts_with('@') {
-                    raw.split('/').nth(1).unwrap_or("")
-                }
-                // Python: `domain.model` → "domain"
-                // Rust without crate:: prefix: `domain::model` → "domain"
-                else {
-                    raw.split("::")
-                        .next()
-                        .and_then(|s| s.split('.').next())
-                        .unwrap_or(raw)
+                } else {
+                    raw.split("::").next().unwrap_or(raw)
                 };
 
                 // Map to a known context name (skip self-references)
@@ -1553,7 +1551,7 @@ mod tests {
         use std::env::temp_dir;
         use std::fs;
 
-        let tmp = temp_dir().join(format!("dendrites_nodesc_test_{}", std::process::id()));
+        let tmp = temp_dir().join(format!("axon_nodesc_test_{}", std::process::id()));
         let src = tmp.join("src").join("billing");
         fs::create_dir_all(&src).unwrap();
 
@@ -1582,7 +1580,7 @@ impl InvoiceRepository {
         )
         .unwrap();
 
-        // No desired model at all — pure heuristic discovery
+        // No enrichment model at all: pure heuristic discovery.
         let actual = scan_actual_model(&tmp, None).unwrap();
 
         assert_eq!(actual.bounded_contexts.len(), 1);
@@ -1613,11 +1611,11 @@ impl InvoiceRepository {
         use std::env::temp_dir;
         use std::fs;
 
-        let tmp = temp_dir().join(format!("dendrites_scan_test_{}", std::process::id()));
+        let tmp = temp_dir().join(format!("axon_scan_test_{}", std::process::id()));
         let src = tmp.join("src").join("domain");
         fs::create_dir_all(&src).unwrap();
 
-        // Write a Rust file with structs matching desired model
+        // Write a Rust file with structs matching the enrichment model.
         fs::write(
             src.join("model.rs"),
             r#"
@@ -1698,7 +1696,7 @@ impl User {
         assert!(bc.entities[0].aggregate_root); // inherited from desired
         assert_eq!(bc.entities[0].fields.len(), 2); // name, email from AST
         assert_eq!(bc.entities[0].methods.len(), 1); // change_email
-        // Invariants carried from desired model enrichment
+        // Invariants carried from enrichment metadata.
         assert_eq!(bc.entities[0].invariants.len(), 1);
         assert_eq!(bc.entities[0].invariants[0], "Email must be unique");
 
@@ -1712,11 +1710,11 @@ impl User {
     }
 
     #[test]
-    fn test_scan_actual_model_java_discovery() {
+    fn test_scan_actual_model_ignores_non_rust_sources() {
         use std::env::temp_dir;
         use std::fs;
 
-        let tmp = temp_dir().join(format!("dendrites_java_test_{}", std::process::id()));
+        let tmp = temp_dir().join(format!("axon_non_rust_test_{}", std::process::id()));
         let src = tmp.join("src").join("orders");
         fs::create_dir_all(&src).unwrap();
 
@@ -1769,21 +1767,21 @@ public enum OrderStatus {
         .unwrap();
 
         let actual = scan_actual_model(&tmp, None).unwrap();
-        assert_eq!(actual.bounded_contexts.len(), 1);
-        let bc = &actual.bounded_contexts[0];
-        assert_eq!(bc.name, "orders");
-
-        // Order: has data fields + methods → Entity
-        assert!(bc.entities.iter().any(|e| e.name == "Order"));
-        let order = bc.entities.iter().find(|e| e.name == "Order").unwrap();
-        assert_eq!(order.fields.len(), 2);
-        assert!(order.methods.len() >= 2);
-
-        // OrderRepository: naming convention → Repository
-        assert!(bc.repositories.iter().any(|r| r.name == "OrderRepository"));
-
-        // OrderStatus: enum → ValueObject
-        assert!(bc.value_objects.iter().any(|v| v.name == "OrderStatus"));
+        assert!(
+            actual.source_files.is_empty(),
+            "Rust-only scanner must ignore non-Rust source files"
+        );
+        assert!(
+            actual
+                .bounded_contexts
+                .iter()
+                .all(|bc| bc.entities.is_empty()
+                    && bc.value_objects.is_empty()
+                    && bc.repositories.is_empty()
+                    && bc.events.is_empty()
+                    && bc.services.is_empty()),
+            "Non-Rust sources must not populate the domain model"
+        );
 
         let _ = fs::remove_dir_all(&tmp);
     }

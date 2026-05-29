@@ -18,16 +18,16 @@ pub struct SourceFile {
     pub path: String,
     /// Owning bounded context
     pub context: String,
-    /// Programming language (rust, python, typescript, go)
+    /// Programming language. The live scanner currently indexes Rust only.
     pub language: String,
 }
 
-/// A symbol (struct, enum, function, interface) discovered in the source code.
+/// A Rust symbol discovered in the source code.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SymbolDef {
     /// Canonical name of the symbol (e.g. "Store", "DomainModel")
     pub name: String,
-    /// Kind: struct, enum, function, interface, class
+    /// Kind: struct, enum, function, method, module
     pub kind: String,
     /// Owning bounded context
     pub context: String,

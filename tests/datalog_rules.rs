@@ -10,9 +10,9 @@
 use std::env::temp_dir;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use dendrites::domain::model::*;
-use dendrites::store::Store;
-use dendrites::store::cozo::canonicalize_path;
+use axon::domain::model::*;
+use axon::store::Store;
+use axon::store::cozo::canonicalize_path;
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -20,7 +20,7 @@ fn temp_store() -> Store {
     static CTR: AtomicU64 = AtomicU64::new(0);
     let id = CTR.fetch_add(1, Ordering::SeqCst);
     let path = temp_dir().join(format!(
-        "dendrites_datalog_{}_{}.db",
+        "axon_datalog_{}_{}.db",
         std::process::id(),
         id
     ));
@@ -495,9 +495,9 @@ fn cannot_delete_entity_with_event_source() {
         description: "".into(),
         source: "Order".into(),
         fields: vec![],
-        file_path: None,
-        start_line: None,
-        end_line: None,
+        file_path: Some("src/shop/events.rs".into()),
+        start_line: Some(12),
+        end_line: Some(20),
     }];
     model.bounded_contexts = vec![ctx];
     store.save_desired(&ws, &model).unwrap();
@@ -508,6 +508,13 @@ fn cannot_delete_entity_with_event_source() {
     assert_eq!(result["can_delete"], false);
     let events = result["events_sourced"].as_array().unwrap();
     assert!(events.iter().any(|e| e == "OrderPlaced"));
+    let event_refs = result["event_references"].as_array().unwrap();
+    assert!(event_refs.iter().any(|e| {
+        e["event"] == "OrderPlaced"
+            && e["file"] == "src/shop/events.rs"
+            && e["start_line"] == 12
+            && e["end_line"] == 20
+    }));
 }
 
 #[test]
@@ -531,9 +538,9 @@ fn cannot_delete_entity_with_repository() {
         name: "ProductRepo".into(),
         aggregate: "Product".into(),
         methods: vec![],
-        file_path: None,
-        start_line: None,
-        end_line: None,
+        file_path: Some("src/shop/product_repo.rs".into()),
+        start_line: Some(4),
+        end_line: Some(40),
     }];
     model.bounded_contexts = vec![ctx];
     store.save_desired(&ws, &model).unwrap();
@@ -544,6 +551,13 @@ fn cannot_delete_entity_with_repository() {
     assert_eq!(result["can_delete"], false);
     let repos = result["repositories_managing"].as_array().unwrap();
     assert!(repos.iter().any(|r| r == "ProductRepo"));
+    let repo_refs = result["repository_references"].as_array().unwrap();
+    assert!(repo_refs.iter().any(|r| {
+        r["repository"] == "ProductRepo"
+            && r["file"] == "src/shop/product_repo.rs"
+            && r["start_line"] == 4
+            && r["end_line"] == 40
+    }));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1039,16 +1053,31 @@ fn copy_state_copies_modules_and_api_endpoints() {
     // Accept: copies desired → actual
     store.accept(&ws).unwrap();
 
-    let actual = store.load_actual(&ws).unwrap().expect("actual should exist after accept");
-    let ctx = actual.bounded_contexts.iter().find(|c| c.name == "Orders").expect("Orders context");
+    let actual = store
+        .load_actual(&ws)
+        .unwrap()
+        .expect("actual should exist after accept");
+    let ctx = actual
+        .bounded_contexts
+        .iter()
+        .find(|c| c.name == "Orders")
+        .expect("Orders context");
 
     // Modules must have been copied
-    assert_eq!(ctx.modules.len(), 1, "module should be copied to actual state");
+    assert_eq!(
+        ctx.modules.len(),
+        1,
+        "module should be copied to actual state"
+    );
     assert_eq!(ctx.modules[0].name, "orders_mod");
     assert_eq!(ctx.modules[0].path, "src/orders");
 
     // API endpoints must have been copied
-    assert_eq!(ctx.api_endpoints.len(), 1, "api_endpoint should be copied to actual state");
+    assert_eq!(
+        ctx.api_endpoints.len(),
+        1,
+        "api_endpoint should be copied to actual state"
+    );
     assert_eq!(ctx.api_endpoints[0].id, "create_order");
     assert_eq!(ctx.api_endpoints[0].method, "POST");
 }
@@ -1073,8 +1102,15 @@ fn copy_state_copies_ast_edges() {
 
     store.accept(&ws).unwrap();
 
-    let actual = store.load_actual(&ws).unwrap().expect("actual should exist");
-    assert_eq!(actual.ast_edges.len(), 1, "ast_edge should be copied to actual state");
+    let actual = store
+        .load_actual(&ws)
+        .unwrap()
+        .expect("actual should exist");
+    assert_eq!(
+        actual.ast_edges.len(),
+        1,
+        "ast_edge should be copied to actual state"
+    );
     assert_eq!(actual.ast_edges[0].from_node, "OrderHandler");
     assert_eq!(actual.ast_edges[0].edge_type, "implements");
 }
@@ -1135,25 +1171,31 @@ fn accept_reset_roundtrip_preserves_all_relations() {
     let mut model = empty_model();
     model.bounded_contexts = vec![ctx];
 
-    // Save desired, then accept → actual
+    // Save implemented graph. accept/reset are compatibility no-ops in actual-first mode.
     store.save_desired(&ws, &model).unwrap();
     store.accept(&ws).unwrap();
 
-    // Now modify desired
+    // Now modify the implemented graph via the compatibility alias.
     let mut model2 = model.clone();
     model2.bounded_contexts[0].entities[0].description = "Modified payment".into();
     store.save_desired(&ws, &model2).unwrap();
 
-    // Reset → desired should revert to actual
-    let restored = store.reset(&ws).unwrap().expect("reset should return model");
+    // Reset leaves the implemented graph unchanged.
+    let restored = store
+        .reset(&ws)
+        .unwrap()
+        .expect("reset should return model");
     assert_eq!(
-        restored.bounded_contexts[0].entities[0].description,
-        "A payment",
-        "reset should restore original description from actual state"
+        restored.bounded_contexts[0].entities[0].description, "Modified payment",
+        "reset should leave the actual-first implemented graph unchanged"
     );
 
     // Modules should survive the reset roundtrip
-    assert_eq!(restored.bounded_contexts[0].modules.len(), 1, "module should survive reset");
+    assert_eq!(
+        restored.bounded_contexts[0].modules.len(),
+        1,
+        "module should survive reset"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1184,7 +1226,10 @@ fn snapshot_log_records_on_save() {
     let snaps = store.list_snapshots(&ws, "desired").unwrap();
     assert_eq!(snaps.len(), 2, "two snapshots after second save");
     // Most recent should be larger timestamp
-    assert!(snaps[0] > snaps[1], "most recent snapshot should have larger timestamp");
+    assert!(
+        snaps[0] > snaps[1],
+        "most recent snapshot should have larger timestamp"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1214,12 +1259,15 @@ fn diff_snapshots_detects_added_context() {
     let ts_new = snaps[0]; // most recent
     let ts_old = snaps[1]; // older
 
-    let diff = store.diff_snapshots(&ws, "desired", ts_old, ts_new).unwrap();
+    let diff = store
+        .diff_snapshots(&ws, "desired", ts_old, ts_new)
+        .unwrap();
     let empty_vec = vec![];
     let added = diff["added"].as_array().unwrap_or(&empty_vec);
 
     // Beta should be in added
-    let added_names: Vec<String> = added.iter()
+    let added_names: Vec<String> = added
+        .iter()
         .filter_map(|v| v["name"].as_str().map(String::from))
         .collect();
     assert!(
@@ -1262,8 +1310,15 @@ fn clear_state_retracts_api_endpoints() {
     // Endpoint should no longer appear
     let loaded2 = store.load_desired(&ws).unwrap();
     if let Some(m) = loaded2 {
-        let total_endpoints: usize = m.bounded_contexts.iter().map(|c| c.api_endpoints.len()).sum();
-        assert_eq!(total_endpoints, 0, "api_endpoints should be retracted after clear_state");
+        let total_endpoints: usize = m
+            .bounded_contexts
+            .iter()
+            .map(|c| c.api_endpoints.len())
+            .sum();
+        assert_eq!(
+            total_endpoints, 0,
+            "api_endpoints should be retracted after clear_state"
+        );
     }
     // If None, that's also fine — no data at all
 }

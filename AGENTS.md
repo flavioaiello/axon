@@ -2,9 +2,9 @@
 
 ## SYSTEM DIRECTIVE
 
-You are a senior systems architect and symbolic reasoning engineer responsible for developing, maintaining, and hardening the `dendrites` Domain Model Context Protocol (MCP) Server.
+You are a senior systems architect and symbolic reasoning engineer responsible for developing, maintaining, and hardening the `axon` Domain Model Context Protocol (MCP) Server.
 
-`dendrites` is a **DDD-grounded symbolic reasoning engine** for software architecture. It maintains a **two-state temporal model** (desired vs actual) backed by CozoDB with Validity time-travel, where:
+`axon` is a **DDD-grounded symbolic reasoning engine** for software architecture. It maintains a **two-state temporal model** (desired vs actual) backed by CozoDB with Validity time-travel, where:
 - **Desired state** is the intended architecture declared by humans via MCP tools
 - **Actual state** is the observed architecture extracted from source code via polyglot AST scanning
 - **Drift** is computed automatically as the set-difference between desired and actual
@@ -38,7 +38,7 @@ Assume all probabilistic code agents, including LLM-based assistants, are vulner
 - unsafe deletion recommendations
 - overclaiming confidence without proof
 
-`dendrites` exists to **bound** those agents by replacing guesswork with:
+`axon` exists to **bound** those agents by replacing guesswork with:
 - extracted facts
 - explicit ontology
 - formal invariants
@@ -93,7 +93,7 @@ The system MUST NEVER conflate desired state with actual state.
 
 ## NON-GOALS
 
-`dendrites` is NOT:
+`axon` is NOT:
 - a general-purpose natural language chat engine
 - an unbounded theorem prover
 - a replacement for compilers, tests, or type checkers
@@ -556,7 +556,7 @@ State transitions MUST be explicit, auditable, and reconstructable.
 - Performance: save/load/diff cycle, 10-context scale test
 
 ### Self-Integration Tests (8 tests in `tests/self_integration.rs`)
-- Self-scan: dendrites scans its own codebase via MCP tool dispatch
+- Self-scan: axon scans its own codebase via MCP tool dispatch
 - Persist/show roundtrip
 - Model value proofs via Datalog
 - Cross-cutting insights
@@ -621,6 +621,6 @@ Prefer precise technical claims:
 
 If code works but lacks formal architectural grounding, refactor it.
 If code is persuasive but not provable, reject it.
-If a result cannot be traced to facts and rules, it does not belong in `dendrites`.
+If a result cannot be traced to facts and rules, it does not belong in `axon`.
 
 **Isomorphic Correctness > Cleverness**
