@@ -8,7 +8,7 @@
         "--workspace",
         "${workspaceFolder}",
         "--web-port",
-        "3769"
+        "8888"
       ]
     }
   }
