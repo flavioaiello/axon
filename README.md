@@ -45,7 +45,7 @@ axon exposes the same live model through multiple adapters:
 | CLI | Universal fallback for Claude Code, Codex, scripts, and terminals |
 | Local web UI/API | Human inspection and extension integrations that can call HTTP |
 
-### VS Code / GitHub Copilot
+### VS Code / VSCodium / GitHub Copilot
 
 Add to `.vscode/mcp.json` in your project:
 
@@ -63,7 +63,35 @@ Add to `.vscode/mcp.json` in your project:
 
 Once configured, Copilot gains access to all axon tools, resources, and prompts automatically.
 
-Claude Code and Codex integrations can use the same MCP configuration when their extension supports MCP. Otherwise, use the CLI or local web API against the running `axon web` process.
+VSCodium does not provide MCP by itself; MCP support comes from the installed agent extension or from an external CLI. Use the same `axon serve ...` command in whichever MCP client you run.
+
+### Claude Code
+
+When using Claude Code from a VS Code or VSCodium terminal, register axon as a stdio MCP server:
+
+```bash
+claude mcp add axon -- axon serve --workspace "$PWD"
+```
+
+If `axon` is not on `PATH`, use the absolute binary path instead:
+
+```bash
+claude mcp add axon -- /path/to/axon serve --workspace /path/to/rust/workspace
+```
+
+Claude Code extensions that expose MCP settings can use the same command and args as the VS Code MCP JSON above.
+
+### Codex
+
+For Codex CLI, add axon to `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.axon]
+command = "axon"
+args = ["serve", "--workspace", "/absolute/path/to/rust/workspace"]
+```
+
+If you launch Codex from the project directory and your Codex version supports environment expansion in config, point `--workspace` at that workspace path. Otherwise prefer an absolute path. Codex extensions for VS Code or VSCodium should use the same MCP server command when they provide MCP configuration.
 
 ## MCP tools
 
