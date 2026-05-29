@@ -33,21 +33,22 @@ struct ImportVisitor {
 
 impl<'ast> Visit<'ast> for ImportVisitor {
     fn visit_use_tree(&mut self, node: &'ast syn::UseTree) {
-        // Very basic extraction: turn use trees into string paths
         fn extract_paths(tree: &syn::UseTree, prefix: &str) -> Vec<String> {
+            fn join(prefix: &str, segment: &str) -> String {
+                if prefix.is_empty() {
+                    segment.to_string()
+                } else {
+                    format!("{prefix}::{segment}")
+                }
+            }
+
             match tree {
-                syn::UseTree::Path(path) => extract_paths(
-                    &path.tree,
-                    &format!(
-                        "{}{}{}::",
-                        prefix,
-                        if prefix.is_empty() { "" } else { "::" },
-                        path.ident
-                    ),
-                ),
-                syn::UseTree::Name(name) => vec![format!("{}{}", prefix, name.ident)],
-                syn::UseTree::Rename(rename) => vec![format!("{}{}", prefix, rename.ident)],
-                syn::UseTree::Glob(_) => vec![format!("{}*", prefix)],
+                syn::UseTree::Path(path) => {
+                    extract_paths(&path.tree, &join(prefix, &path.ident.to_string()))
+                }
+                syn::UseTree::Name(name) => vec![join(prefix, &name.ident.to_string())],
+                syn::UseTree::Rename(rename) => vec![join(prefix, &rename.ident.to_string())],
+                syn::UseTree::Glob(_) => vec![join(prefix, "*")],
                 syn::UseTree::Group(group) => {
                     let mut paths = vec![];
                     for item in &group.items {
@@ -58,7 +59,6 @@ impl<'ast> Visit<'ast> for ImportVisitor {
             }
         }
         self.imports.extend(extract_paths(node, ""));
-        syn::visit::visit_use_tree(self, node);
     }
 }
 
@@ -1396,11 +1396,11 @@ mod tests {
             use crate::domain::model::DomainModel;
         "#;
         let deps = extract_live_dependencies(Path::new("test.rs"), code).unwrap();
-        // The visitor walks recursively, producing entries for each nesting level.
-        // std::path::Path → 3 entries, crate::domain::model::DomainModel → 4 entries.
-        assert!(deps.len() >= 2);
-        assert!(deps.iter().any(|d| d.to_module.contains("Path")));
-        assert!(deps.iter().any(|d| d.to_module.contains("DomainModel")));
+        let modules: Vec<&str> = deps.iter().map(|dep| dep.to_module.as_str()).collect();
+        assert_eq!(
+            modules,
+            vec!["std::path::Path", "crate::domain::model::DomainModel"]
+        );
     }
 
     #[test]

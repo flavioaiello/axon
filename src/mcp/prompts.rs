@@ -53,8 +53,8 @@ fn build_guidelines_prompt(
 
     let bootstrap = if is_empty {
         "\n**This project has no architecture model yet.** \
-            Analyze the codebase first: identify crates, modules, structs, imports, and calls using `sync` \
-            (changes update the implemented Rust architecture graph). Use `define` only to enrich semantic overlays.\n"
+            Analyze the codebase first: identify crates, modules, structs, imports, and calls using `rust_scan` \
+            (changes update the actual Rust graph). Use `rust_annotations` only to enrich semantic overlays.\n"
     } else {
         ""
     };
@@ -89,22 +89,22 @@ fn build_guidelines_prompt(
 
 Axon tracks the **implemented Rust architecture**: source-extracted Rust facts are ground truth; DDD and pattern terms are semantic overlays.
 
-1. **Read the status quo** → call `architecture` (Rust ontology summary + health score + recent temporal changes)
-2. **Refresh from source** → call `sync` after code changes; the watcher usually does this automatically
+1. **Read the status quo** → call `rust_status` (Rust ontology summary + health score + recent temporal changes)
+2. **Refresh from source** → call `rust_scan` after code changes; the watcher usually does this automatically
 3. **Use the overview correctly** → the web graph intentionally shows only crate/module/submodule/struct; MCP keeps source files, symbols, imports, and calls available for precision
-4. **Enrich missing semantics** → call `define` only when static extraction needs DDD/policy labels or ownership context
-5. **Analyze impact** → call `impact` with module/struct/symbol aliases and analysis type (dependency_graph, call_graph_callers, call_graph_reachability, etc.)
-6. **Review history** → call `drift` or `history` to compare recent implemented graph snapshots
-7. **Constrain architecture** → call `constrain` to declare layers and forbidden/allowed dependencies
+4. **Enrich missing semantics** → call `rust_annotations` only when static extraction needs DDD/policy labels or ownership context
+5. **Analyze impact** → call `rust_impact` with module/struct/symbol aliases and analysis type (dependency_graph, call_graph_callers, call_graph_reachability, etc.)
+6. **Review history** → call `rust_diff` or `rust_history` to compare recent actual graph snapshots
+7. **Constrain architecture** → call `rust_constraints` to declare layers and forbidden/allowed dependencies
 
 ### Continuous Improvement
 
 Use `diagnose` as the improvement loop:
 
-1. **Diagnose** → call `refactor` with `action: "diagnose"` — runs full analysis and returns prioritized `next_actions`
+1. **Diagnose** → call `rust_diagnose` with `action: "diagnose"` — runs full analysis and returns prioritized `next_actions`
 2. **Follow next_actions** → implement the highest-priority fix
-3. **Re-scan** → call `sync` to update the implemented architecture from source
-4. **Diagnose again** → call `refactor` with `action: "diagnose"` — health score should improve
+3. **Re-scan** → call `rust_scan` to update the actual Rust graph from source
+4. **Diagnose again** → call `rust_diagnose` with `action: "diagnose"` — health score should improve
 5. **Iterate** until `status: "healthy"` (score 100)
 {rules_section}
 {health_section}"#
@@ -283,11 +283,8 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let path = std::env::temp_dir().join(format!(
-            "axon_prompt_test_{}_{}.db",
-            std::process::id(),
-            id
-        ));
+        let path =
+            std::env::temp_dir().join(format!("axon_prompt_test_{}_{}.db", std::process::id(), id));
         Store::open(&path).unwrap()
     }
 
@@ -335,8 +332,8 @@ mod tests {
         let text = match &prompt.messages[0].content {
             ContentBlock::Text { text } => text,
         };
-        assert!(text.contains("`impact`"));
-        assert!(text.contains("`architecture`"));
+        assert!(text.contains("`rust_impact`"));
+        assert!(text.contains("`rust_status`"));
     }
 
     #[test]

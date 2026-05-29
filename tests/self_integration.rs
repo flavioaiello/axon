@@ -29,11 +29,7 @@ use axon::store::cozo::canonicalize_path;
 fn temp_store() -> Store {
     static CTR: AtomicU64 = AtomicU64::new(0);
     let id = CTR.fetch_add(1, Ordering::SeqCst);
-    let path = temp_dir().join(format!(
-        "axon_self_integ_{}_{}.db",
-        std::process::id(),
-        id
-    ));
+    let path = temp_dir().join(format!("axon_self_integ_{}_{}.db", std::process::id(), id));
     Store::open(&path).expect("Failed to open temp store")
 }
 
@@ -69,8 +65,8 @@ fn self_scan_persist_show_roundtrip() {
     let ws = ws_root.to_string_lossy().to_string();
 
     // ── Step 1: Scan actual model from axon source ────────────────
-    let actual = scan_actual_model(&ws_root, None)
-        .expect("scan_actual_model must succeed on axon source");
+    let actual =
+        scan_actual_model(&ws_root, None).expect("scan_actual_model must succeed on axon source");
 
     // axon has src/{domain,mcp,server,store} → at least 4 bounded contexts
     assert!(
@@ -820,8 +816,7 @@ fn self_diagnose_improvement_loop() {
     eprintln!("── Diagnose results ──");
     eprintln!("  Status: {}", report["status"]);
     eprintln!("  Health score: {}", report["health_score"]);
-    eprintln!("  Has actual: {}", report["has_actual_model"]);
-    eprintln!("  Has desired: {}", report["has_desired_model"]);
+    eprintln!("  Has implemented: {}", report["has_implemented_model"]);
 
     // Must have a health score
     let score = report["health_score"]
@@ -868,12 +863,8 @@ fn self_diagnose_improvement_loop() {
     // After scan, models are in sync so no drift, but aggregate quality
     // issues should be detected (axon has aggregate roots without invariants)
     assert!(
-        report["has_actual_model"].as_bool().unwrap(),
-        "must have actual model after scan"
-    );
-    assert!(
-        report["has_desired_model"].as_bool().unwrap(),
-        "must have desired model after scan"
+        report["has_implemented_model"].as_bool().unwrap(),
+        "must have implemented model after scan"
     );
 
     eprintln!("── Self-improvement loop: diagnose verified ──");

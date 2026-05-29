@@ -1,20 +1,3 @@
-<p align="center">
-  <img src="axon.svg" alt="axon" width="420"/>
-</p>
-
-<p align="center">
-  <strong>Live Rust structure graph for AI coding agents</strong><br/>
-  <em>Repo-grounded symbolic reasoning over the implemented architecture</em>
-</p>
-
-<p align="center">
-  <a href="https://github.com/flavioaiello/axon/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-7c3aed" alt="MIT License"/></a>
-  <img src="https://img.shields.io/badge/rust-2024_edition-f97316" alt="Rust 2024"/>
-  <img src="https://img.shields.io/badge/MCP-2025--03--26-14b8a6" alt="MCP Spec"/>
-</p>
-
----
-
 ## What is axon?
 
 **axon** is a local Rust architecture intelligence server for AI coding agents. Instead of letting agents guess about your codebase structure, axon extracts Rust facts from source code, stores them as machine-checkable relations in an embedded Datalog engine ([CozoDB](https://www.cozodb.org/)), and answers architectural questions with **proof-carrying results**.
@@ -84,29 +67,32 @@ Claude Code and Codex integrations can use the same MCP configuration when their
 
 ## MCP tools
 
-The canonical tool names below are exposed directly. Short aliases are also available for interactive use: `architecture`, `impact`, `safe_to_delete`, `check`, `how_connected`, `why`, `drift`, `search`, `define`, `sync`, `refactor`, and `constrain`.
+The canonical tool names are Rust-native and actual-state first. Legacy names such as `architecture`, `query_blast_radius`, `scan_model`, and `set_model` remain callable for compatibility, but they are not advertised by `tools/list`.
 
 ### Read tools
 
 | Tool | Description |
 |:-----|:------------|
-| `get_model` | Returns the implemented Rust ontology contract with health and temporal change status |
-| `model_health` | Structured health report via Datalog — score (0–100), cycles, violations, complexity |
-| `query_blast_radius` | Downstream impact analysis over modules, structs, symbols, dependencies, fields, methods, and calls |
-| `can_delete_symbol` | Proof-backed safe-deletion check for structs/symbols with inbound reference witnesses |
-| `check_architectural_invariant` | Evaluate invariants: layer violations, cycles, aggregate quality, orphans |
-| `query_dependency_path` | Return proof paths between Rust modules/components |
-| `explain_violation` | Evidence-backed explanation with witness paths for any violation |
-| `diff_models` | Compare recent implemented graph snapshots — added/removed entities and changes |
+| `rust_status` | Current actual-state Rust model: crates, modules, source files, symbols, imports, calls, semantic annotations, health, and snapshot freshness |
+| `rust_graph` | Bounded graph-database views over Rust modules, source files, symbols, imports, calls, AST edges, neighborhoods, paths, and relation counts; repeated facts are returned as compact `schema` + `cols` + `rows` JSON |
+| `rust_health` | Structured Datalog health report: score (0–100), cycles, violations, missing invariants, orphan modules/contexts, and graph analytics when available |
+| `rust_impact` | Blast-radius analysis over modules, structs, symbols, dependencies, fields, methods, and call graph reachability |
+| `rust_delete_safety` | Proof-backed safe-deletion check for structs/symbols with inbound call/import/AST witnesses; module is optional |
+| `rust_invariants` | Evaluate actual graph invariants and configured constraints: layer violations, cycles, aggregate quality, orphans, policy violations, drift freshness |
+| `rust_path` | Return proof paths between Rust modules/components |
+| `rust_explain` | Evidence-backed explanation with witness paths for failing invariants or constraints |
+| `rust_diff` | Compare recent actual Rust graph snapshots — added/removed facts and changes |
+| `rust_history` | List actual Rust graph snapshots or compare two snapshot timestamps |
+| `rust_search` | Search Rust facts and semantic annotations by keyword |
 
 ### Write tools
 
 | Tool | Description |
 |:-----|:------------|
-| `set_model` | Create, update, or remove semantic overlays on top of Rust facts |
-| `scan_model` | AST-scan workspace source code and populate the implemented Rust fact graph |
-| `refactor_model` | Diagnose and plan from implemented facts; `accept`/`reset` are compatibility no-ops in actual-first mode |
-| `assert_model` | Declare constraints: layer assignments, allowed/forbidden dependencies |
+| `rust_scan` | AST-scan workspace source code and refresh the actual Rust fact graph; use `rust_graph` to inspect persisted facts |
+| `rust_annotations` | Create, update, or remove semantic annotations on top of Rust facts; does not mutate source-extracted ground truth |
+| `rust_diagnose` | Diagnose and plan from actual Rust facts; `accept`/`reset` are compatibility no-ops in actual-first mode |
+| `rust_constraints` | Declare and evaluate constraints: layer assignments, allowed/forbidden dependencies |
 
 ### Resources
 
@@ -138,11 +124,11 @@ All commands accept `--workspace <path>` (defaults to current directory).
 Examples:
 
 ```bash
-axon web --workspace . --port 3769
-axon serve --workspace . --web-port 3769
+axon web --workspace .
+axon serve --workspace .
 ```
 
-Open `http://127.0.0.1:3769` to inspect the live Rust architecture overview. If the port is occupied, axon automatically tries the next available port and prints the URL.
+Open `http://127.0.0.1:8888` to inspect the live Rust architecture overview. If the port is occupied, axon reports a bind error instead of switching ports.
 
 ## How it works
 
@@ -211,7 +197,20 @@ The system never guesses. If it can't prove a claim, it returns `unknown`.
 
 ## Example tool outputs
 
-### `model_health`
+### `rust_graph`
+
+```json
+{
+  "schema": "axon.rust_graph.relations.v1",
+  "format": "schema_rows",
+  "view": "relations",
+  "cols": ["rel", "count"],
+  "rows": [["symbol", 210], ["calls_symbol", 2952]],
+  "proof": { "rule": "bounded Rust graph query over persisted Cozo relations" }
+}
+```
+
+### `rust_health`
 
 ```json
 {
@@ -229,7 +228,7 @@ The system never guesses. If it can't prove a claim, it returns `unknown`.
 }
 ```
 
-### `can_delete_symbol`
+### `rust_delete_safety`
 
 ```json
 {
@@ -245,7 +244,7 @@ The system never guesses. If it can't prove a claim, it returns `unknown`.
 }
 ```
 
-### `diff_models`
+### `rust_diff`
 
 ```json
 {

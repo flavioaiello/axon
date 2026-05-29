@@ -21,7 +21,7 @@ enum Commands {
         #[arg(short, long)]
         workspace: Option<String>,
 
-        /// Local web graph port (falls back upward if occupied)
+        /// Local web graph port
         #[arg(long, default_value_t = server::web::DEFAULT_WEB_PORT)]
         web_port: u16,
     },
@@ -32,7 +32,7 @@ enum Commands {
         #[arg(short, long)]
         workspace: Option<String>,
 
-        /// Local web graph port (falls back upward if occupied)
+        /// Local web graph port
         #[arg(short, long, default_value_t = server::web::DEFAULT_WEB_PORT)]
         port: u16,
     },

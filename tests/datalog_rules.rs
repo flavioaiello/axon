@@ -8,6 +8,7 @@
 //! dependency paths, model health, drift computation, and search.
 
 use std::env::temp_dir;
+use std::fs;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use axon::domain::model::*;
@@ -19,11 +20,7 @@ use axon::store::cozo::canonicalize_path;
 fn temp_store() -> Store {
     static CTR: AtomicU64 = AtomicU64::new(0);
     let id = CTR.fetch_add(1, Ordering::SeqCst);
-    let path = temp_dir().join(format!(
-        "axon_datalog_{}_{}.db",
-        std::process::id(),
-        id
-    ));
+    let path = temp_dir().join(format!("axon_datalog_{}_{}.db", std::process::id(), id));
     Store::open(&path).unwrap()
 }
 
@@ -379,8 +376,81 @@ fn policy_violation_none_when_no_forbidden() {
     store.save_desired(&ws, &model).unwrap();
 
     let result = store.evaluate_policy_violations(&canon).unwrap();
-    assert_eq!(result["status"], "true");
+    assert_eq!(result["status"], "unconfigured");
+    assert_eq!(result["configured"], false);
     assert_eq!(result["count"], 0);
+    assert_eq!(result["policy_coverage"]["dependency_constraint_count"], 0);
+}
+
+#[test]
+fn policy_violation_none_when_policy_configured() {
+    let store = temp_store();
+    let ws = ws();
+    let canon = canonicalize(&ws);
+    let mut model = empty_model();
+    let mut a = empty_ctx("A");
+    a.dependencies = vec!["B".into()];
+    let b = empty_ctx("B");
+    model.bounded_contexts = vec![a, b];
+    store.save_desired(&ws, &model).unwrap();
+
+    store
+        .upsert_layer_assignment(&canon, "A", "domain")
+        .unwrap();
+    store
+        .upsert_layer_assignment(&canon, "B", "infrastructure")
+        .unwrap();
+    store
+        .upsert_dependency_constraint(&canon, "layer", "infrastructure", "domain", "forbidden")
+        .unwrap();
+
+    let result = store.evaluate_policy_violations(&canon).unwrap();
+    assert_eq!(result["status"], "true");
+    assert_eq!(result["configured"], true);
+    assert_eq!(result["count"], 0);
+}
+
+#[test]
+fn policy_assignments_survive_store_reopen_for_crate_root() {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = temp_dir().join(format!(
+        "axon_policy_reopen_{}_{}",
+        std::process::id(),
+        unique
+    ));
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"policy-reopen\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .unwrap();
+    let ws = canonicalize_path(&root.to_string_lossy());
+
+    {
+        let store = Store::open(&root).unwrap();
+        store.upsert_layer_assignment(&ws, "A", "domain").unwrap();
+        store
+            .upsert_dependency_constraint(&ws, "layer", "domain", "infrastructure", "forbidden")
+            .unwrap();
+    }
+
+    let reopened = Store::open(&root).unwrap();
+    assert_eq!(
+        reopened.list_layer_assignments(&ws).unwrap(),
+        vec![("A".into(), "domain".into())]
+    );
+    assert_eq!(
+        reopened.list_dependency_constraints(&ws).unwrap(),
+        vec![(
+            "layer".into(),
+            "domain".into(),
+            "infrastructure".into(),
+            "forbidden".into()
+        )]
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -425,7 +495,11 @@ fn dependency_path_transitive() {
     let paths = store
         .query_dependency_path(&canonicalize(&ws), "A", "D")
         .unwrap();
-    assert!(paths.len() >= 3, "Transitive path A→B→C→D has 3 edges");
+    assert!(
+        paths.iter().any(|path| path == &vec!["A", "B", "C", "D"]),
+        "Transitive path A->B->C->D must be returned as an ordered path: {:?}",
+        paths
+    );
 }
 
 #[test]
@@ -558,6 +632,99 @@ fn cannot_delete_entity_with_repository() {
             && r["start_line"] == 4
             && r["end_line"] == 40
     }));
+}
+
+#[test]
+fn cannot_delete_symbol_with_actual_import_reference() {
+    let store = temp_store();
+    let ws = ws();
+    let mut model = empty_model();
+    model.import_edges = vec![ImportEdge {
+        from_file: "src/server/stdio.rs".into(),
+        to_module: "crate::store::Store".into(),
+        context: "server".into(),
+    }];
+    store.save_actual(&ws, &model).unwrap();
+
+    let result = store
+        .can_delete_symbol(&canonicalize(&ws), "", "Store")
+        .unwrap();
+    assert_eq!(result["can_delete"], false);
+    let import_refs = result["import_references"].as_array().unwrap();
+    assert!(import_refs.iter().any(|reference| {
+        reference["file"] == "src/server/stdio.rs"
+            && reference["import"] == "crate::store::Store"
+            && reference["context"] == "server"
+    }));
+}
+
+#[test]
+fn cannot_delete_symbol_with_field_type_reference() {
+    let store = temp_store();
+    let ws = ws();
+    let mut model = empty_model();
+    let mut ctx = empty_ctx("Policy");
+    ctx.entities = vec![Entity {
+        name: "HealthReport".into(),
+        description: "".into(),
+        aggregate_root: false,
+        fields: vec![Field {
+            name: "coverage".into(),
+            field_type: "Option<PolicyCoverage>".into(),
+            required: false,
+            description: "".into(),
+        }],
+        methods: vec![],
+        invariants: vec![],
+        file_path: None,
+        start_line: None,
+        end_line: None,
+    }];
+    model.bounded_contexts = vec![ctx];
+    store.save_actual(&ws, &model).unwrap();
+
+    let result = store
+        .can_delete_symbol(&canonicalize(&ws), "", "PolicyCoverage")
+        .unwrap();
+    assert_eq!(result["can_delete"], false);
+    assert_eq!(
+        result["type_references"]["fields"][0]["owner"],
+        "HealthReport"
+    );
+    assert_eq!(
+        result["type_references"]["fields"][0]["field_type"],
+        "Option<PolicyCoverage>"
+    );
+}
+
+#[test]
+fn cannot_delete_qualified_symbol_with_short_call_reference() {
+    let store = temp_store();
+    let ws = ws();
+    let mut model = empty_model();
+    model.symbols = vec![SymbolDef {
+        name: "Store::query_call_paths".into(),
+        kind: "method".into(),
+        context: "store".into(),
+        file_path: "src/store/cozo.rs".into(),
+        start_line: 1,
+        end_line: 20,
+        visibility: "public".into(),
+    }];
+    model.call_edges = vec![CallEdge {
+        caller: "ReasoningKernel::how_connected_claim".into(),
+        callee: "query_call_paths".into(),
+        file_path: "src/reasoning/mod.rs".into(),
+        line: 10,
+        context: "reasoning".into(),
+    }];
+    store.save_actual(&ws, &model).unwrap();
+
+    let result = store
+        .can_delete_symbol(&canonicalize(&ws), "", "Store::query_call_paths")
+        .unwrap();
+    assert_eq!(result["can_delete"], false);
+    assert_eq!(result["call_references"][0]["callee"], "query_call_paths");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -723,10 +890,66 @@ fn impact_analysis_events_and_dependents() {
 //  9. Graph algorithms
 // ═══════════════════════════════════════════════════════════════════════════
 
-// NOTE: PageRank, CommunityDetectionLouvain, BetweennessCentrality, and
-// TopologicalSort tests are omitted because CozoDB's `minimal` feature
-// (used by cozo-ce) does not include these fixed rules. The methods in
-// Store gracefully degrade via unwrap_or_default() in model_health().
+// NOTE: PageRank, CommunityDetectionLouvain, and BetweennessCentrality depend
+// on optional Cozo fixed rules. Pure graph algorithms stay covered here.
+
+#[test]
+fn degree_centrality_counts_context_edges() {
+    let store = temp_store();
+    let ws = ws();
+    let mut model = empty_model();
+    let mut a = empty_ctx("A");
+    a.dependencies = vec!["B".into(), "C".into()];
+    let mut b = empty_ctx("B");
+    b.dependencies = vec!["C".into()];
+    let c = empty_ctx("C");
+    model.bounded_contexts = vec![a, b, c];
+    store.save_actual(&ws, &model).unwrap();
+
+    let degrees = store.degree_centrality(&canonicalize(&ws)).unwrap();
+    assert!(
+        degrees.iter().any(|row| row == &("A".into(), 0, 2)),
+        "A degree missing: {:?}",
+        degrees
+    );
+    assert!(
+        degrees.iter().any(|row| row == &("B".into(), 1, 1)),
+        "B degree missing: {:?}",
+        degrees
+    );
+    assert!(
+        degrees.iter().any(|row| row == &("C".into(), 2, 0)),
+        "C degree missing: {:?}",
+        degrees
+    );
+}
+
+#[test]
+fn topological_order_returns_acyclic_order_without_fixed_rules() {
+    let store = temp_store();
+    let ws = ws();
+    let mut model = empty_model();
+    let mut a = empty_ctx("A");
+    a.dependencies = vec!["B".into(), "C".into()];
+    let mut b = empty_ctx("B");
+    b.dependencies = vec!["C".into()];
+    let c = empty_ctx("C");
+    model.bounded_contexts = vec![a, b, c];
+    store.save_actual(&ws, &model).unwrap();
+
+    let result = store.topological_order(&canonicalize(&ws)).unwrap();
+    assert_eq!(result["status"], "acyclic");
+    let order = result["order"].as_array().unwrap();
+    assert_eq!(order.len(), 3, "unexpected topological order: {:?}", result);
+    let position = |name: &str| {
+        order
+            .iter()
+            .position(|item| item["context"] == name)
+            .unwrap()
+    };
+    assert!(position("C") < position("B"));
+    assert!(position("B") < position("A"));
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 10. Model health composite score
@@ -771,6 +994,38 @@ fn model_health_perfect_score() {
     );
     assert!(health.circular_deps.is_empty());
     assert!(health.layer_violations.is_empty());
+}
+
+#[test]
+fn model_health_reports_policy_coverage_gaps() {
+    let store = temp_store();
+    let ws = ws();
+    let mut model = empty_model();
+    let mut a = empty_ctx("A");
+    a.dependencies = vec!["B".into()];
+    let b = empty_ctx("B");
+    model.bounded_contexts = vec![a, b];
+    store.save_desired(&ws, &model).unwrap();
+
+    let canon = canonicalize(&ws);
+    let health = store.model_health(&canon).unwrap();
+    assert_eq!(health.policy_coverage.context_count, 2);
+    assert_eq!(health.policy_coverage.layer_assignment_count, 0);
+    assert_eq!(health.policy_coverage.dependency_constraint_count, 0);
+    assert_eq!(health.policy_coverage.missing_layer_assignments.len(), 2);
+    assert!(health.score < 100);
+
+    store
+        .upsert_layer_assignment(&canon, "A", "application")
+        .unwrap();
+    store
+        .upsert_dependency_constraint(&canon, "layer", "domain", "infrastructure", "forbidden")
+        .unwrap();
+
+    let updated = store.model_health(&canon).unwrap();
+    assert_eq!(updated.policy_coverage.layer_assignment_count, 1);
+    assert_eq!(updated.policy_coverage.dependency_constraint_count, 1);
+    assert_eq!(updated.policy_coverage.missing_layer_assignments, vec!["B"]);
 }
 
 #[test]
@@ -931,6 +1186,39 @@ fn search_architecture_finds_by_description() {
     );
 }
 
+#[test]
+fn search_architecture_finds_policy_constraints() {
+    let store = temp_store();
+    let ws = ws();
+    let canon = canonicalize(&ws);
+    let mut model = empty_model();
+    model.bounded_contexts = vec![empty_ctx("Domain"), empty_ctx("Infra")];
+    store.save_actual(&ws, &model).unwrap();
+    store
+        .upsert_layer_assignment(&canon, "Domain", "domain")
+        .unwrap();
+    store
+        .upsert_dependency_constraint(&canon, "layer", "domain", "infrastructure", "forbidden")
+        .unwrap();
+
+    let result = store
+        .search_text(&canon, "policy dependency constraints architecture", 20)
+        .unwrap();
+    let results = result["results"].as_array().unwrap();
+    assert!(
+        results
+            .iter()
+            .any(|item| item["kind"] == "dependency_constraint"),
+        "dependency constraint missing from search results: {result:?}"
+    );
+    assert!(
+        results
+            .iter()
+            .any(|item| item["kind"] == "layer_assignment"),
+        "layer assignment missing from search results: {result:?}"
+    );
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // 14. Call graph queries
 // ═══════════════════════════════════════════════════════════════════════════
@@ -986,7 +1274,107 @@ fn call_graph_callers_and_callees() {
 }
 
 #[test]
+fn call_graph_queries_accept_qualified_and_short_symbol_aliases() {
+    let store = temp_store();
+    let ws = ws();
+    let mut model = empty_model();
+    model.call_edges = vec![
+        CallEdge {
+            caller: "ReasoningKernel::how_connected_claim".into(),
+            callee: "query_call_paths".into(),
+            file_path: "src/reasoning/mod.rs".into(),
+            line: 10,
+            context: "reasoning".into(),
+        },
+        CallEdge {
+            caller: "Store::query_call_paths".into(),
+            callee: "collect_dependency_paths".into(),
+            file_path: "src/store/cozo.rs".into(),
+            line: 20,
+            context: "store".into(),
+        },
+    ];
+    store.save_actual(&ws, &model).unwrap();
+    let canon = canonicalize(&ws);
+
+    let callers = store
+        .call_graph_callers(&canon, "Store::query_call_paths")
+        .unwrap();
+    assert_eq!(callers["count"], 1);
+    assert_eq!(
+        callers["callers"][0]["caller"],
+        "ReasoningKernel::how_connected_claim"
+    );
+
+    let callees = store
+        .call_graph_callees(&canon, "query_call_paths")
+        .unwrap();
+    assert_eq!(callees["count"], 1);
+    assert_eq!(callees["callees"][0]["callee"], "collect_dependency_paths");
+
+    let reachable = store
+        .call_graph_reachability(&canon, "query_call_paths")
+        .unwrap();
+    assert!(
+        reachable["reachable"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item == "collect_dependency_paths")
+    );
+}
+
+#[test]
 fn call_graph_stats_summary() {
+    let store = temp_store();
+    let ws = ws();
+    let mut model = empty_model();
+    model.call_edges = vec![
+        CallEdge {
+            caller: "a".into(),
+            callee: "b".into(),
+            file_path: "".into(),
+            line: 1,
+            context: "".into(),
+        },
+        CallEdge {
+            caller: "a".into(),
+            callee: "c".into(),
+            file_path: "".into(),
+            line: 2,
+            context: "".into(),
+        },
+        CallEdge {
+            caller: "b".into(),
+            callee: "c".into(),
+            file_path: "".into(),
+            line: 3,
+            context: "".into(),
+        },
+    ];
+    model.symbols = vec![SymbolDef {
+        name: "Project::c".into(),
+        kind: "method".into(),
+        context: "".into(),
+        file_path: "src/lib.rs".into(),
+        start_line: 1,
+        end_line: 1,
+        visibility: "private".into(),
+    }];
+    store.save_actual(&ws, &model).unwrap();
+
+    let stats = store.call_graph_stats(&canonicalize(&ws)).unwrap();
+    assert_eq!(stats["total_edges"], 3);
+    assert_eq!(stats["unique_callers"], 2); // a, b
+    assert_eq!(stats["unique_callees"], 2); // b, c
+    assert_eq!(stats["project_callee_edges"], 2);
+    assert_eq!(stats["unique_project_callees"], 1);
+    assert_eq!(stats["hottest_project_callees"][0]["callee"], "c");
+    assert_eq!(stats["hottest_project_callees"][0]["call_count"], 2);
+}
+
+#[test]
+fn rust_graph_relation_counts_match_call_graph_stats() {
     let store = temp_store();
     let ws = ws();
     let mut model = empty_model();
@@ -1015,10 +1403,31 @@ fn call_graph_stats_summary() {
     ];
     store.save_actual(&ws, &model).unwrap();
 
-    let stats = store.call_graph_stats(&canonicalize(&ws)).unwrap();
+    let canon = canonicalize(&ws);
+    let counts = store.rust_graph_relation_counts(&canon).unwrap();
+    let stats = store.call_graph_stats(&canon).unwrap();
+
+    assert_eq!(counts.get("calls_symbol"), Some(&3));
     assert_eq!(stats["total_edges"], 3);
-    assert_eq!(stats["unique_callers"], 2); // a, b
-    assert_eq!(stats["unique_callees"], 2); // b, c
+    assert_eq!(
+        counts["calls_symbol"],
+        stats["total_edges"].as_u64().unwrap() as usize
+    );
+
+    let graph = store
+        .query_rust_graph(&canon, &serde_json::json!({ "view": "relations" }))
+        .unwrap();
+    assert_eq!(graph["relation_counts"]["calls_symbol"], 3);
+
+    let filtered = store
+        .query_rust_graph(
+            &canon,
+            &serde_json::json!({ "view": "relations", "relation": "calls_symbol" }),
+        )
+        .unwrap();
+    assert_eq!(filtered["summary"]["relation_count"], 1);
+    assert_eq!(filtered["relation_counts"]["calls_symbol"], 3);
+    assert!(filtered["relation_counts"]["import_edge"].is_null());
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

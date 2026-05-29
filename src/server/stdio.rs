@@ -17,6 +17,10 @@ fn load_model(store: &Store, workspace_path: &str) -> DomainModel {
 
 /// List of write-tool names used to route `tools/call` to the mutable path.
 const WRITE_TOOLS: &[&str] = &[
+    "rust_scan",
+    "rust_annotations",
+    "rust_diagnose",
+    "rust_constraints",
     "define",
     "sync",
     "refactor",
@@ -327,11 +331,8 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let path = std::env::temp_dir().join(format!(
-            "axon_stdio_test_{}_{}.db",
-            std::process::id(),
-            id
-        ));
+        let path =
+            std::env::temp_dir().join(format!("axon_stdio_test_{}_{}.db", std::process::id(), id));
         std::sync::Arc::new(Store::open(&path).unwrap())
     }
 
@@ -397,12 +398,14 @@ mod tests {
         let result = resp.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert!(names.contains(&"architecture"));
-        assert!(names.contains(&"impact"));
-        assert!(names.contains(&"define"));
-        assert!(names.contains(&"refactor"));
-        assert!(names.contains(&"drift"));
-        assert!(names.contains(&"history"));
+        assert!(names.contains(&"rust_status"));
+        assert!(names.contains(&"rust_impact"));
+        assert!(names.contains(&"rust_scan"));
+        assert!(names.contains(&"rust_diagnose"));
+        assert!(names.contains(&"rust_diff"));
+        assert!(names.contains(&"rust_history"));
+        assert!(!names.contains(&"architecture"));
+        assert!(!names.contains(&"define"));
     }
 
     #[test]

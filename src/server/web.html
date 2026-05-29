@@ -1,0 +1,1149 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Axon Architecture Map</title>
+  <style>
+    :root {
+      --canvas: #101211;
+      --canvas-2: #171814;
+      --panel: #1d1e1a;
+      --panel-2: #242620;
+      --stroke: #3a403a;
+      --stroke-soft: #2a302b;
+      --text: #f4efe2;
+      --muted: #aeb5ad;
+      --quiet: #777f77;
+      --crate: #46b9a7;
+      --module: #70b8d6;
+      --struct: #e6b655;
+      --imports: #6fb7d8;
+      --calls: #d96a4f;
+      --focus: #f0c35a;
+      --danger: #d96a4f;
+    }
+
+    * { box-sizing: border-box; }
+
+    html,
+    body { min-height: 100%; }
+
+    body {
+      margin: 0;
+      height: 100vh;
+      overflow: hidden;
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr);
+      background:
+        linear-gradient(120deg, rgba(112, 184, 214, 0.12), transparent 32%),
+        linear-gradient(210deg, rgba(230, 182, 85, 0.12), transparent 36%),
+        repeating-linear-gradient(90deg, rgba(244, 239, 226, 0.025) 0, rgba(244, 239, 226, 0.025) 1px, transparent 1px, transparent 64px),
+        repeating-linear-gradient(0deg, rgba(244, 239, 226, 0.018) 0, rgba(244, 239, 226, 0.018) 1px, transparent 1px, transparent 64px),
+        linear-gradient(135deg, var(--canvas), var(--canvas-2));
+      color: var(--text);
+      font: 14px/1.45 "Avenir Next", "Gill Sans", "Trebuchet MS", sans-serif;
+      letter-spacing: 0;
+    }
+
+    button,
+    input { font: inherit; }
+
+    .topbar {
+      position: relative;
+      z-index: 3;
+      display: grid;
+      grid-template-columns: minmax(220px, 1fr) minmax(280px, 520px) auto;
+      gap: 16px;
+      align-items: center;
+      padding: 14px 18px;
+      border-bottom: 1px solid rgba(244, 239, 226, 0.12);
+      background: rgba(16, 18, 17, 0.92);
+      backdrop-filter: blur(18px);
+    }
+
+    .brand {
+      min-width: 0;
+      display: flex;
+      align-items: baseline;
+      gap: 14px;
+    }
+
+    h1,
+    h2,
+    h3,
+    p { margin: 0; }
+
+    h1 {
+      font-size: 25px;
+      font-weight: 800;
+      line-height: 1;
+    }
+
+    h2 {
+      font-size: 12px;
+      font-weight: 800;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+
+    h3 { font-size: 15px; }
+
+    #subtitle {
+      overflow: hidden;
+      color: var(--muted);
+      white-space: nowrap;
+      text-overflow: ellipsis;
+    }
+
+    .search {
+      min-width: 0;
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr);
+      align-items: center;
+      gap: 10px;
+      padding: 8px 11px;
+      border: 1px solid rgba(244, 239, 226, 0.16);
+      border-radius: 8px;
+      background: rgba(36, 38, 32, 0.82);
+    }
+
+    .search span {
+      color: var(--quiet);
+      font-size: 12px;
+      font-weight: 800;
+      text-transform: uppercase;
+    }
+
+    .search input {
+      min-width: 0;
+      border: 0;
+      outline: 0;
+      color: var(--text);
+      background: transparent;
+    }
+
+    .toolbar {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .toggle {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      min-height: 34px;
+      padding: 6px 10px;
+      border: 1px solid rgba(244, 239, 226, 0.15);
+      border-radius: 8px;
+      color: var(--muted);
+      background: rgba(29, 30, 26, 0.8);
+      cursor: pointer;
+      user-select: none;
+    }
+
+    .toggle input { accent-color: var(--focus); }
+
+    button {
+      min-height: 34px;
+      padding: 7px 12px;
+      border: 1px solid rgba(244, 239, 226, 0.18);
+      border-radius: 8px;
+      color: var(--text);
+      background: rgba(70, 185, 167, 0.18);
+      cursor: pointer;
+    }
+
+    button:hover,
+    .toggle:hover,
+    .search:focus-within { border-color: rgba(240, 195, 90, 0.7); }
+
+    .workspace {
+      min-height: 0;
+      display: grid;
+      grid-template-columns: 260px minmax(0, 1fr) 340px;
+    }
+
+    .rail,
+    .inspector {
+      min-height: 0;
+      overflow: auto;
+      padding: 18px;
+      background: rgba(29, 30, 26, 0.86);
+    }
+
+    .rail { border-right: 1px solid rgba(244, 239, 226, 0.1); }
+    .inspector { border-left: 1px solid rgba(244, 239, 226, 0.1); }
+
+    .panel + .panel { margin-top: 22px; }
+
+    .stat-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      margin-top: 10px;
+    }
+
+    .stat,
+    .crate-card,
+    .details-card {
+      border: 1px solid rgba(244, 239, 226, 0.12);
+      border-radius: 8px;
+      background: rgba(16, 18, 17, 0.7);
+    }
+
+    .stat { padding: 10px; }
+    .stat strong { display: block; font-size: 22px; line-height: 1; }
+    .stat span { display: block; margin-top: 5px; color: var(--quiet); font-size: 12px; }
+
+    .crate-list { display: grid; gap: 8px; margin-top: 10px; }
+    .crate-card { padding: 10px; }
+    .crate-card strong { display: block; }
+    .crate-card span { color: var(--quiet); font-size: 12px; }
+
+    .legend {
+      display: grid;
+      gap: 9px;
+      margin-top: 12px;
+      color: var(--muted);
+    }
+
+    .legend span {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+    }
+
+    .swatch {
+      width: 13px;
+      height: 13px;
+      border-radius: 99px;
+      display: inline-block;
+      box-shadow: 0 0 0 1px rgba(16, 18, 17, 0.9), 0 0 18px rgba(255, 255, 255, 0.08);
+    }
+
+    .stage {
+      position: relative;
+      min-width: 0;
+      min-height: 0;
+      overflow: hidden;
+    }
+
+    #graph {
+      width: 100%;
+      height: 100%;
+      display: block;
+      cursor: grab;
+      touch-action: none;
+    }
+
+    #graph.panning { cursor: grabbing; }
+
+    .hud {
+      position: absolute;
+      left: 16px;
+      bottom: 16px;
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      pointer-events: none;
+    }
+
+    .hud span {
+      min-height: 30px;
+      display: inline-flex;
+      align-items: center;
+      padding: 6px 10px;
+      border: 1px solid rgba(244, 239, 226, 0.12);
+      border-radius: 8px;
+      color: var(--muted);
+      background: rgba(16, 18, 17, 0.76);
+      backdrop-filter: blur(14px);
+    }
+
+    .details {
+      margin-top: 12px;
+      display: grid;
+      gap: 10px;
+    }
+
+    .details-card { padding: 12px; }
+
+    .details-title {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+    }
+
+    .pill-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-top: 10px;
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      min-height: 24px;
+      padding: 3px 8px;
+      border: 1px solid rgba(244, 239, 226, 0.13);
+      border-radius: 999px;
+      color: var(--muted);
+      background: rgba(244, 239, 226, 0.05);
+      font-size: 12px;
+    }
+
+    .kv {
+      display: grid;
+      gap: 7px;
+      margin-top: 12px;
+    }
+
+    .kv div {
+      display: grid;
+      grid-template-columns: 92px minmax(0, 1fr);
+      gap: 10px;
+      align-items: baseline;
+    }
+
+    .kv dt {
+      color: var(--quiet);
+      font-size: 12px;
+      text-transform: uppercase;
+    }
+
+    .kv dd {
+      margin: 0;
+      overflow-wrap: anywhere;
+      color: var(--text);
+      font-family: "Berkeley Mono", "SFMono-Regular", Consolas, monospace;
+      font-size: 12px;
+    }
+
+    .neighbor-list {
+      display: grid;
+      gap: 6px;
+      margin-top: 10px;
+      color: var(--muted);
+    }
+
+    .neighbor-list button {
+      display: block;
+      width: 100%;
+      min-height: 0;
+      padding: 7px 9px;
+      text-align: left;
+      color: var(--muted);
+      background: rgba(244, 239, 226, 0.04);
+    }
+
+    svg .depth-band { fill: rgba(244, 239, 226, 0.025); stroke: rgba(244, 239, 226, 0.05); }
+    svg .edge { fill: none; stroke: var(--stroke); stroke-linecap: round; opacity: 0.58; }
+    svg .edge.contains,
+    svg .edge.declares { stroke: rgba(244, 239, 226, 0.34); opacity: 0.42; }
+    svg .edge.imports { stroke: var(--imports); opacity: 0.56; }
+    svg .edge.calls { stroke: var(--calls); opacity: 0.64; }
+    svg .edge.dimmed { opacity: 0.08; }
+    svg .edge.selected { opacity: 0.96; stroke: var(--focus); }
+
+    .node { cursor: grab; }
+    .node.dragging { cursor: grabbing; }
+    .node.dimmed { opacity: 0.24; }
+    .node .halo { fill: transparent; stroke: transparent; stroke-width: 12; }
+    .node.selected .halo,
+    .node.matched .halo { stroke: rgba(240, 195, 90, 0.3); }
+    .node circle { stroke: rgba(16, 18, 17, 0.92); stroke-width: 2; }
+    .node.crate circle { fill: var(--crate); }
+    .node.module circle { fill: var(--module); }
+    .node.struct circle { fill: var(--struct); }
+    .node text {
+      fill: var(--text);
+      paint-order: stroke;
+      stroke: rgba(16, 18, 17, 0.9);
+      stroke-width: 5px;
+      stroke-linejoin: round;
+      font-size: 12px;
+      font-weight: 700;
+      pointer-events: none;
+    }
+
+    .node.struct text { font-size: 11px; }
+
+    @media (max-width: 1080px) {
+      body { height: auto; overflow: auto; }
+      .topbar { grid-template-columns: auto minmax(0, 1fr); gap: 8px 10px; padding: 8px 10px; }
+      .brand { align-items: center; gap: 8px; }
+      h1 { font-size: 22px; }
+      #subtitle { display: none; }
+      .search { padding: 7px 10px; }
+      .toolbar { grid-column: 1 / -1; gap: 6px; justify-content: flex-start; overflow-x: auto; padding-bottom: 2px; }
+      .toggle,
+      button { flex: 0 0 auto; min-height: 31px; padding: 5px 8px; }
+      .workspace { grid-template-columns: 1fr; grid-template-rows: minmax(320px, calc(100vh - 112px)) auto auto; }
+      .rail,
+      .inspector { border: 0; border-bottom: 1px solid rgba(244, 239, 226, 0.1); }
+      .stage { order: -1; min-height: 320px; }
+      .rail { order: 0; }
+      .inspector { order: 1; }
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <h1>Axon</h1>
+      <div id="subtitle">Live Rust architecture overview</div>
+    </div>
+    <label class="search">
+      <span>Search</span>
+      <input id="search" type="search" autocomplete="off" placeholder="crate, module, struct, path" />
+    </label>
+    <div class="toolbar" aria-label="Graph filters">
+      <label class="toggle"><input id="toggle-structs" type="checkbox" /> Show structs</label>
+      <label class="toggle"><input id="toggle-imports" type="checkbox" checked /> Imports</label>
+      <label class="toggle"><input id="toggle-calls" type="checkbox" checked /> Calls</label>
+      <button id="fit" type="button">Fit</button>
+    </div>
+  </header>
+
+  <div class="workspace">
+    <aside class="rail">
+      <section class="panel">
+        <h2>Inventory</h2>
+        <div id="stats" class="stat-grid"></div>
+      </section>
+      <section class="panel">
+        <h2>Crates</h2>
+        <div id="crates" class="crate-list"></div>
+      </section>
+      <section class="panel">
+        <h2>Legend</h2>
+        <div class="legend">
+          <span><i class="swatch" style="background:var(--crate)"></i>Crate</span>
+          <span><i class="swatch" style="background:var(--module)"></i>Module / submodule</span>
+          <span><i class="swatch" style="background:var(--struct)"></i>Struct</span>
+          <span><i class="swatch" style="background:var(--imports)"></i>Imports</span>
+          <span><i class="swatch" style="background:var(--calls)"></i>Calls</span>
+        </div>
+      </section>
+    </aside>
+
+    <main class="stage">
+      <svg id="graph" role="img" aria-label="Rust architecture overview"></svg>
+      <div class="hud">
+        <span id="visible-count">Loading</span>
+        <span id="hover-readout">Ready</span>
+      </div>
+    </main>
+
+    <aside class="inspector">
+      <h2>Selected</h2>
+      <div id="details" class="details">Select a node.</div>
+    </aside>
+  </div>
+
+  <script>
+    const namespace = 'http://www.w3.org/2000/svg';
+    const colors = { crate: '#46b9a7', module: '#70b8d6', struct: '#e6b655' };
+    const svg = document.getElementById('graph');
+    const details = document.getElementById('details');
+    const stats = document.getElementById('stats');
+    const crates = document.getElementById('crates');
+    const search = document.getElementById('search');
+    const visibleCount = document.getElementById('visible-count');
+    const hoverReadout = document.getElementById('hover-readout');
+    const fitButton = document.getElementById('fit');
+    const toggles = {
+      structs: document.getElementById('toggle-structs'),
+      imports: document.getElementById('toggle-imports'),
+      calls: document.getElementById('toggle-calls'),
+    };
+
+    const state = {
+      data: null,
+      selectedId: null,
+      transform: { x: 0, y: 0, scale: 1 },
+      manualPositions: new Map(),
+      panning: false,
+      panStart: null,
+      lastLayout: null,
+    };
+
+    fetch('/api/graph')
+      .then(response => response.json())
+      .then(render)
+      .catch(error => {
+        details.textContent = String(error);
+        hoverReadout.textContent = 'Load failed';
+      });
+
+    search.addEventListener('input', draw);
+    Object.values(toggles).forEach(toggle => toggle.addEventListener('change', draw));
+    fitButton.addEventListener('click', () => {
+      state.transform = { x: 0, y: 0, scale: 1 };
+      applyTransform();
+    });
+
+    window.addEventListener('resize', debounce(draw, 80));
+
+    svg.addEventListener('wheel', event => {
+      event.preventDefault();
+      const scaleFactor = Math.exp(-event.deltaY * 0.0012);
+      zoomAt(event.clientX, event.clientY, scaleFactor);
+    }, { passive: false });
+
+    svg.addEventListener('pointerdown', event => {
+      if (event.target.closest && event.target.closest('.node')) return;
+      state.panning = true;
+      state.panStart = {
+        pointerX: event.clientX,
+        pointerY: event.clientY,
+        originX: state.transform.x,
+        originY: state.transform.y,
+      };
+      svg.classList.add('panning');
+      svg.setPointerCapture(event.pointerId);
+    });
+
+    svg.addEventListener('pointermove', event => {
+      if (!state.panning || !state.panStart) return;
+      state.transform.x = state.panStart.originX + event.clientX - state.panStart.pointerX;
+      state.transform.y = state.panStart.originY + event.clientY - state.panStart.pointerY;
+      applyTransform();
+    });
+
+    svg.addEventListener('pointerup', finishPan);
+    svg.addEventListener('pointercancel', finishPan);
+
+    function render(data) {
+      state.data = data;
+      document.getElementById('subtitle').textContent = `${data.nodes.length} nodes / ${data.edges.length} edges`;
+      renderStats(data.stats || {});
+      renderCrates(data.crates || []);
+      draw();
+    }
+
+    function renderStats(summary) {
+      const selectedStats = [
+        ['crates', 'Crates'],
+        ['modules', 'Modules'],
+        ['structs', 'Structs'],
+        ['imports', 'Imports'],
+        ['calls', 'Calls'],
+        ['methods', 'Methods'],
+      ];
+      clearElement(stats);
+      for (const [key, label] of selectedStats) {
+        const card = document.createElement('div');
+        card.className = 'stat';
+        const value = document.createElement('strong');
+        value.textContent = summary[key] ?? 0;
+        const caption = document.createElement('span');
+        caption.textContent = label;
+        card.append(value, caption);
+        stats.appendChild(card);
+      }
+    }
+
+    function renderCrates(crateRows) {
+      clearElement(crates);
+      if (crateRows.length === 0) {
+        crates.textContent = 'No crates indexed.';
+        return;
+      }
+      for (const crateRow of crateRows) {
+        const card = document.createElement('div');
+        card.className = 'crate-card';
+        const name = document.createElement('strong');
+        name.textContent = crateRow.name;
+        const meta = document.createElement('span');
+        const moduleCount = crateRow.stats?.modules ?? 0;
+        const structCount = crateRow.stats?.structs ?? 0;
+        meta.textContent = `${moduleCount} modules / ${structCount} structs`;
+        card.append(name, meta);
+        crates.appendChild(card);
+      }
+    }
+
+    function draw() {
+      if (!state.data) return;
+      const bounds = svg.getBoundingClientRect();
+      const width = Math.max(760, Math.floor(bounds.width || 1000));
+      const height = Math.max(560, Math.floor(bounds.height || 720));
+      svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
+      clearElement(svg);
+
+      const options = currentOptions();
+      const graphView = buildGraphView(state.data, options);
+      const layout = createLayout(graphView.nodes, graphView.edges, width, height);
+      state.lastLayout = layout;
+
+      visibleCount.textContent = `${layout.nodes.length} visible nodes / ${graphView.edges.length} visible edges`;
+
+      const viewport = svgElement('g', { id: 'viewport' });
+      const bands = svgElement('g', { class: 'bands' });
+      const edgeLayer = svgElement('g', { class: 'edges' });
+      const nodeLayer = svgElement('g', { class: 'nodes' });
+
+      renderDepthBands(bands, layout.maxDepth, width, height, layout.columnGap);
+      const nodeById = new Map(layout.nodes.map(node => [node.id, node]));
+      const edgeViews = [];
+
+      for (const edge of graphView.edges) {
+        const from = nodeById.get(edge.from);
+        const to = nodeById.get(edge.to);
+        if (!from || !to) continue;
+        const path = svgElement('path', {
+          class: edgeClass(edge),
+          d: edgePath(edge, from, to),
+          'stroke-width': edgeWidth(edge),
+        });
+        const title = svgElement('title');
+        title.textContent = `${edge.label}${edge.count ? ` (${edge.count})` : ''}`;
+        path.appendChild(title);
+        edgeLayer.appendChild(path);
+        edgeViews.push({ edge, path });
+      }
+
+      for (const node of layout.nodes) {
+        const group = renderNode(node, nodeById, edgeViews, graphView.edges);
+        nodeLayer.appendChild(group);
+      }
+
+      viewport.append(bands, edgeLayer, nodeLayer);
+      svg.appendChild(viewport);
+      applyTransform();
+
+      const selectedNode = state.selectedId ? nodeById.get(state.selectedId) : null;
+      if (selectedNode) {
+        showDetails(selectedNode, graphView.edges, nodeById);
+      } else {
+        showEmptyDetails(graphView);
+      }
+    }
+
+    function currentOptions() {
+      return {
+        showStructs: toggles.structs.checked,
+        showImports: toggles.imports.checked,
+        showCalls: toggles.calls.checked,
+        query: search.value.trim().toLowerCase(),
+      };
+    }
+
+    function buildGraphView(data, options) {
+      const baseNodes = data.nodes.filter(node => {
+        if (node.kind === 'workspace') return false;
+        if (options.showStructs || node.kind !== 'struct') return true;
+        return Boolean(options.query && matchesQuery(node, options.query));
+      });
+      const visibleIds = new Set(baseNodes.map(node => node.id));
+      let baseEdges = data.edges.filter(edge => visibleIds.has(edge.from) && visibleIds.has(edge.to));
+      if (!options.showImports) baseEdges = baseEdges.filter(edge => edge.label !== 'imports');
+      if (!options.showCalls) baseEdges = baseEdges.filter(edge => edge.label !== 'calls');
+
+      const matchedIds = new Set();
+      if (options.query) {
+        for (const node of baseNodes) {
+          if (matchesQuery(node, options.query)) matchedIds.add(node.id);
+        }
+      }
+
+      const activeIds = new Set(matchedIds);
+      if (matchedIds.size > 0) {
+        for (const edge of baseEdges) {
+          if (matchedIds.has(edge.from) || matchedIds.has(edge.to)) {
+            activeIds.add(edge.from);
+            activeIds.add(edge.to);
+          }
+        }
+      }
+
+      const nodes = baseNodes.map(node => ({
+        ...node,
+        matched: matchedIds.has(node.id),
+        dimmed: matchedIds.size > 0 && !activeIds.has(node.id),
+      }));
+      const edges = baseEdges.map(edge => ({
+        ...edge,
+        dimmed: matchedIds.size > 0 && !(activeIds.has(edge.from) && activeIds.has(edge.to)),
+      }));
+      return { nodes, edges };
+    }
+
+    function matchesQuery(node, query) {
+      const haystack = [node.label, node.kind, node.path, node.file_path, node.visibility]
+        .filter(Boolean)
+        .join(' ')
+        .toLowerCase();
+      return haystack.includes(query);
+    }
+
+    function createLayout(nodes, edges, width, height) {
+      const nodeById = new Map(nodes.map(node => [node.id, { ...node, raw: node }]));
+      const childrenByParent = new Map();
+      const parentByChild = new Map();
+      for (const edge of edges) {
+        if (!['contains', 'declares'].includes(edge.label)) continue;
+        if (!nodeById.has(edge.from) || !nodeById.has(edge.to)) continue;
+        if (!childrenByParent.has(edge.from)) childrenByParent.set(edge.from, []);
+        childrenByParent.get(edge.from).push(edge.to);
+        parentByChild.set(edge.to, edge.from);
+      }
+
+      for (const childIds of childrenByParent.values()) {
+        childIds.sort((leftId, rightId) => compareNodes(nodeById.get(leftId), nodeById.get(rightId)));
+      }
+
+      const root = nodes.find(node => node.kind === 'workspace') || nodes.find(node => !parentByChild.has(node.id)) || nodes[0];
+      const weights = new Map();
+      const depths = new Map();
+
+      function measure(nodeId) {
+        if (weights.has(nodeId)) return weights.get(nodeId);
+        const childIds = (childrenByParent.get(nodeId) || []).filter(childId => nodeById.has(childId));
+        if (childIds.length === 0) {
+          weights.set(nodeId, 1);
+          return 1;
+        }
+        const weight = Math.max(1, childIds.reduce((total, childId) => total + measure(childId), 0));
+        weights.set(nodeId, weight);
+        return weight;
+      }
+
+      if (root) measure(root.id);
+
+      function assignDepth(nodeId, depth) {
+        const previous = depths.get(nodeId);
+        if (previous !== undefined && previous <= depth) return;
+        depths.set(nodeId, depth);
+        for (const childId of childrenByParent.get(nodeId) || []) assignDepth(childId, depth + 1);
+      }
+
+      if (root) assignDepth(root.id, 0);
+      let maxDepth = Math.max(1, ...Array.from(depths.values()));
+      for (const node of nodeById.values()) {
+        if (!depths.has(node.id)) {
+          const fallbackDepth = fallbackDepthFor(node.kind);
+          depths.set(node.id, fallbackDepth);
+          maxDepth = Math.max(maxDepth, fallbackDepth);
+        }
+      }
+
+      const leftPadding = 78;
+      const rightPadding = 108;
+      const topPadding = 56;
+      const bottomPadding = 68;
+      const columnGap = Math.max(116, Math.min(210, (width - leftPadding - rightPadding) / Math.max(1, maxDepth)));
+      const positionedIds = new Set();
+
+      function placeTree(nodeId, depth, top, bottom) {
+        const node = nodeById.get(nodeId);
+        if (!node) return;
+        const manual = state.manualPositions.get(node.id);
+        node.x = manual?.x ?? Math.min(width - rightPadding, leftPadding + depth * columnGap);
+        node.y = manual?.y ?? (top + bottom) / 2;
+        node.depth = depth;
+        positionedIds.add(node.id);
+
+        const childIds = (childrenByParent.get(nodeId) || []).filter(childId => nodeById.has(childId));
+        if (childIds.length === 0) return;
+        const totalWeight = childIds.reduce((total, childId) => total + (weights.get(childId) || 1), 0);
+        let cursor = top;
+        for (const childId of childIds) {
+          const share = Math.max(34, (bottom - top) * ((weights.get(childId) || 1) / Math.max(1, totalWeight)));
+          placeTree(childId, depth + 1, cursor, Math.min(bottom, cursor + share));
+          cursor += share;
+        }
+      }
+
+      if (root) placeTree(root.id, 0, topPadding, height - bottomPadding);
+
+      const unplaced = Array.from(nodeById.values()).filter(node => !positionedIds.has(node.id));
+      for (const [index, node] of unplaced.entries()) {
+        const fallbackDepth = depths.get(node.id) || fallbackDepthFor(node.kind);
+        const manual = state.manualPositions.get(node.id);
+        node.x = manual?.x ?? Math.min(width - rightPadding, leftPadding + fallbackDepth * columnGap);
+        node.y = manual?.y ?? topPadding + 34 + index * 38;
+        node.depth = fallbackDepth;
+      }
+
+      relaxOverlaps(Array.from(nodeById.values()), height, topPadding, bottomPadding);
+      return { nodes: Array.from(nodeById.values()), maxDepth, columnGap };
+    }
+
+    function compareNodes(left, right) {
+      const order = { workspace: 0, crate: 1, module: 2, struct: 3 };
+      const orderDiff = (order[left?.kind] ?? 9) - (order[right?.kind] ?? 9);
+      if (orderDiff !== 0) return orderDiff;
+      return String(left?.label || '').localeCompare(String(right?.label || ''));
+    }
+
+    function fallbackDepthFor(kind) {
+      if (kind === 'workspace') return 0;
+      if (kind === 'crate') return 1;
+      if (kind === 'module') return 2;
+      return 3;
+    }
+
+    function relaxOverlaps(nodes, height, topPadding, bottomPadding) {
+      const byColumn = new Map();
+      for (const node of nodes) {
+        const key = Math.round(node.x / 24);
+        if (!byColumn.has(key)) byColumn.set(key, []);
+        byColumn.get(key).push(node);
+      }
+      for (const columnNodes of byColumn.values()) {
+        columnNodes.sort((left, right) => left.y - right.y);
+        let cursor = topPadding;
+        for (const node of columnNodes) {
+          const gap = radiusFor(node) * 2 + 18;
+          node.y = Math.max(node.y, cursor + gap / 2);
+          cursor = node.y + gap / 2;
+        }
+        const overflow = cursor - (height - bottomPadding);
+        if (overflow > 0) {
+          for (const node of columnNodes) node.y -= overflow / 2;
+        }
+      }
+    }
+
+    function renderDepthBands(layer, maxDepth, width, height, columnGap) {
+      for (let depth = 0; depth <= maxDepth; depth += 1) {
+        if (depth % 2 !== 0) continue;
+        const band = svgElement('rect', {
+          class: 'depth-band',
+          x: Math.max(0, 78 + depth * columnGap - columnGap / 2),
+          y: 28,
+          width: Math.max(80, columnGap),
+          height: Math.max(0, height - 84),
+          rx: 8,
+        });
+        layer.appendChild(band);
+      }
+    }
+
+    function renderNode(node, nodeById, edgeViews, edges) {
+      const group = svgElement('g', {
+        class: nodeClass(node),
+        transform: `translate(${node.x}, ${node.y})`,
+        tabindex: '0',
+        role: 'button',
+        'aria-label': `${node.kind}: ${node.label}`,
+      });
+
+      const halo = svgElement('circle', { class: 'halo', r: radiusFor(node) + 7 });
+      const circle = svgElement('circle', { r: radiusFor(node), fill: colors[node.kind] || '#aeb5ad' });
+      const title = svgElement('title');
+      title.textContent = `${node.kind}: ${node.label}`;
+      const label = svgElement('text', { x: radiusFor(node) + 9, y: 4 });
+      label.textContent = shortLabel(node.label, node.kind === 'struct' ? 23 : 28);
+
+      group.append(title, halo, circle, label);
+
+      group.addEventListener('mouseenter', () => {
+        hoverReadout.textContent = `${node.kind} / ${node.label}`;
+      });
+      group.addEventListener('mouseleave', () => {
+        hoverReadout.textContent = 'Ready';
+      });
+      group.addEventListener('click', () => {
+        if (node.wasDragged) {
+          node.wasDragged = false;
+          return;
+        }
+        state.selectedId = node.id;
+        showDetails(node, edges, nodeById);
+        markSelection();
+      });
+      group.addEventListener('keydown', event => {
+        if (event.key !== 'Enter' && event.key !== ' ') return;
+        event.preventDefault();
+        state.selectedId = node.id;
+        showDetails(node, edges, nodeById);
+        markSelection();
+      });
+
+      enableDrag(group, node, edgeViews);
+      return group;
+    }
+
+    function nodeClass(node) {
+      return [
+        'node',
+        node.kind,
+        node.dimmed ? 'dimmed' : '',
+        node.matched ? 'matched' : '',
+        state.selectedId === node.id ? 'selected' : '',
+      ].filter(Boolean).join(' ');
+    }
+
+    function edgeClass(edge) {
+      return [
+        'edge',
+        edge.label,
+        edge.dimmed ? 'dimmed' : '',
+        state.selectedId && (edge.from === state.selectedId || edge.to === state.selectedId) ? 'selected' : '',
+      ].filter(Boolean).join(' ');
+    }
+
+    function radiusFor(node) {
+      if (node.kind === 'workspace') return 20;
+      if (node.kind === 'crate') return 18;
+      if (node.kind === 'module') return Math.min(15, 10 + Math.log2((node.file_count || 0) + 1));
+      return Math.min(13, 8 + Math.log2((node.method_count || 0) + 1));
+    }
+
+    function edgeWidth(edge) {
+      return Math.min(6, edge.label === 'contains' || edge.label === 'declares' ? 1.15 : 1.4 + Math.log2(edge.count || 1));
+    }
+
+    function edgePath(edge, from, to) {
+      const horizontal = Math.max(44, Math.abs(to.x - from.x) * 0.42);
+      if (edge.label === 'contains' || edge.label === 'declares') {
+        return `M ${from.x} ${from.y} C ${from.x + horizontal} ${from.y}, ${to.x - horizontal} ${to.y}, ${to.x} ${to.y}`;
+      }
+      const bend = edge.label === 'calls' ? 38 : -32;
+      const midpointX = (from.x + to.x) / 2;
+      const midpointY = (from.y + to.y) / 2 + bend;
+      return `M ${from.x} ${from.y} Q ${midpointX} ${midpointY}, ${to.x} ${to.y}`;
+    }
+
+    function enableDrag(group, node, edgeViews) {
+      let dragging = false;
+      let offsetX = 0;
+      let offsetY = 0;
+      let moved = false;
+
+      group.addEventListener('pointerdown', event => {
+        const point = svgPoint(event);
+        dragging = true;
+        moved = false;
+        offsetX = point.x - node.x;
+        offsetY = point.y - node.y;
+        group.classList.add('dragging');
+        group.setPointerCapture(event.pointerId);
+        event.stopPropagation();
+        event.preventDefault();
+      });
+
+      group.addEventListener('pointermove', event => {
+        if (!dragging) return;
+        const point = svgPoint(event);
+        node.x = point.x - offsetX;
+        node.y = point.y - offsetY;
+        moved = true;
+        state.manualPositions.set(node.id, { x: node.x, y: node.y });
+        updateNodeView(group, node, edgeViews);
+      });
+
+      group.addEventListener('pointerup', event => finishDrag(group, node, event, moved));
+      group.addEventListener('pointercancel', event => finishDrag(group, node, event, moved));
+    }
+
+    function finishDrag(group, node, event, moved) {
+      group.classList.remove('dragging');
+      if (group.hasPointerCapture(event.pointerId)) group.releasePointerCapture(event.pointerId);
+      node.wasDragged = moved;
+    }
+
+    function updateNodeView(group, node, edgeViews) {
+      group.setAttribute('transform', `translate(${node.x}, ${node.y})`);
+      for (const { edge, path } of edgeViews) {
+        if (edge.from !== node.id && edge.to !== node.id) continue;
+        const peerId = edge.from === node.id ? edge.to : edge.from;
+        const peer = state.lastLayout?.nodes.find(candidate => candidate.id === peerId);
+        if (!peer) continue;
+        const from = edge.from === node.id ? node : peer;
+        const to = edge.to === node.id ? node : peer;
+        path.setAttribute('d', edgePath(edge, from, to));
+      }
+    }
+
+    function svgPoint(event) {
+      const point = svg.createSVGPoint();
+      point.x = event.clientX;
+      point.y = event.clientY;
+      const viewport = document.getElementById('viewport');
+      const matrix = viewport?.getScreenCTM() || svg.getScreenCTM();
+      return point.matrixTransform(matrix.inverse());
+    }
+
+    function finishPan(event) {
+      if (!state.panning) return;
+      state.panning = false;
+      state.panStart = null;
+      svg.classList.remove('panning');
+      if (svg.hasPointerCapture(event.pointerId)) svg.releasePointerCapture(event.pointerId);
+    }
+
+    function zoomAt(clientX, clientY, scaleFactor) {
+      const bounds = svg.getBoundingClientRect();
+      const pointerX = clientX - bounds.left;
+      const pointerY = clientY - bounds.top;
+      const nextScale = clamp(state.transform.scale * scaleFactor, 0.45, 2.8);
+      const ratio = nextScale / state.transform.scale;
+      state.transform.x = pointerX - (pointerX - state.transform.x) * ratio;
+      state.transform.y = pointerY - (pointerY - state.transform.y) * ratio;
+      state.transform.scale = nextScale;
+      applyTransform();
+    }
+
+    function applyTransform() {
+      const viewport = document.getElementById('viewport');
+      if (!viewport) return;
+      viewport.setAttribute('transform', `translate(${state.transform.x}, ${state.transform.y}) scale(${state.transform.scale})`);
+    }
+
+    function markSelection() {
+      for (const group of svg.querySelectorAll('.node')) {
+        group.classList.toggle('selected', group.getAttribute('aria-label') === selectedAriaLabel());
+      }
+      for (const path of svg.querySelectorAll('.edge')) path.classList.remove('selected');
+      draw();
+    }
+
+    function selectedAriaLabel() {
+      const node = state.lastLayout?.nodes.find(candidate => candidate.id === state.selectedId);
+      return node ? `${node.kind}: ${node.label}` : '';
+    }
+
+    function showEmptyDetails(graphView) {
+      clearElement(details);
+      const card = document.createElement('div');
+      card.className = 'details-card';
+      const title = document.createElement('h3');
+      title.textContent = 'Architecture map';
+      const pills = document.createElement('div');
+      pills.className = 'pill-row';
+      pills.append(pill(`${graphView.nodes.length} nodes`), pill(`${graphView.edges.length} edges`));
+      card.append(title, pills);
+      details.appendChild(card);
+    }
+
+    function showDetails(node, edges, nodeById) {
+      clearElement(details);
+
+      const card = document.createElement('div');
+      card.className = 'details-card';
+      const titleRow = document.createElement('div');
+      titleRow.className = 'details-title';
+      const title = document.createElement('h3');
+      title.textContent = node.label;
+      titleRow.append(title, pill(node.kind));
+      card.appendChild(titleRow);
+
+      const labels = [...(node.semantic_labels || []).map(label => label.label), ...(node.pattern_labels || [])];
+      if (labels.length > 0) {
+        const pills = document.createElement('div');
+        pills.className = 'pill-row';
+        labels.slice(0, 8).forEach(label => pills.appendChild(pill(label)));
+        card.appendChild(pills);
+      }
+
+      const rows = [
+        ['path', node.path || node.file_path],
+        ['visibility', node.visibility],
+        ['methods', node.method_count],
+        ['files', node.file_count],
+        ['line', lineRange(node)],
+      ].filter(([, value]) => value !== undefined && value !== null && value !== '');
+      card.appendChild(keyValues(rows));
+      details.appendChild(card);
+
+      const related = edges
+        .filter(edge => edge.from === node.id || edge.to === node.id)
+        .slice(0, 18);
+      const relationCard = document.createElement('div');
+      relationCard.className = 'details-card';
+      const relationTitle = document.createElement('h3');
+      relationTitle.textContent = 'Relations';
+      relationCard.appendChild(relationTitle);
+      const list = document.createElement('div');
+      list.className = 'neighbor-list';
+      if (related.length === 0) {
+        list.textContent = 'No visible relations.';
+      } else {
+        for (const edge of related) {
+          const peerId = edge.from === node.id ? edge.to : edge.from;
+          const peer = nodeById.get(peerId);
+          if (!peer) continue;
+          const button = document.createElement('button');
+          button.type = 'button';
+          button.textContent = `${edge.label} ${edge.from === node.id ? 'to' : 'from'} ${peer.label}`;
+          button.addEventListener('click', () => {
+            state.selectedId = peer.id;
+            showDetails(peer, edges, nodeById);
+            draw();
+          });
+          list.appendChild(button);
+        }
+      }
+      relationCard.appendChild(list);
+      details.appendChild(relationCard);
+    }
+
+    function keyValues(rows) {
+      const list = document.createElement('dl');
+      list.className = 'kv';
+      for (const [key, value] of rows) {
+        const row = document.createElement('div');
+        const term = document.createElement('dt');
+        term.textContent = key;
+        const definition = document.createElement('dd');
+        definition.textContent = String(value);
+        row.append(term, definition);
+        list.appendChild(row);
+      }
+      return list;
+    }
+
+    function lineRange(node) {
+      if (!node.start_line && !node.end_line) return '';
+      if (node.start_line === node.end_line) return node.start_line;
+      return `${node.start_line || '?'}-${node.end_line || '?'}`;
+    }
+
+    function pill(text) {
+      const item = document.createElement('span');
+      item.className = 'pill';
+      item.textContent = text;
+      return item;
+    }
+
+    function svgElement(tagName, attributes = {}) {
+      const element = document.createElementNS(namespace, tagName);
+      for (const [key, value] of Object.entries(attributes)) {
+        element.setAttribute(key, value);
+      }
+      return element;
+    }
+
+    function clearElement(element) {
+      while (element.firstChild) element.removeChild(element.firstChild);
+    }
+
+    function shortLabel(value, maxLength) {
+      const text = String(value || '');
+      return text.length > maxLength ? `${text.slice(0, maxLength - 1)}...` : text;
+    }
+
+    function clamp(value, min, max) {
+      return Math.max(min, Math.min(max, value));
+    }
+
+    function debounce(callback, delay) {
+      let handle = 0;
+      return () => {
+        window.clearTimeout(handle);
+        handle = window.setTimeout(callback, delay);
+      };
+    }
+  </script>
+</body>
+</html>

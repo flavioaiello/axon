@@ -3,7 +3,8 @@ use cozo::{DbInstance, ScriptMutability};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 use crate::domain::model::*;
 
@@ -18,6 +19,7 @@ use crate::domain::model::*;
 /// - `DomainModel` structs are reconstructed on-demand from relations.
 pub struct Store {
     db: DbInstance,
+    policy_path: Option<PathBuf>,
 }
 
 impl Store {
@@ -25,12 +27,19 @@ impl Store {
     ///
     /// The path parameter is retained for callers that still derive a crate-local
     /// store location, but CozoDB data now lives only for the process lifetime.
-    pub fn open(_path: &Path) -> Result<Self> {
+    pub fn open(path: &Path) -> Result<Self> {
+        let root = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let policy_path = root
+            .join("Cargo.toml")
+            .is_file()
+            .then(|| root.join(".axon").join("policy.json"));
         let db = DbInstance::new("mem", "", Default::default())
             .map_err(|e| anyhow::anyhow!("Failed to open in-memory CozoDB: {:?}", e))?;
 
         Self::init_schema(&db)?;
-        Ok(Self { db })
+        let store = Self { db, policy_path };
+        store.load_persisted_policy(&canonicalize_path(&root.to_string_lossy()))?;
+        Ok(store)
     }
 
     // ── Schema ─────────────────────────────────────────────────────────────
@@ -513,7 +522,6 @@ impl Store {
                 )
                 .map_err(|e| anyhow::anyhow!("save method '{}'.{}: {:?}", owner, m.name, e))?;
 
-            // Method parameters
             for (j, p) in m.parameters.iter().enumerate() {
                 let mut pp = params_map(&[
                     ("ws", ws),
@@ -4090,6 +4098,18 @@ impl Store {
         layer: &str,
     ) -> Result<()> {
         let ws = canonicalize_path(workspace);
+        self.upsert_layer_assignment_in_memory(&ws, context, layer)?;
+        self.persist_policy(&ws)?;
+        Ok(())
+    }
+
+    fn upsert_layer_assignment_in_memory(
+        &self,
+        workspace: &str,
+        context: &str,
+        layer: &str,
+    ) -> Result<()> {
+        let ws = canonicalize_path(workspace);
         let params = params_map(&[("ws", &ws), ("ctx", context), ("layer", layer)]);
         self.run_script(
             "?[workspace, context, layer] <- [[$ws, $ctx, $layer]] \
@@ -4112,13 +4132,31 @@ impl Store {
                 ScriptMutability::Mutable,
             )
             .map_err(|e| anyhow::anyhow!("remove_layer_assignment: {:?}", e))?;
-        Ok(!existing.rows.is_empty())
+        let removed = !existing.rows.is_empty();
+        if removed {
+            self.persist_policy(&ws)?;
+        }
+        Ok(removed)
     }
 
     /// Add a dependency constraint between layers or contexts.
     /// `constraint_kind` is `"layer"` or `"context"`.
     /// `rule` is `"forbidden"` or `"allowed"`.
     pub fn upsert_dependency_constraint(
+        &self,
+        workspace: &str,
+        constraint_kind: &str,
+        source: &str,
+        target: &str,
+        rule: &str,
+    ) -> Result<()> {
+        let ws = canonicalize_path(workspace);
+        self.upsert_dependency_constraint_in_memory(&ws, constraint_kind, source, target, rule)?;
+        self.persist_policy(&ws)?;
+        Ok(())
+    }
+
+    fn upsert_dependency_constraint_in_memory(
         &self,
         workspace: &str,
         constraint_kind: &str,
@@ -4169,7 +4207,11 @@ impl Store {
                 ScriptMutability::Mutable,
             )
             .map_err(|e| anyhow::anyhow!("remove_dependency_constraint: {:?}", e))?;
-        Ok(!existing.rows.is_empty())
+        let removed = !existing.rows.is_empty();
+        if removed {
+            self.persist_policy(&ws)?;
+        }
+        Ok(removed)
     }
 
     /// List all layer assignments for a workspace.
@@ -4210,6 +4252,93 @@ impl Store {
             .iter()
             .map(|r| (dv_str(&r[0]), dv_str(&r[1]), dv_str(&r[2]), dv_str(&r[3])))
             .collect())
+    }
+
+    fn load_persisted_policy(&self, workspace: &str) -> Result<()> {
+        let Some(path) = &self.policy_path else {
+            return Ok(());
+        };
+        if !path.exists() {
+            return Ok(());
+        }
+
+        let text = fs::read_to_string(path)
+            .with_context(|| format!("read persisted architecture policy at {}", path.display()))?;
+        let policy: PersistedArchitecturePolicy =
+            serde_json::from_str(&text).with_context(|| {
+                format!("parse persisted architecture policy at {}", path.display())
+            })?;
+
+        for assignment in policy.layer_assignments {
+            self.upsert_layer_assignment_in_memory(
+                workspace,
+                &assignment.context,
+                &assignment.layer,
+            )?;
+        }
+        for constraint in policy.dependency_constraints {
+            self.upsert_dependency_constraint_in_memory(
+                workspace,
+                &constraint.constraint_kind,
+                &constraint.source,
+                &constraint.target,
+                &constraint.rule,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    fn persist_policy(&self, workspace: &str) -> Result<()> {
+        let Some(path) = &self.policy_path else {
+            return Ok(());
+        };
+
+        let mut layer_assignments = self
+            .list_layer_assignments(workspace)?
+            .into_iter()
+            .map(|(context, layer)| PersistedLayerAssignment { context, layer })
+            .collect::<Vec<_>>();
+        layer_assignments.sort_by(|a, b| a.context.cmp(&b.context));
+
+        let mut dependency_constraints = self
+            .list_dependency_constraints(workspace)?
+            .into_iter()
+            .map(
+                |(constraint_kind, source, target, rule)| PersistedDependencyConstraint {
+                    constraint_kind,
+                    source,
+                    target,
+                    rule,
+                },
+            )
+            .collect::<Vec<_>>();
+        dependency_constraints.sort_by(|a, b| {
+            (&a.constraint_kind, &a.source, &a.target).cmp(&(
+                &b.constraint_kind,
+                &b.source,
+                &b.target,
+            ))
+        });
+
+        let policy = PersistedArchitecturePolicy {
+            version: 1,
+            layer_assignments,
+            dependency_constraints,
+        };
+
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("create policy directory {}", parent.display()))?;
+        }
+        let tmp_path = path.with_extension("json.tmp");
+        let json = serde_json::to_string_pretty(&policy)?;
+        fs::write(&tmp_path, format!("{json}\n"))
+            .with_context(|| format!("write temporary policy file {}", tmp_path.display()))?;
+        fs::rename(&tmp_path, path)
+            .with_context(|| format!("replace persisted architecture policy {}", path.display()))?;
+
+        Ok(())
     }
 
     /// Evaluate policy violations: find context dependencies that violate layer
@@ -4275,12 +4404,633 @@ impl Store {
 
         let all_violations: Vec<serde_json::Value> =
             layer_items.into_iter().chain(context_items).collect();
+        let complexity = self.context_complexity(&ws)?;
+        let policy_coverage = self.policy_coverage(&ws, &complexity)?;
+        let configured = policy_coverage.context_count == 0
+            || (policy_coverage.missing_layer_assignments.is_empty()
+                && policy_coverage.dependency_constraint_count > 0);
+        let status = if !all_violations.is_empty() {
+            "false"
+        } else if configured {
+            "true"
+        } else {
+            "unconfigured"
+        };
 
         Ok(json!({
-            "status": if all_violations.is_empty() { "true" } else { "false" },
+            "status": status,
+            "configured": configured,
+            "policy_coverage": policy_coverage,
             "violations": all_violations,
             "count": all_violations.len(),
         }))
+    }
+
+    /// Return bounded, structured views over the persisted Rust graph.
+    ///
+    /// This is deliberately not an arbitrary Datalog endpoint. MCP clients get
+    /// graph-database leverage through curated views that preserve relation
+    /// names, node kinds, edge kinds, source evidence, and truncation metadata.
+    pub fn query_rust_graph(&self, workspace: &str, args: &Value) -> Result<serde_json::Value> {
+        let ws = canonicalize_path(workspace);
+        let view = args["view"].as_str().unwrap_or("overview");
+        let kind = args["kind"].as_str().unwrap_or("all");
+        let relation = args["relation"].as_str().unwrap_or("all");
+        let context_filter = args["context"]
+            .as_str()
+            .or_else(|| args["module"].as_str())
+            .unwrap_or("");
+        let file_filter = args["file"].as_str().unwrap_or("");
+        let symbol_filter = args["symbol"]
+            .as_str()
+            .or_else(|| args["struct"].as_str())
+            .unwrap_or("");
+        let from_filter = args["from"].as_str().unwrap_or("");
+        let to_filter = args["to"].as_str().unwrap_or("");
+        let limit = args["limit"].as_u64().unwrap_or(50).clamp(1, 200) as usize;
+        let filter_context = context_filter.to_lowercase();
+        let filter_file = file_filter.to_lowercase();
+        let filter_symbol = symbol_filter.to_lowercase();
+        let filter_from = from_filter.to_lowercase();
+        let filter_to = to_filter.to_lowercase();
+
+        let filters = json!({
+            "kind": kind,
+            "relation": relation,
+            "context": context_filter,
+            "file": file_filter,
+            "symbol": symbol_filter,
+            "from": from_filter,
+            "to": to_filter,
+            "limit": limit,
+        });
+
+        let mut relations_used = BTreeSet::new();
+        let truncate = |items: Vec<serde_json::Value>| {
+            let total = items.len();
+            let truncated = total > limit;
+            let returned = items.into_iter().take(limit).collect::<Vec<_>>();
+            (returned, total, truncated)
+        };
+
+        match view {
+            "overview" | "relations" => {
+                let mut relation_counts = self.rust_graph_relation_counts(&ws)?;
+                if view == "relations" && relation != "all" {
+                    relation_counts = relation_counts
+                        .remove(relation)
+                        .map(|count| BTreeMap::from([(relation.to_string(), count)]))
+                        .unwrap_or_default();
+                }
+                for relation in relation_counts.keys() {
+                    relations_used.insert(relation.clone());
+                }
+                Ok(json!({
+                    "status": "ok",
+                    "view": view,
+                    "workspace": ws,
+                    "graph_schema": rust_graph_schema_json(),
+                    "relation_counts": relation_counts,
+                    "relations_used": relations_used.into_iter().collect::<Vec<_>>(),
+                    "filters": filters,
+                    "summary": {
+                        "relation_count": relation_counts.len(),
+                    }
+                }))
+            }
+            "nodes" => {
+                let mut nodes = Vec::new();
+                if (kind == "all" || kind == "context") && filter_symbol.is_empty() {
+                    relations_used.insert("context".to_string());
+                    let rows = self
+                        .run_script(
+                            "?[name, description, module_path] := *context{workspace: $ws, name, state: 'actual', description, module_path @ 'NOW'} :limit 500",
+                            params_map(&[("ws", &ws)]),
+                            ScriptMutability::Immutable,
+                        )
+                        .map_err(|e| anyhow::anyhow!("graph context nodes: {:?}", e))?;
+                    for row in &rows.rows {
+                        let name = dv_str(&row[0]);
+                        let module_path = dv_str(&row[2]);
+                        if !filter_context.is_empty()
+                            && !text_matches(&name, &filter_context)
+                            && !text_matches(&module_path, &filter_context)
+                        {
+                            continue;
+                        }
+                        nodes.push(json!({
+                            "id": format!("context:{name}"),
+                            "kind": "context",
+                            "name": name,
+                            "module_path": module_path,
+                            "description": dv_str(&row[1]),
+                            "relation": "context",
+                        }));
+                    }
+                }
+                if (kind == "all" || kind == "module") && filter_symbol.is_empty() {
+                    relations_used.insert("module".to_string());
+                    let rows = self
+                        .run_script(
+                            "?[context, name, path, public, file_path, description] := *module{workspace: $ws, context, name, state: 'actual', path, public, file_path, description @ 'NOW'} :limit 500",
+                            params_map(&[("ws", &ws)]),
+                            ScriptMutability::Immutable,
+                        )
+                        .map_err(|e| anyhow::anyhow!("graph module nodes: {:?}", e))?;
+                    for row in &rows.rows {
+                        let context = dv_str(&row[0]);
+                        let name = dv_str(&row[1]);
+                        let path = dv_str(&row[2]);
+                        let file_path = dv_str(&row[4]);
+                        if !filter_context.is_empty()
+                            && !text_matches(&context, &filter_context)
+                            && !text_matches(&name, &filter_context)
+                            && !text_matches(&path, &filter_context)
+                        {
+                            continue;
+                        }
+                        if !filter_file.is_empty() && !text_matches(&file_path, &filter_file) {
+                            continue;
+                        }
+                        nodes.push(json!({
+                            "id": format!("module:{path}"),
+                            "kind": "module",
+                            "name": name,
+                            "context": context,
+                            "path": path,
+                            "public": matches!(&row[3], cozo::DataValue::Bool(true)),
+                            "file": file_path,
+                            "description": dv_str(&row[5]),
+                            "relation": "module",
+                        }));
+                    }
+                }
+                if (kind == "all" || kind == "source_file") && filter_symbol.is_empty() {
+                    relations_used.insert("source_file".to_string());
+                    let rows = self
+                        .run_script(
+                            "?[path, context, language] := *source_file{workspace: $ws, path, state: 'actual', context, language @ 'NOW'} :limit 500",
+                            params_map(&[("ws", &ws)]),
+                            ScriptMutability::Immutable,
+                        )
+                        .map_err(|e| anyhow::anyhow!("graph source_file nodes: {:?}", e))?;
+                    for row in &rows.rows {
+                        let path = dv_str(&row[0]);
+                        let context = dv_str(&row[1]);
+                        if !filter_context.is_empty() && !text_matches(&context, &filter_context) {
+                            continue;
+                        }
+                        if !filter_file.is_empty() && !text_matches(&path, &filter_file) {
+                            continue;
+                        }
+                        nodes.push(json!({
+                            "id": format!("source_file:{path}"),
+                            "kind": "source_file",
+                            "path": path,
+                            "context": context,
+                            "language": dv_str(&row[2]),
+                            "relation": "source_file",
+                        }));
+                    }
+                }
+                if kind == "all"
+                    || kind == "symbol"
+                    || matches!(kind, "struct" | "enum" | "function" | "method")
+                {
+                    relations_used.insert("symbol".to_string());
+                    let rows = self
+                        .run_script(
+                            "?[name, kind, context, file_path, start_line, end_line, visibility] := *symbol{workspace: $ws, name, state: 'actual', kind, context, file_path, start_line, end_line, visibility @ 'NOW'} :limit 500",
+                            params_map(&[("ws", &ws)]),
+                            ScriptMutability::Immutable,
+                        )
+                        .map_err(|e| anyhow::anyhow!("graph symbol nodes: {:?}", e))?;
+                    for row in &rows.rows {
+                        let name = dv_str(&row[0]);
+                        let symbol_kind = dv_str(&row[1]);
+                        let context = dv_str(&row[2]);
+                        let file_path = dv_str(&row[3]);
+                        if kind != "all" && kind != "symbol" && kind != symbol_kind {
+                            continue;
+                        }
+                        if !filter_symbol.is_empty() && !text_matches(&name, &filter_symbol) {
+                            continue;
+                        }
+                        if !filter_context.is_empty() && !text_matches(&context, &filter_context) {
+                            continue;
+                        }
+                        if !filter_file.is_empty() && !text_matches(&file_path, &filter_file) {
+                            continue;
+                        }
+                        nodes.push(json!({
+                            "id": format!("symbol:{name}"),
+                            "kind": symbol_kind,
+                            "name": name,
+                            "context": context,
+                            "file": file_path,
+                            "start_line": dv_i64(&row[4]),
+                            "end_line": dv_i64(&row[5]),
+                            "visibility": dv_str(&row[6]),
+                            "relation": "symbol",
+                        }));
+                    }
+                }
+                let (nodes, total, truncated) = truncate(nodes);
+                Ok(json!({
+                    "status": "ok",
+                    "view": "nodes",
+                    "workspace": ws,
+                    "nodes": nodes,
+                    "count": nodes.len(),
+                    "total_before_limit": total,
+                    "truncated": truncated,
+                    "relations_used": relations_used.into_iter().collect::<Vec<_>>(),
+                    "filters": filters,
+                }))
+            }
+            "edges" => {
+                let mut edges = Vec::new();
+                if relation == "all" || relation == "context_dep" {
+                    relations_used.insert("context_dep".to_string());
+                    let rows = self
+                        .run_script(
+                            "?[from_ctx, to_ctx] := *context_dep{workspace: $ws, from_ctx, to_ctx, state: 'actual' @ 'NOW'} :limit 500",
+                            params_map(&[("ws", &ws)]),
+                            ScriptMutability::Immutable,
+                        )
+                        .map_err(|e| anyhow::anyhow!("graph context_dep edges: {:?}", e))?;
+                    for row in &rows.rows {
+                        let from = dv_str(&row[0]);
+                        let to = dv_str(&row[1]);
+                        if !filter_context.is_empty()
+                            && !text_matches(&from, &filter_context)
+                            && !text_matches(&to, &filter_context)
+                        {
+                            continue;
+                        }
+                        if !filter_from.is_empty() && !text_matches(&from, &filter_from) {
+                            continue;
+                        }
+                        if !filter_to.is_empty() && !text_matches(&to, &filter_to) {
+                            continue;
+                        }
+                        edges.push(json!({
+                            "id": format!("context_dep:{from}->{to}"),
+                            "relation": "context_dep",
+                            "from": from,
+                            "to": to,
+                            "from_kind": "context",
+                            "to_kind": "context",
+                        }));
+                    }
+                }
+                if relation == "all" || relation == "import_edge" {
+                    relations_used.insert("import_edge".to_string());
+                    let rows = self
+                        .run_script(
+                            "?[from_file, to_module, context] := *import_edge{workspace: $ws, from_file, to_module, state: 'actual', context @ 'NOW'} :limit 500",
+                            params_map(&[("ws", &ws)]),
+                            ScriptMutability::Immutable,
+                        )
+                        .map_err(|e| anyhow::anyhow!("graph import_edge edges: {:?}", e))?;
+                    for row in &rows.rows {
+                        let from_file = dv_str(&row[0]);
+                        let to_module = dv_str(&row[1]);
+                        let context = dv_str(&row[2]);
+                        if !filter_context.is_empty() && !text_matches(&context, &filter_context) {
+                            continue;
+                        }
+                        if !filter_file.is_empty() && !text_matches(&from_file, &filter_file) {
+                            continue;
+                        }
+                        if !filter_symbol.is_empty() && !text_matches(&to_module, &filter_symbol) {
+                            continue;
+                        }
+                        if !filter_from.is_empty() && !text_matches(&from_file, &filter_from) {
+                            continue;
+                        }
+                        if !filter_to.is_empty() && !text_matches(&to_module, &filter_to) {
+                            continue;
+                        }
+                        edges.push(json!({
+                            "id": format!("import_edge:{from_file}->{to_module}"),
+                            "relation": "import_edge",
+                            "from": from_file,
+                            "to": to_module,
+                            "from_kind": "source_file",
+                            "to_kind": "module_path",
+                            "context": context,
+                        }));
+                    }
+                }
+                if relation == "all" || relation == "calls_symbol" {
+                    relations_used.insert("calls_symbol".to_string());
+                    let calls_query = if filter_context.is_empty()
+                        && filter_file.is_empty()
+                        && filter_symbol.is_empty()
+                        && filter_from.is_empty()
+                        && filter_to.is_empty()
+                    {
+                        "?[caller, callee, file_path, line, context] := *calls_symbol{workspace: $ws, caller, callee, state: 'actual', file_path, line, context @ 'NOW'} :limit 500"
+                    } else {
+                        "?[caller, callee, file_path, line, context] := *calls_symbol{workspace: $ws, caller, callee, state: 'actual', file_path, line, context @ 'NOW'}"
+                    };
+                    let rows = self
+                        .run_script(
+                            calls_query,
+                            params_map(&[("ws", &ws)]),
+                            ScriptMutability::Immutable,
+                        )
+                        .map_err(|e| anyhow::anyhow!("graph calls_symbol edges: {:?}", e))?;
+                    for row in &rows.rows {
+                        let caller = dv_str(&row[0]);
+                        let callee = dv_str(&row[1]);
+                        let file_path = dv_str(&row[2]);
+                        let context = dv_str(&row[4]);
+                        if !filter_context.is_empty() && !text_matches(&context, &filter_context) {
+                            continue;
+                        }
+                        if !filter_file.is_empty() && !text_matches(&file_path, &filter_file) {
+                            continue;
+                        }
+                        if !filter_symbol.is_empty()
+                            && !text_matches(&caller, &filter_symbol)
+                            && !text_matches(&callee, &filter_symbol)
+                        {
+                            continue;
+                        }
+                        if !filter_from.is_empty() && !text_matches(&caller, &filter_from) {
+                            continue;
+                        }
+                        if !filter_to.is_empty() && !text_matches(&callee, &filter_to) {
+                            continue;
+                        }
+                        edges.push(json!({
+                            "id": format!("calls_symbol:{caller}->{callee}:{}", dv_i64(&row[3])),
+                            "relation": "calls_symbol",
+                            "from": caller,
+                            "to": callee,
+                            "from_kind": "symbol",
+                            "to_kind": "symbol",
+                            "file": file_path,
+                            "line": dv_i64(&row[3]),
+                            "context": context,
+                        }));
+                    }
+                }
+                if relation == "all" || relation == "ast_edge" {
+                    relations_used.insert("ast_edge".to_string());
+                    let rows = self
+                        .run_script(
+                            "?[from_node, to_node, edge_type] := *ast_edge{workspace: $ws, state: 'actual', from_node, to_node, edge_type @ 'NOW'} :limit 500",
+                            params_map(&[("ws", &ws)]),
+                            ScriptMutability::Immutable,
+                        )
+                        .map_err(|e| anyhow::anyhow!("graph ast_edge edges: {:?}", e))?;
+                    for row in &rows.rows {
+                        let from_node = dv_str(&row[0]);
+                        let to_node = dv_str(&row[1]);
+                        if !filter_symbol.is_empty()
+                            && !text_matches(&from_node, &filter_symbol)
+                            && !text_matches(&to_node, &filter_symbol)
+                        {
+                            continue;
+                        }
+                        if !filter_from.is_empty() && !text_matches(&from_node, &filter_from) {
+                            continue;
+                        }
+                        if !filter_to.is_empty() && !text_matches(&to_node, &filter_to) {
+                            continue;
+                        }
+                        edges.push(json!({
+                            "id": format!("ast_edge:{from_node}->{to_node}"),
+                            "relation": "ast_edge",
+                            "from": from_node,
+                            "to": to_node,
+                            "from_kind": "symbol",
+                            "to_kind": "symbol",
+                            "edge_type": dv_str(&row[2]),
+                        }));
+                    }
+                }
+                let (edges, total, truncated) = truncate(edges);
+                Ok(json!({
+                    "status": "ok",
+                    "view": "edges",
+                    "workspace": ws,
+                    "edges": edges,
+                    "count": edges.len(),
+                    "total_before_limit": total,
+                    "truncated": truncated,
+                    "relations_used": relations_used.into_iter().collect::<Vec<_>>(),
+                    "filters": filters,
+                }))
+            }
+            "neighborhood" => {
+                if context_filter.is_empty() && file_filter.is_empty() && symbol_filter.is_empty() {
+                    anyhow::bail!(
+                        "neighborhood requires one of 'context'/'module', 'file', or 'symbol'"
+                    );
+                }
+                let nodes = self.query_rust_graph(
+                    &ws,
+                    &json!({
+                        "view": "nodes",
+                        "kind": kind,
+                        "context": context_filter,
+                        "file": file_filter,
+                        "symbol": symbol_filter,
+                        "limit": limit,
+                    }),
+                )?;
+                let edges = self.query_rust_graph(
+                    &ws,
+                    &json!({
+                        "view": "edges",
+                        "relation": relation,
+                        "context": context_filter,
+                        "file": file_filter,
+                        "symbol": symbol_filter,
+                        "limit": limit,
+                    }),
+                )?;
+                let mut neighborhood_nodes = nodes["nodes"].as_array().cloned().unwrap_or_default();
+                let mut node_ids = neighborhood_nodes
+                    .iter()
+                    .filter_map(|node| node["id"].as_str().map(str::to_string))
+                    .collect::<BTreeSet<_>>();
+                if let Some(edge_values) = edges["edges"].as_array() {
+                    for edge in edge_values {
+                        for (name_field, kind_field) in [("from", "from_kind"), ("to", "to_kind")] {
+                            let name = edge[name_field].as_str().unwrap_or("");
+                            if name.is_empty() {
+                                continue;
+                            }
+                            let node_kind = edge[kind_field].as_str().unwrap_or("node");
+                            let node_id = format!("{node_kind}:{name}");
+                            if node_ids.insert(node_id.clone()) {
+                                neighborhood_nodes.push(json!({
+                                    "id": node_id,
+                                    "kind": node_kind,
+                                    "name": name,
+                                    "context": edge["context"].as_str().unwrap_or(""),
+                                    "file": edge["file"].as_str().unwrap_or(""),
+                                    "relation": edge["relation"].as_str().unwrap_or("edge_endpoint"),
+                                }));
+                            }
+                        }
+                    }
+                }
+                let mut relation_values = BTreeSet::new();
+                for relation in nodes["relations_used"].as_array().into_iter().flatten() {
+                    if let Some(relation) = relation.as_str() {
+                        relation_values.insert(relation.to_string());
+                    }
+                }
+                for relation in edges["relations_used"].as_array().into_iter().flatten() {
+                    if let Some(relation) = relation.as_str() {
+                        relation_values.insert(relation.to_string());
+                    }
+                }
+                let node_count = neighborhood_nodes.len() as u64;
+                let edge_count = edges["count"].as_u64().unwrap_or(0);
+                Ok(json!({
+                    "status": "ok",
+                    "view": "neighborhood",
+                    "workspace": ws,
+                    "focal": {
+                        "context": context_filter,
+                        "file": file_filter,
+                        "symbol": symbol_filter,
+                    },
+                    "nodes": neighborhood_nodes,
+                    "edges": edges["edges"].clone(),
+                    "count": node_count + edge_count,
+                    "summary": {
+                        "node_count": node_count,
+                        "edge_count": edge_count,
+                    },
+                    "truncated": nodes["truncated"].as_bool().unwrap_or(false) || edges["truncated"].as_bool().unwrap_or(false),
+                    "relations_used": relation_values.into_iter().collect::<Vec<_>>(),
+                    "filters": filters,
+                }))
+            }
+            "paths" => {
+                if relation == "all" || relation == "context_dep" {
+                    if from_filter.is_empty() || to_filter.is_empty() {
+                        anyhow::bail!("paths with context_dep require 'from' and 'to'");
+                    }
+                    relations_used.insert("context_dep".to_string());
+                    let paths = self.query_dependency_path(&ws, from_filter, to_filter)?;
+                    Ok(json!({
+                        "status": "ok",
+                        "view": "paths",
+                        "workspace": ws,
+                        "relation": "context_dep",
+                        "from": from_filter,
+                        "to": to_filter,
+                        "reachable": !paths.is_empty(),
+                        "paths": paths,
+                        "count": paths.len(),
+                        "relations_used": relations_used.into_iter().collect::<Vec<_>>(),
+                        "filters": filters,
+                    }))
+                } else if relation == "calls_symbol" {
+                    if from_filter.is_empty() {
+                        anyhow::bail!("paths with calls_symbol require 'from'");
+                    }
+                    relations_used.insert("calls_symbol".to_string());
+                    if to_filter.is_empty() {
+                        let result = self.call_graph_reachability(&ws, from_filter)?;
+                        Ok(json!({
+                            "status": "ok",
+                            "view": "paths",
+                            "workspace": ws,
+                            "relation": "calls_symbol",
+                            "from": from_filter,
+                            "to": to_filter,
+                            "reachable": result["count"].as_u64().unwrap_or(0) > 0,
+                            "result": result,
+                            "count": result["count"],
+                            "relations_used": relations_used.into_iter().collect::<Vec<_>>(),
+                            "filters": filters,
+                        }))
+                    } else {
+                        let paths = self.query_call_paths(&ws, from_filter, to_filter)?;
+                        Ok(json!({
+                            "status": "ok",
+                            "view": "paths",
+                            "workspace": ws,
+                            "relation": "calls_symbol",
+                            "from": from_filter,
+                            "to": to_filter,
+                            "reachable": !paths.is_empty(),
+                            "paths": paths,
+                            "count": paths.len(),
+                            "relations_used": relations_used.into_iter().collect::<Vec<_>>(),
+                            "filters": filters,
+                        }))
+                    }
+                } else {
+                    anyhow::bail!("paths supports relation 'context_dep' or 'calls_symbol'");
+                }
+            }
+            other => anyhow::bail!(
+                "Unknown graph view '{other}'. Use overview, relations, nodes, edges, neighborhood, or paths."
+            ),
+        }
+    }
+
+    pub fn rust_graph_relation_counts(&self, workspace: &str) -> Result<BTreeMap<String, usize>> {
+        let mut counts = BTreeMap::new();
+        let relations = [
+            (
+                "context",
+                "?[count(name)] := *context{workspace: $ws, name, state: 'actual' @ 'NOW'}",
+            ),
+            (
+                "module",
+                "?[count(name)] := *module{workspace: $ws, name, state: 'actual' @ 'NOW'}",
+            ),
+            (
+                "source_file",
+                "?[count(path)] := *source_file{workspace: $ws, path, state: 'actual' @ 'NOW'}",
+            ),
+            (
+                "symbol",
+                "?[count(name)] := *symbol{workspace: $ws, name, state: 'actual' @ 'NOW'}",
+            ),
+            (
+                "context_dep",
+                "?[count(from_ctx)] := *context_dep{workspace: $ws, from_ctx, state: 'actual' @ 'NOW'}",
+            ),
+            (
+                "import_edge",
+                "?[count(from_file)] := *import_edge{workspace: $ws, from_file, state: 'actual' @ 'NOW'}",
+            ),
+            (
+                "calls_symbol",
+                "?[count(caller)] := *calls_symbol{workspace: $ws, caller, state: 'actual' @ 'NOW'}",
+            ),
+            (
+                "ast_edge",
+                "?[count(from_node)] := *ast_edge{workspace: $ws, from_node, state: 'actual' @ 'NOW'}",
+            ),
+        ];
+
+        for (relation, query) in relations {
+            let rows = self
+                .run_script(
+                    query,
+                    params_map(&[("ws", workspace)]),
+                    ScriptMutability::Immutable,
+                )
+                .map_err(|e| anyhow::anyhow!("graph relation count {relation}: {:?}", e))?;
+            let count = rows.rows.first().map(|row| dv_i64(&row[0])).unwrap_or(0);
+            counts.insert(relation.to_string(), count.max(0) as usize);
+        }
+
+        Ok(counts)
     }
 
     pub fn impact_analysis(
@@ -4323,8 +5073,8 @@ impl Store {
 
         let ast_impact = self
             .run_script(
-                "ast[target, type] := *ast_edge{workspace: $ws, state: 'actual', from_node: $ent, to_node: target, edge_type: type @ 'NOW'} \
-                 ast[target, type] := ast[mid, _], *ast_edge{workspace: $ws, state: 'actual', from_node: mid, to_node: target, edge_type: type @ 'NOW'} \
+                "ast[target, type] := *ast_edge{workspace: $ws, from_node: $ent, to_node: target, edge_type: type @ 'NOW'} \
+                 ast[target, type] := ast[mid, _], *ast_edge{workspace: $ws, from_node: mid, to_node: target, edge_type: type @ 'NOW'} \
                  ?[target, type] := ast[target, type]",
                 params_map(&[("ws", workspace), ("ent", entity_name)]),
                 ScriptMutability::Immutable,
@@ -4334,13 +5084,15 @@ impl Store {
         // Symbol-level: find files that import modules containing this entity name
         let importing_files = self
             .run_script(
-                "?[from_file, to_module, context] := *import_edge{workspace: $ws, from_file, to_module, state: 'actual', context @ 'NOW'}, \
-                 is_in(to_module, $ent)",
-                params_map(&[("ws", workspace), ("ent", entity_name)]),
+                "?[from_file, to_module, context] := *import_edge{workspace: $ws, from_file, to_module, context @ 'NOW'}",
+                params_map(&[("ws", workspace)]),
                 ScriptMutability::Immutable,
             )
             .map(|r| r.rows)
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|row| import_references_symbol(&dv_str(&row[1]), entity_name))
+            .collect::<Vec<_>>();
 
         Ok(json!({
             "entity": entity_name,
@@ -4391,29 +5143,104 @@ impl Store {
         from_context: &str,
         to_context: &str,
     ) -> Result<Vec<Vec<String>>> {
-        let params = params_map(&[
-            ("ws", workspace),
-            ("from_ctx", from_context),
-            ("to_ctx", to_context),
-        ]);
+        let params = params_map(&[("ws", workspace)]);
         let result = self
             .run_script(
-                "reachable[a, b] := *context_dep{workspace: $ws, from_ctx: a, to_ctx: b, state: 'desired' @ 'NOW'} \
-                 reachable[a, c] := reachable[a, b], *context_dep{workspace: $ws, from_ctx: b, to_ctx: c, state: 'desired' @ 'NOW'} \
-                 on_path[a, b] := *context_dep{workspace: $ws, from_ctx: a, to_ctx: b, state: 'desired' @ 'NOW'}, reachable[a, $to_ctx], a == $from_ctx \
-                 on_path[a, b] := *context_dep{workspace: $ws, from_ctx: a, to_ctx: b, state: 'desired' @ 'NOW'}, reachable[$from_ctx, a], reachable[b, $to_ctx] \
-                 on_path[a, b] := *context_dep{workspace: $ws, from_ctx: a, to_ctx: b, state: 'desired' @ 'NOW'}, reachable[$from_ctx, a], b == $to_ctx \
-                 ?[a, b] := on_path[a, b]",
+                "?[from_ctx, to_ctx] := *context_dep{workspace: $ws, from_ctx, to_ctx @ 'NOW'}",
                 params,
                 ScriptMutability::Immutable,
             )
             .map_err(|e| anyhow::anyhow!("query_dependency_path: {:?}", e))?;
 
-        Ok(result
-            .rows
+        if from_context == to_context {
+            return Ok(vec![vec![from_context.to_string()]]);
+        }
+
+        let mut adjacency: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut contexts = BTreeSet::new();
+        for row in &result.rows {
+            let from_ctx = dv_str(&row[0]);
+            let to_ctx = dv_str(&row[1]);
+            contexts.insert(from_ctx.clone());
+            contexts.insert(to_ctx.clone());
+            adjacency.entry(from_ctx).or_default().push(to_ctx);
+        }
+        for targets in adjacency.values_mut() {
+            targets.sort();
+            targets.dedup();
+        }
+
+        let max_depth = contexts.len().max(1);
+        let mut paths = Vec::new();
+        let mut path = vec![from_context.to_string()];
+        let mut visited = BTreeSet::from([from_context.to_string()]);
+        collect_dependency_paths(
+            from_context,
+            to_context,
+            &adjacency,
+            &mut visited,
+            &mut path,
+            &mut paths,
+            max_depth,
+        );
+        Ok(paths)
+    }
+
+    pub fn query_call_paths(
+        &self,
+        workspace: &str,
+        from_symbol: &str,
+        to_symbol: &str,
+    ) -> Result<Vec<Vec<String>>> {
+        let ws = canonicalize_path(workspace);
+        let params = params_map(&[("ws", &ws)]);
+        let result = self
+            .run_script(
+                "?[caller, callee] := *calls_symbol{workspace: $ws, caller, callee, state: 'actual' @ 'NOW'}",
+                params,
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| anyhow::anyhow!("query_call_paths: {:?}", e))?;
+
+        if from_symbol == to_symbol {
+            return Ok(vec![vec![from_symbol.to_string()]]);
+        }
+
+        let mut adjacency: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut symbols = BTreeSet::new();
+        for row in &result.rows {
+            let caller = dv_str(&row[0]);
+            let callee = dv_str(&row[1]);
+            symbols.insert(caller.clone());
+            symbols.insert(callee.clone());
+            adjacency.entry(caller).or_default().push(callee);
+        }
+        for targets in adjacency.values_mut() {
+            targets.sort();
+            targets.dedup();
+        }
+
+        let start_symbols = symbols
             .iter()
-            .map(|r| vec![dv_str(&r[0]), dv_str(&r[1])])
-            .collect())
+            .filter(|symbol| symbol_lookup_matches(symbol, from_symbol))
+            .cloned()
+            .collect::<Vec<_>>();
+        let max_depth = symbols.len().max(1);
+        let mut paths = Vec::new();
+        for start_symbol in start_symbols {
+            let mut path = vec![start_symbol.clone()];
+            let mut visited = BTreeSet::from([start_symbol.clone()]);
+            collect_dependency_paths(
+                &start_symbol,
+                to_symbol,
+                &adjacency,
+                &mut visited,
+                &mut path,
+                &mut paths,
+                max_depth,
+            );
+        }
+        Ok(paths)
     }
 
     pub fn can_delete_symbol(
@@ -4423,72 +5250,148 @@ impl Store {
         entity_name: &str,
     ) -> Result<serde_json::Value> {
         let params = params_map(&[("ws", workspace), ("ctx", context), ("ent", entity_name)]);
+        let workspace_params = params_map(&[("ws", workspace), ("ent", entity_name)]);
 
-        let aggreg = self.run_script(
-            "?[agg] := *aggregate_member{workspace: $ws, context: $ctx, member: $ent, state: 'desired', aggregate: agg @ 'NOW'}",
-            params.clone(),
-            ScriptMutability::Immutable,
-        ).map_err(|e| anyhow::anyhow!("check aggregate: {:?}", e))?;
+        let aggreg = if context.is_empty() {
+            self.run_script(
+                "?[context, agg] := *aggregate_member{workspace: $ws, context, member: $ent, state: 'desired', aggregate: agg @ 'NOW'}",
+                workspace_params.clone(),
+                ScriptMutability::Immutable,
+            )
+        } else {
+            self.run_script(
+                "?[context, agg] := *aggregate_member{workspace: $ws, context, member: $ent, state: 'desired', aggregate: agg @ 'NOW'}, context = $ctx",
+                params.clone(),
+                ScriptMutability::Immutable,
+            )
+        }
+        .map_err(|e| anyhow::anyhow!("check aggregate: {:?}", e))?;
 
-        let events = self.run_script(
-            "?[evt, file_path, start_line, end_line] := *event{workspace: $ws, context: $ctx, source: $ent, state: 'desired', name: evt, file_path, start_line, end_line @ 'NOW'}",
-            params.clone(),
-            ScriptMutability::Immutable,
-        ).map_err(|e| anyhow::anyhow!("check events: {:?}", e))?;
+        let events = if context.is_empty() {
+            self.run_script(
+                "?[context, evt, file_path, start_line, end_line] := *event{workspace: $ws, context, source: $ent, state: 'desired', name: evt, file_path, start_line, end_line @ 'NOW'}",
+                workspace_params.clone(),
+                ScriptMutability::Immutable,
+            )
+        } else {
+            self.run_script(
+                "?[context, evt, file_path, start_line, end_line] := *event{workspace: $ws, context, source: $ent, state: 'desired', name: evt, file_path, start_line, end_line @ 'NOW'}, context = $ctx",
+                params.clone(),
+                ScriptMutability::Immutable,
+            )
+        }
+        .map_err(|e| anyhow::anyhow!("check events: {:?}", e))?;
 
-        let repos = self.run_script(
-            "?[repo, file_path, start_line, end_line] := *repository{workspace: $ws, context: $ctx, aggregate: $ent, state: 'desired', name: repo, file_path, start_line, end_line @ 'NOW'}",
-            params.clone(),
-            ScriptMutability::Immutable,
-        ).map_err(|e| anyhow::anyhow!("check repo: {:?}", e))?;
+        let repos = if context.is_empty() {
+            self.run_script(
+                "?[context, repo, file_path, start_line, end_line] := *repository{workspace: $ws, context, aggregate: $ent, state: 'desired', name: repo, file_path, start_line, end_line @ 'NOW'}",
+                workspace_params.clone(),
+                ScriptMutability::Immutable,
+            )
+        } else {
+            self.run_script(
+                "?[context, repo, file_path, start_line, end_line] := *repository{workspace: $ws, context, aggregate: $ent, state: 'desired', name: repo, file_path, start_line, end_line @ 'NOW'}, context = $ctx",
+                params.clone(),
+                ScriptMutability::Immutable,
+            )
+        }
+        .map_err(|e| anyhow::anyhow!("check repo: {:?}", e))?;
 
         let has_deps = !aggreg.rows.is_empty() || !events.rows.is_empty() || !repos.rows.is_empty();
 
         // Symbol-level: check if any import edges reference this symbol
         let import_refs = self.run_script(
-            "?[from_file, to_module] := *import_edge{workspace: $ws, from_file, to_module, state: 'actual' @ 'NOW'}, \
-             is_in(to_module, $ent)",
-            params.clone(),
+            "?[from_file, to_module, context] := *import_edge{workspace: $ws, from_file, to_module, context @ 'NOW'}",
+            workspace_params.clone(),
             ScriptMutability::Immutable,
-        ).map_err(|e| anyhow::anyhow!("check import references: {:?}", e))?.rows;
+        ).map_err(|e| anyhow::anyhow!("check import references: {:?}", e))?.rows
+            .into_iter()
+            .filter(|row| import_references_symbol(&dv_str(&row[1]), entity_name))
+            .collect::<Vec<_>>();
 
         // AST edges: check if any node references this symbol
         let ast_refs = self.run_script(
-            "?[from_node, edge_type] := *ast_edge{workspace: $ws, state: 'actual', from_node, to_node: $ent, edge_type @ 'NOW'}",
+            "?[from_node, edge_type] := *ast_edge{workspace: $ws, from_node, to_node: $ent, edge_type @ 'NOW'}",
             params.clone(),
             ScriptMutability::Immutable,
         ).map_err(|e| anyhow::anyhow!("check ast references: {:?}", e))?.rows;
 
-        // Call graph: check if any caller targets this symbol
+        // Call graph: check if any caller targets this symbol or its short method alias.
+        let symbol_aliases = symbol_lookup_aliases(entity_name);
         let call_refs = self.run_script(
-            "?[caller, file_path, line] := *calls_symbol{workspace: $ws, caller, callee: $ent, state: 'actual', file_path, line @ 'NOW'}",
-            params.clone(),
+            "?[caller, callee, file_path, line, context] := *calls_symbol{workspace: $ws, caller, callee, file_path, line, context @ 'NOW'}",
+            workspace_params.clone(),
             ScriptMutability::Immutable,
-        ).map_err(|e| anyhow::anyhow!("check call references: {:?}", e))?.rows;
+        ).map_err(|e| anyhow::anyhow!("check call references: {:?}", e))?.rows
+            .into_iter()
+            .filter(|row| {
+                (context.is_empty() || dv_str(&row[4]) == context)
+                    && symbol_aliases.iter().any(|alias| dv_str(&row[1]) == *alias)
+            })
+            .collect::<Vec<_>>();
+
+        let field_type_refs = self.run_script(
+            "?[context, owner_kind, owner, name, field_type] := *field{workspace: $ws, context, owner_kind, owner, name, field_type @ 'NOW'}",
+            workspace_params.clone(),
+            ScriptMutability::Immutable,
+        ).map_err(|e| anyhow::anyhow!("check field type references: {:?}", e))?.rows
+            .into_iter()
+            .filter(|row| type_references_symbol(&dv_str(&row[4]), entity_name))
+            .collect::<Vec<_>>();
+        let method_return_refs = self.run_script(
+            "?[context, owner_kind, owner, name, return_type] := *method{workspace: $ws, context, owner_kind, owner, name, return_type @ 'NOW'}",
+            workspace_params.clone(),
+            ScriptMutability::Immutable,
+        ).map_err(|e| anyhow::anyhow!("check method return references: {:?}", e))?.rows
+            .into_iter()
+            .filter(|row| type_references_symbol(&dv_str(&row[4]), entity_name))
+            .collect::<Vec<_>>();
+        let method_param_refs = self.run_script(
+            "?[context, owner_kind, owner, method, name, param_type] := *method_param{workspace: $ws, context, owner_kind, owner, method, name, param_type @ 'NOW'}",
+            workspace_params.clone(),
+            ScriptMutability::Immutable,
+        ).map_err(|e| anyhow::anyhow!("check method parameter references: {:?}", e))?.rows
+            .into_iter()
+            .filter(|row| type_references_symbol(&dv_str(&row[5]), entity_name))
+            .collect::<Vec<_>>();
 
         let has_symbol_refs =
             !import_refs.is_empty() || !ast_refs.is_empty() || !call_refs.is_empty();
+        let has_type_refs = !field_type_refs.is_empty()
+            || !method_return_refs.is_empty()
+            || !method_param_refs.is_empty();
 
         Ok(serde_json::json!({
-            "can_delete": !has_deps && !has_symbol_refs,
-            "aggregates_referencing": aggreg.rows.iter().map(|r| dv_str(&r[0])).collect::<Vec<_>>(),
-            "events_sourced": events.rows.iter().map(|r| dv_str(&r[0])).collect::<Vec<_>>(),
-            "repositories_managing": repos.rows.iter().map(|r| dv_str(&r[0])).collect::<Vec<_>>(),
+            "can_delete": !has_deps && !has_symbol_refs && !has_type_refs,
+            "aggregates_referencing": aggreg.rows.iter().map(|r| dv_str(&r[1])).collect::<Vec<_>>(),
+            "events_sourced": events.rows.iter().map(|r| dv_str(&r[1])).collect::<Vec<_>>(),
+            "repositories_managing": repos.rows.iter().map(|r| dv_str(&r[1])).collect::<Vec<_>>(),
+            "aggregate_references": aggreg.rows.iter().map(|r| json!({
+                "context": dv_str(&r[0]),
+                "aggregate": dv_str(&r[1]),
+            })).collect::<Vec<_>>(),
             "event_references": events.rows.iter().map(|r| json!({
-                "event": dv_str(&r[0]),
-                "file": dv_str(&r[1]),
-                "start_line": dv_i64(&r[2]),
-                "end_line": dv_i64(&r[3]),
+                "context": dv_str(&r[0]),
+                "event": dv_str(&r[1]),
+                "file": dv_str(&r[2]),
+                "start_line": dv_i64(&r[3]),
+                "end_line": dv_i64(&r[4]),
             })).collect::<Vec<_>>(),
             "repository_references": repos.rows.iter().map(|r| json!({
-                "repository": dv_str(&r[0]),
-                "file": dv_str(&r[1]),
-                "start_line": dv_i64(&r[2]),
-                "end_line": dv_i64(&r[3]),
+                "context": dv_str(&r[0]),
+                "repository": dv_str(&r[1]),
+                "file": dv_str(&r[2]),
+                "start_line": dv_i64(&r[3]),
+                "end_line": dv_i64(&r[4]),
             })).collect::<Vec<_>>(),
-            "import_references": import_refs.iter().map(|r| json!({"file": dv_str(&r[0]), "import": dv_str(&r[1])})).collect::<Vec<_>>(),
+            "import_references": import_refs.iter().map(|r| json!({"file": dv_str(&r[0]), "import": dv_str(&r[1]), "context": dv_str(&r[2])})).collect::<Vec<_>>(),
             "ast_references": ast_refs.iter().map(|r| json!({"from": dv_str(&r[0]), "edge_type": dv_str(&r[1])})).collect::<Vec<_>>(),
-            "call_references": call_refs.iter().map(|r| json!({"caller": dv_str(&r[0]), "file": dv_str(&r[1]), "line": dv_i64(&r[2])})).collect::<Vec<_>>(),
+            "call_references": call_refs.iter().map(|r| json!({"caller": dv_str(&r[0]), "callee": dv_str(&r[1]), "file": dv_str(&r[2]), "line": dv_i64(&r[3]), "context": dv_str(&r[4])})).collect::<Vec<_>>(),
+            "type_references": {
+                "fields": field_type_refs.iter().map(|r| json!({"context": dv_str(&r[0]), "owner_kind": dv_str(&r[1]), "owner": dv_str(&r[2]), "field": dv_str(&r[3]), "field_type": dv_str(&r[4])})).collect::<Vec<_>>(),
+                "method_returns": method_return_refs.iter().map(|r| json!({"context": dv_str(&r[0]), "owner_kind": dv_str(&r[1]), "owner": dv_str(&r[2]), "method": dv_str(&r[3]), "return_type": dv_str(&r[4])})).collect::<Vec<_>>(),
+                "method_params": method_param_refs.iter().map(|r| json!({"context": dv_str(&r[0]), "owner_kind": dv_str(&r[1]), "owner": dv_str(&r[2]), "method": dv_str(&r[3]), "param": dv_str(&r[4]), "param_type": dv_str(&r[5])})).collect::<Vec<_>>(),
+            },
         }))
     }
 
@@ -4497,42 +5400,62 @@ impl Store {
     /// Return all direct callers of a symbol.
     pub fn call_graph_callers(&self, workspace: &str, symbol: &str) -> Result<serde_json::Value> {
         let ws = canonicalize_path(workspace);
-        let params = params_map(&[("ws", &ws), ("sym", symbol)]);
+        let params = params_map(&[("ws", &ws)]);
         let rows = self.run_script(
-            "?[caller, file_path, line, context] := *calls_symbol{workspace: $ws, caller, callee: $sym, state: 'actual', file_path, line, context @ 'NOW'}",
+            "?[caller, callee, file_path, line, context] := *calls_symbol{workspace: $ws, caller, callee, state: 'actual', file_path, line, context @ 'NOW'}",
             params,
             ScriptMutability::Immutable,
         ).map_err(|e| anyhow::anyhow!("call_graph_callers: {:?}", e))?;
+        let callers = rows
+            .rows
+            .iter()
+            .filter(|row| symbol_lookup_matches(&dv_str(&row[1]), symbol))
+            .map(|r| {
+                json!({
+                    "caller": dv_str(&r[0]),
+                    "callee": dv_str(&r[1]),
+                    "file": dv_str(&r[2]),
+                    "line": dv_i64(&r[3]),
+                    "context": dv_str(&r[4]),
+                })
+            })
+            .collect::<Vec<_>>();
+        let count = callers.len();
         Ok(json!({
             "symbol": symbol,
-            "callers": rows.rows.iter().map(|r| json!({
-                "caller": dv_str(&r[0]),
-                "file": dv_str(&r[1]),
-                "line": dv_i64(&r[2]),
-                "context": dv_str(&r[3]),
-            })).collect::<Vec<_>>(),
-            "count": rows.rows.len(),
+            "callers": callers,
+            "count": count,
         }))
     }
 
     /// Return all direct callees of a symbol.
     pub fn call_graph_callees(&self, workspace: &str, symbol: &str) -> Result<serde_json::Value> {
         let ws = canonicalize_path(workspace);
-        let params = params_map(&[("ws", &ws), ("sym", symbol)]);
+        let params = params_map(&[("ws", &ws)]);
         let rows = self.run_script(
-            "?[callee, file_path, line, context] := *calls_symbol{workspace: $ws, caller: $sym, callee, state: 'actual', file_path, line, context @ 'NOW'}",
+            "?[caller, callee, file_path, line, context] := *calls_symbol{workspace: $ws, caller, callee, state: 'actual', file_path, line, context @ 'NOW'}",
             params,
             ScriptMutability::Immutable,
         ).map_err(|e| anyhow::anyhow!("call_graph_callees: {:?}", e))?;
+        let callees = rows
+            .rows
+            .iter()
+            .filter(|row| symbol_lookup_matches(&dv_str(&row[0]), symbol))
+            .map(|r| {
+                json!({
+                    "caller": dv_str(&r[0]),
+                    "callee": dv_str(&r[1]),
+                    "file": dv_str(&r[2]),
+                    "line": dv_i64(&r[3]),
+                    "context": dv_str(&r[4]),
+                })
+            })
+            .collect::<Vec<_>>();
+        let count = callees.len();
         Ok(json!({
             "symbol": symbol,
-            "callees": rows.rows.iter().map(|r| json!({
-                "callee": dv_str(&r[0]),
-                "file": dv_str(&r[1]),
-                "line": dv_i64(&r[2]),
-                "context": dv_str(&r[3]),
-            })).collect::<Vec<_>>(),
-            "count": rows.rows.len(),
+            "callees": callees,
+            "count": count,
         }))
     }
 
@@ -4543,18 +5466,50 @@ impl Store {
         symbol: &str,
     ) -> Result<serde_json::Value> {
         let ws = canonicalize_path(workspace);
-        let params = params_map(&[("ws", &ws), ("sym", symbol)]);
+        let params = params_map(&[("ws", &ws)]);
         let rows = self.run_script(
-            "reachable[callee] := *calls_symbol{workspace: $ws, caller: $sym, callee, state: 'actual' @ 'NOW'} \
-             reachable[c] := reachable[b], *calls_symbol{workspace: $ws, caller: b, callee: c, state: 'actual' @ 'NOW'} \
-             ?[callee] := reachable[callee]",
+            "?[caller, callee] := *calls_symbol{workspace: $ws, caller, callee, state: 'actual' @ 'NOW'}",
             params,
             ScriptMutability::Immutable,
         ).map_err(|e| anyhow::anyhow!("call_graph_reachability: {:?}", e))?;
+        let mut adjacency: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut starts = Vec::new();
+        for row in &rows.rows {
+            let caller = dv_str(&row[0]);
+            let callee = dv_str(&row[1]);
+            if symbol_lookup_matches(&caller, symbol) {
+                starts.push(caller.clone());
+            }
+            adjacency.entry(caller).or_default().push(callee);
+        }
+        for targets in adjacency.values_mut() {
+            targets.sort();
+            targets.dedup();
+        }
+        starts.sort();
+        starts.dedup();
+
+        let mut reachable = BTreeSet::new();
+        let mut stack = starts;
+        let mut visited = BTreeSet::new();
+        while let Some(current) = stack.pop() {
+            if !visited.insert(current.clone()) {
+                continue;
+            }
+            if let Some(callees) = adjacency.get(&current) {
+                for callee in callees {
+                    if reachable.insert(callee.clone()) {
+                        stack.push(callee.clone());
+                    }
+                }
+            }
+        }
+        let reachable = reachable.into_iter().collect::<Vec<_>>();
+        let count = reachable.len();
         Ok(json!({
             "symbol": symbol,
-            "reachable": rows.rows.iter().map(|r| dv_str(&r[0])).collect::<Vec<_>>(),
-            "count": rows.rows.len(),
+            "reachable": reachable,
+            "count": count,
         }))
     }
 
@@ -4590,6 +5545,50 @@ impl Store {
             ScriptMutability::Immutable,
         ).map_err(|e| anyhow::anyhow!("call_graph_stats hot: {:?}", e))?;
 
+        let call_callees = self.run_script(
+            "?[caller, callee, file_path, line] := *calls_symbol{workspace: $ws, caller, callee, state: 'actual', file_path, line @ 'NOW'}",
+            params.clone(),
+            ScriptMutability::Immutable,
+        ).map_err(|e| anyhow::anyhow!("call_graph_stats callee rows: {:?}", e))?;
+        let symbols = self
+            .run_script(
+                "?[name] := *symbol{workspace: $ws, name, state: 'actual' @ 'NOW'}",
+                params,
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| anyhow::anyhow!("call_graph_stats symbols: {:?}", e))?;
+
+        let mut symbol_aliases: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for row in &symbols.rows {
+            let symbol = dv_str(&row[0]);
+            for alias in symbol_lookup_aliases(&symbol) {
+                symbol_aliases
+                    .entry(alias)
+                    .or_default()
+                    .insert(symbol.clone());
+            }
+        }
+        let mut project_callee_counts: BTreeMap<String, (i64, BTreeSet<String>)> = BTreeMap::new();
+        for row in &call_callees.rows {
+            let callee = dv_str(&row[1]);
+            if let Some(matched_symbols) = symbol_aliases.get(&callee) {
+                let entry = project_callee_counts
+                    .entry(callee)
+                    .or_insert_with(|| (0, BTreeSet::new()));
+                entry.0 += 1;
+                entry.1.extend(matched_symbols.iter().cloned());
+            }
+        }
+        let project_callee_edges = project_callee_counts
+            .values()
+            .map(|(count, _)| *count)
+            .sum::<i64>();
+        let unique_project_callees = project_callee_counts.len();
+        let mut hot_project_callees = project_callee_counts.into_iter().collect::<Vec<_>>();
+        hot_project_callees
+            .sort_by(|left, right| right.1.0.cmp(&left.1.0).then_with(|| left.0.cmp(&right.0)));
+        hot_project_callees.truncate(10);
+
         Ok(json!({
             "total_edges": if total.rows.is_empty() { 0 } else { dv_i64(&total.rows[0][0]) },
             "unique_callers": if unique_callers.rows.is_empty() { 0 } else { dv_i64(&unique_callers.rows[0][0]) },
@@ -4598,21 +5597,121 @@ impl Store {
                 "callee": dv_str(&r[0]),
                 "call_count": dv_i64(&r[1]),
             })).collect::<Vec<_>>(),
+            "project_callee_edges": project_callee_edges,
+            "unique_project_callees": unique_project_callees,
+            "hottest_project_callees": hot_project_callees.into_iter().map(|(callee, (count, matched_symbols))| json!({
+                "callee": callee,
+                "call_count": count,
+                "matched_symbols": matched_symbols.into_iter().collect::<Vec<_>>(),
+            })).collect::<Vec<_>>(),
         }))
+    }
+
+    pub fn field_usage(
+        &self,
+        workspace: &str,
+        field_type: &str,
+    ) -> Result<Vec<(String, String, String, String)>> {
+        let params = params_map(&[("ws", workspace), ("field_type", field_type)]);
+        let rows = self
+            .run_script(
+                "?[ctx, owner_kind, owner, field_name] := \
+                *field{workspace: $ws, context: ctx, owner_kind, owner, \
+                       name: field_name, field_type: $field_type @ 'NOW'}",
+                params,
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| anyhow::anyhow!("field_usage: {:?}", e))?;
+        Ok(rows
+            .rows
+            .iter()
+            .map(|row| {
+                (
+                    dv_str(&row[0]),
+                    dv_str(&row[1]),
+                    dv_str(&row[2]),
+                    dv_str(&row[3]),
+                )
+            })
+            .collect())
+    }
+
+    pub fn method_search(
+        &self,
+        workspace: &str,
+        method_name: &str,
+    ) -> Result<Vec<(String, String, String, String)>> {
+        let params = params_map(&[("ws", workspace), ("method_name", method_name)]);
+        let rows = self
+            .run_script(
+                "?[ctx, owner_kind, owner, return_type] := \
+                *method{workspace: $ws, context: ctx, owner_kind, owner, \
+                        name: $method_name, return_type @ 'NOW'}",
+                params,
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| anyhow::anyhow!("method_search: {:?}", e))?;
+        Ok(rows
+            .rows
+            .iter()
+            .map(|row| {
+                (
+                    dv_str(&row[0]),
+                    dv_str(&row[1]),
+                    dv_str(&row[2]),
+                    dv_str(&row[3]),
+                )
+            })
+            .collect())
+    }
+
+    pub fn shared_fields(
+        &self,
+        workspace: &str,
+    ) -> Result<Vec<(String, String, String, String, String)>> {
+        let params = params_map(&[("ws", workspace)]);
+        let rows = self
+            .run_script(
+                "entity_field[ctx, owner, name, ft] := \
+                *field{workspace: $ws, context: ctx, owner_kind: 'entity', \
+                       owner, name, field_type: ft @ 'NOW'} \
+             event_field[ctx, owner, name, ft] := \
+                *field{workspace: $ws, context: ctx, owner_kind: 'event', \
+                       owner, name, field_type: ft @ 'NOW'} \
+             ?[ctx, entity, event, field_name, field_type] := \
+                entity_field[ctx, entity, field_name, field_type], \
+                event_field[ctx, event, field_name, field_type]",
+                params,
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| anyhow::anyhow!("shared_fields: {:?}", e))?;
+        Ok(rows
+            .rows
+            .iter()
+            .map(|row| {
+                (
+                    dv_str(&row[0]),
+                    dv_str(&row[1]),
+                    dv_str(&row[2]),
+                    dv_str(&row[3]),
+                    dv_str(&row[4]),
+                )
+            })
+            .collect())
     }
 
     pub fn dependency_graph(&self, workspace: &str) -> Result<serde_json::Value> {
         let params = params_map(&[("ws", workspace)]);
         let contexts = self
             .run_script(
-                "?[name, module_path] := *context{workspace: $ws, name, module_path, state: 'desired' @ 'NOW'}",
+                "?[name, module_path] := *context{workspace: $ws, name, module_path @ 'NOW'}",
                 params.clone(),
                 ScriptMutability::Immutable,
             )
             .map_err(|e| anyhow::anyhow!("dependency_graph contexts: {:?}", e))?;
         let deps = self
             .run_script(
-                "?[from_ctx, to_ctx] := *context_dep{workspace: $ws, from_ctx, to_ctx, state: 'desired' @ 'NOW'}",
+                "?[from_ctx, to_ctx] := *context_dep{workspace: $ws, from_ctx, to_ctx @ 'NOW'}",
                 params.clone(),
                 ScriptMutability::Immutable,
             )
@@ -4650,8 +5749,8 @@ impl Store {
 
         // Search contexts
         if let Ok(r) = self.run_script(
-            "?[name, description, score] := ~context:fts{workspace, name, state | query: $q, k: $k, bind_score: score}, \
-             workspace = $ws, state = 'desired', *context{workspace, name, state, description @ 'NOW'}",
+            "?[name, description, score] := ~context:fts{workspace, name | query: $q, k: $k, bind_score: score}, \
+             workspace = $ws, *context{workspace, name, description @ 'NOW'}",
             params.clone(), ScriptMutability::Immutable,
         ) {
             for row in &r.rows {
@@ -4661,8 +5760,8 @@ impl Store {
 
         // Search entities
         if let Ok(r) = self.run_script(
-            "?[context, name, description, score] := ~entity:fts{workspace, context, name, state | query: $q, k: $k, bind_score: score}, \
-             workspace = $ws, state = 'desired', *entity{workspace, context, name, state, description @ 'NOW'}",
+            "?[context, name, description, score] := ~entity:fts{workspace, context, name | query: $q, k: $k, bind_score: score}, \
+             workspace = $ws, *entity{workspace, context, name, description @ 'NOW'}",
             params.clone(), ScriptMutability::Immutable,
         ) {
             for row in &r.rows {
@@ -4672,8 +5771,8 @@ impl Store {
 
         // Search services
         if let Ok(r) = self.run_script(
-            "?[context, name, description, score] := ~service:fts{workspace, context, name, state | query: $q, k: $k, bind_score: score}, \
-             workspace = $ws, state = 'desired', *service{workspace, context, name, state, description @ 'NOW'}",
+            "?[context, name, description, score] := ~service:fts{workspace, context, name | query: $q, k: $k, bind_score: score}, \
+             workspace = $ws, *service{workspace, context, name, description @ 'NOW'}",
             params.clone(), ScriptMutability::Immutable,
         ) {
             for row in &r.rows {
@@ -4683,8 +5782,8 @@ impl Store {
 
         // Search events
         if let Ok(r) = self.run_script(
-            "?[context, name, description, score] := ~event:fts{workspace, context, name, state | query: $q, k: $k, bind_score: score}, \
-             workspace = $ws, state = 'desired', *event{workspace, context, name, state, description @ 'NOW'}",
+            "?[context, name, description, score] := ~event:fts{workspace, context, name | query: $q, k: $k, bind_score: score}, \
+             workspace = $ws, *event{workspace, context, name, description @ 'NOW'}",
             params.clone(), ScriptMutability::Immutable,
         ) {
             for row in &r.rows {
@@ -4694,8 +5793,8 @@ impl Store {
 
         // Search decision titles
         if let Ok(r) = self.run_script(
-            "?[id, title, score] := ~architectural_decision:title_fts{workspace, id, state | query: $q, k: $k, bind_score: score}, \
-             workspace = $ws, state = 'desired', *architectural_decision{workspace, id, state, title @ 'NOW'}",
+            "?[id, title, score] := ~architectural_decision:title_fts{workspace, id | query: $q, k: $k, bind_score: score}, \
+             workspace = $ws, *architectural_decision{workspace, id, title @ 'NOW'}",
             params.clone(), ScriptMutability::Immutable,
         ) {
             for row in &r.rows {
@@ -4705,8 +5804,8 @@ impl Store {
 
         // Search decision rationales
         if let Ok(r) = self.run_script(
-            "?[id, title, rationale, score] := ~architectural_decision:rationale_fts{workspace, id, state | query: $q, k: $k, bind_score: score}, \
-             workspace = $ws, state = 'desired', *architectural_decision{workspace, id, state, title, rationale @ 'NOW'}",
+            "?[id, title, rationale, score] := ~architectural_decision:rationale_fts{workspace, id | query: $q, k: $k, bind_score: score}, \
+             workspace = $ws, *architectural_decision{workspace, id, title, rationale @ 'NOW'}",
             params.clone(), ScriptMutability::Immutable,
         ) {
             for row in &r.rows {
@@ -4720,8 +5819,8 @@ impl Store {
 
         // Search invariant text
         if let Ok(r) = self.run_script(
-            "?[context, entity, text, score] := ~invariant:text_fts{workspace, context, entity, idx, state | query: $q, k: $k, bind_score: score}, \
-             workspace = $ws, state = 'desired', *invariant{workspace, context, entity, idx, state, text @ 'NOW'}",
+            "?[context, entity, text, score] := ~invariant:text_fts{workspace, context, entity, idx | query: $q, k: $k, bind_score: score}, \
+             workspace = $ws, *invariant{workspace, context, entity, idx, text @ 'NOW'}",
             params.clone(), ScriptMutability::Immutable,
         ) {
             for row in &r.rows {
@@ -4814,6 +5913,103 @@ impl Store {
                         }));
                     }
                 }
+                for source_file in &model.source_files {
+                    if text_matches(&source_file.path, &needle)
+                        || text_matches(&source_file.context, &needle)
+                        || text_matches(&source_file.language, &needle)
+                    {
+                        results.push(json!({
+                            "kind": "source_file",
+                            "path": &source_file.path,
+                            "context": &source_file.context,
+                            "language": &source_file.language,
+                            "score": "1.0",
+                            "search_mode": "rust_fact_scan",
+                        }));
+                    }
+                }
+                for symbol in &model.symbols {
+                    if text_matches(&symbol.name, &needle)
+                        || text_matches(&symbol.kind, &needle)
+                        || text_matches(&symbol.context, &needle)
+                        || text_matches(&symbol.file_path, &needle)
+                    {
+                        results.push(json!({
+                            "kind": "symbol",
+                            "name": &symbol.name,
+                            "symbol_kind": &symbol.kind,
+                            "context": &symbol.context,
+                            "file": &symbol.file_path,
+                            "start_line": symbol.start_line,
+                            "end_line": symbol.end_line,
+                            "visibility": &symbol.visibility,
+                            "score": "1.0",
+                            "search_mode": "rust_fact_scan",
+                        }));
+                    }
+                }
+                for import in &model.import_edges {
+                    if text_matches(&import.from_file, &needle)
+                        || text_matches(&import.to_module, &needle)
+                        || text_matches(&import.context, &needle)
+                    {
+                        results.push(json!({
+                            "kind": "import_edge",
+                            "from_file": &import.from_file,
+                            "to_module": &import.to_module,
+                            "context": &import.context,
+                            "score": "1.0",
+                            "search_mode": "rust_fact_scan",
+                        }));
+                    }
+                }
+                for call in &model.call_edges {
+                    if text_matches(&call.caller, &needle)
+                        || text_matches(&call.callee, &needle)
+                        || text_matches(&call.file_path, &needle)
+                        || text_matches(&call.context, &needle)
+                    {
+                        results.push(json!({
+                            "kind": "calls_symbol",
+                            "caller": &call.caller,
+                            "callee": &call.callee,
+                            "file": &call.file_path,
+                            "line": call.line,
+                            "context": &call.context,
+                            "score": "1.0",
+                            "search_mode": "rust_fact_scan",
+                        }));
+                    }
+                }
+            }
+            for (context, layer) in self.list_layer_assignments(&ws)? {
+                let searchable =
+                    format!("policy architecture layer assignment context {context} layer {layer}");
+                if text_matches(&searchable, &needle) {
+                    results.push(json!({
+                        "kind": "layer_assignment",
+                        "context": context,
+                        "layer": layer,
+                        "score": "1.0",
+                        "search_mode": "policy_scan",
+                    }));
+                }
+            }
+            for (constraint_kind, source, target, rule) in self.list_dependency_constraints(&ws)? {
+                let searchable = format!(
+                    "policy architecture dependency constraint {constraint_kind} {source} {target} {rule}"
+                );
+                if text_matches(&searchable, &needle) {
+                    results.push(json!({
+                        "kind": "dependency_constraint",
+                        "constraint_kind": constraint_kind,
+                        "source": source,
+                        "target": target,
+                        "rule": rule,
+                        "score": "1.0",
+                        "search_mode": "policy_scan",
+                    }));
+                }
             }
         }
 
@@ -4828,9 +6024,14 @@ impl Store {
                 .unwrap_or(0.0);
             sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
         });
+        let total_before_limit = results.len();
+        let truncated = total_before_limit > limit;
+        results.truncate(limit);
 
         Ok(json!({
             "query": query,
+            "total_before_limit": total_before_limit,
+            "truncated": truncated,
             "results": results,
             "count": results.len(),
         }))
@@ -4842,7 +6043,7 @@ impl Store {
     pub fn pagerank(&self, workspace: &str) -> Result<Vec<(String, f64)>> {
         let params = params_map(&[("ws", workspace)]);
         let result = self.run_script(
-            "edges[from, to] := *context_dep{workspace: $ws, from_ctx: from, to_ctx: to, state: 'desired' @ 'NOW'} \
+            "edges[from, to] := *context_dep{workspace: $ws, from_ctx: from, to_ctx: to @ 'NOW'} \
              ?[node, rank] <~ PageRank(edges[])",
             params,
             ScriptMutability::Immutable,
@@ -4867,7 +6068,7 @@ impl Store {
     pub fn community_detection(&self, workspace: &str) -> Result<Vec<(String, u64)>> {
         let params = params_map(&[("ws", workspace)]);
         let result = self.run_script(
-            "edges[from, to] := *context_dep{workspace: $ws, from_ctx: from, to_ctx: to, state: 'desired' @ 'NOW'} \
+            "edges[from, to] := *context_dep{workspace: $ws, from_ctx: from, to_ctx: to @ 'NOW'} \
              ?[node, community] <~ CommunityDetectionLouvain(edges[])",
             params,
             ScriptMutability::Immutable,
@@ -4889,7 +6090,7 @@ impl Store {
     pub fn betweenness_centrality(&self, workspace: &str) -> Result<Vec<(String, f64)>> {
         let params = params_map(&[("ws", workspace)]);
         let result = self.run_script(
-            "edges[from, to] := *context_dep{workspace: $ws, from_ctx: from, to_ctx: to, state: 'desired' @ 'NOW'} \
+            "edges[from, to] := *context_dep{workspace: $ws, from_ctx: from, to_ctx: to @ 'NOW'} \
              ?[node, centrality] <~ BetweennessCentrality(edges[])",
             params,
             ScriptMutability::Immutable,
@@ -4913,56 +6114,114 @@ impl Store {
     /// Compute in-degree and out-degree for each context in the dependency graph.
     pub fn degree_centrality(&self, workspace: &str) -> Result<Vec<(String, u32, u32)>> {
         let params = params_map(&[("ws", workspace)]);
-        let result = self.run_script(
-            "ctx_now[ctx] := *context{workspace: $ws, name: ctx, state: 'desired' @ 'NOW'} \
-             dep_from[ctx] := *context_dep{workspace: $ws, from_ctx: ctx, state: 'desired' @ 'NOW'} \
-             dep_to[ctx] := *context_dep{workspace: $ws, to_ctx: ctx, state: 'desired' @ 'NOW'} \
-             out_deg[ctx, count(to)] := *context_dep{workspace: $ws, from_ctx: ctx, to_ctx: to, state: 'desired' @ 'NOW'} \
-             out_deg[ctx, 0] := ctx_now[ctx], not dep_from[ctx] \
-             in_deg[ctx, count(from)] := *context_dep{workspace: $ws, to_ctx: ctx, from_ctx: from, state: 'desired' @ 'NOW'} \
-             in_deg[ctx, 0] := ctx_now[ctx], not dep_to[ctx] \
-             ?[ctx, in_d, out_d] := in_deg[ctx, in_d], out_deg[ctx, out_d]",
-            params,
-            ScriptMutability::Immutable,
-        ).map_err(|e| anyhow::anyhow!("degree_centrality: {:?}", e))?;
-        Ok(result
-            .rows
-            .iter()
-            .map(|r| (dv_str(&r[0]), dv_u32(&r[1]), dv_u32(&r[2])))
+        let contexts = self
+            .run_script(
+                "?[ctx] := *context{workspace: $ws, name: ctx @ 'NOW'}",
+                params.clone(),
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| anyhow::anyhow!("degree_centrality contexts: {:?}", e))?;
+        let edges = self
+            .run_script(
+                "?[from_ctx, to_ctx] := *context_dep{workspace: $ws, from_ctx, to_ctx @ 'NOW'}",
+                params,
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| anyhow::anyhow!("degree_centrality edges: {:?}", e))?;
+
+        let mut degrees: BTreeMap<String, (u32, u32)> = BTreeMap::new();
+        for row in &contexts.rows {
+            degrees.entry(dv_str(&row[0])).or_insert((0, 0));
+        }
+        for row in &edges.rows {
+            let from_ctx = dv_str(&row[0]);
+            let to_ctx = dv_str(&row[1]);
+            degrees.entry(from_ctx.clone()).or_insert((0, 0)).1 += 1;
+            degrees.entry(to_ctx).or_insert((0, 0)).0 += 1;
+        }
+
+        Ok(degrees
+            .into_iter()
+            .map(|(ctx, (in_d, out_d))| (ctx, in_d, out_d))
             .collect())
     }
 
     /// Compute topological ordering of context dependencies (if acyclic).
     pub fn topological_order(&self, workspace: &str) -> Result<serde_json::Value> {
         let params = params_map(&[("ws", workspace)]);
-        let result = self.run_script(
-            "edges[from, to] := *context_dep{workspace: $ws, from_ctx: from, to_ctx: to, state: 'desired' @ 'NOW'} \
-             nodes[name] := *context{workspace: $ws, name, state: 'desired' @ 'NOW'} \
-             ?[node, order] <~ TopologicalSort(nodes[], edges[])",
-            params,
-            ScriptMutability::Immutable,
-        );
-        match result {
-            Ok(r) => {
-                let mut items: Vec<(String, i64)> = r
-                    .rows
-                    .iter()
-                    .map(|row| (dv_str(&row[0]), dv_i64(&row[1])))
-                    .collect();
-                items.sort_by_key(|(_, order)| *order);
-                Ok(json!({
-                    "status": "acyclic",
-                    "order": items.iter().map(|(n, o)| json!({"context": n, "order": o})).collect::<Vec<_>>(),
-                }))
+        let contexts = self
+            .run_script(
+                "?[ctx] := *context{workspace: $ws, name: ctx @ 'NOW'}",
+                params.clone(),
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| anyhow::anyhow!("topological_order contexts: {:?}", e))?;
+        let edges = self
+            .run_script(
+                "?[from_ctx, to_ctx] := *context_dep{workspace: $ws, from_ctx, to_ctx @ 'NOW'}",
+                params,
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| anyhow::anyhow!("topological_order edges: {:?}", e))?;
+
+        let mut dependents: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut indegree: BTreeMap<String, u32> = BTreeMap::new();
+        for row in &contexts.rows {
+            indegree.entry(dv_str(&row[0])).or_insert(0);
+        }
+        for row in &edges.rows {
+            let from_ctx = dv_str(&row[0]);
+            let to_ctx = dv_str(&row[1]);
+            dependents
+                .entry(to_ctx.clone())
+                .or_default()
+                .insert(from_ctx.clone());
+            *indegree.entry(from_ctx).or_insert(0) += 1;
+            indegree.entry(to_ctx).or_insert(0);
+        }
+
+        let mut ready: BTreeSet<String> = indegree
+            .iter()
+            .filter_map(|(ctx, count)| (*count == 0).then(|| ctx.clone()))
+            .collect();
+        let mut ordered = Vec::new();
+
+        while let Some(ctx) = ready.iter().next().cloned() {
+            ready.remove(&ctx);
+            let order = ordered.len() as i64;
+            ordered.push((ctx.clone(), order));
+            if let Some(context_dependents) = dependents.get(&ctx) {
+                for dependent in context_dependents {
+                    if let Some(count) = indegree.get_mut(dependent) {
+                        *count = count.saturating_sub(1);
+                        if *count == 0 {
+                            ready.insert(dependent.clone());
+                        }
+                    }
+                }
             }
-            Err(_) => {
-                let cycles = self.circular_deps(workspace)?;
-                Ok(json!({
-                    "status": "cyclic",
-                    "message": "Graph contains cycles; topological sort is not possible.",
-                    "cycles": cycles.iter().map(|(a, b)| json!({"from": a, "to": b})).collect::<Vec<_>>(),
-                }))
-            }
+        }
+
+        if ordered.len() == indegree.len() {
+            Ok(json!({
+                "status": "acyclic",
+                "order": ordered.iter().map(|(n, o)| json!({"context": n, "order": o})).collect::<Vec<_>>(),
+            }))
+        } else {
+            let cycles = self.circular_deps(workspace)?;
+            let ordered_contexts: BTreeSet<_> =
+                ordered.iter().map(|(ctx, _)| ctx.clone()).collect();
+            let remaining = indegree
+                .keys()
+                .filter(|ctx| !ordered_contexts.contains(*ctx))
+                .cloned()
+                .collect::<Vec<_>>();
+            Ok(json!({
+                "status": "cyclic",
+                "message": "Graph contains cycles; topological sort is not possible.",
+                "cycles": cycles.iter().map(|(a, b)| json!({"from": a, "to": b})).collect::<Vec<_>>(),
+                "remaining_contexts": remaining,
+            }))
         }
     }
 
@@ -4975,6 +6234,7 @@ impl Store {
         let missing_invariants = self.aggregate_roots_without_invariants(&canonical)?;
         let orphans = self.orphan_contexts(&canonical)?;
         let complexity = self.context_complexity(&canonical)?;
+        let policy_coverage = self.policy_coverage(&canonical, &complexity)?;
         let god_contexts: Vec<String> = complexity
             .iter()
             .filter(|c| c.entity_count + c.service_count > 10)
@@ -5004,7 +6264,13 @@ impl Store {
 
         let critical = circular.len() + violations.len();
         let warnings = missing_invariants.len() + god_contexts.len() + unsourced_events.len();
-        let info = orphans.len();
+        let policy_gaps = if policy_coverage.context_count == 0 {
+            0
+        } else {
+            policy_coverage.missing_layer_assignments.len()
+                + usize::from(policy_coverage.dependency_constraint_count == 0)
+        };
+        let info = orphans.len() + policy_gaps;
         let score = (100i32 - (critical as i32 * 20) - (warnings as i32 * 5) - (info as i32 * 2))
             .max(0) as u32;
 
@@ -5027,6 +6293,7 @@ impl Store {
             god_contexts,
             unsourced_events,
             complexity,
+            policy_coverage,
             bottleneck_contexts,
             communities: communities
                 .into_iter()
@@ -5114,6 +6381,31 @@ impl Store {
         Ok(complexity)
     }
 
+    fn policy_coverage(
+        &self,
+        workspace: &str,
+        complexity: &[ContextComplexity],
+    ) -> Result<PolicyCoverage> {
+        let layer_assignments = self.list_layer_assignments(workspace)?;
+        let dependency_constraints = self.list_dependency_constraints(workspace)?;
+        let assigned_contexts = layer_assignments
+            .iter()
+            .map(|(context, _)| context.as_str())
+            .collect::<BTreeSet<_>>();
+        let missing_layer_assignments = complexity
+            .iter()
+            .filter(|context| !assigned_contexts.contains(context.context.as_str()))
+            .map(|context| context.context.clone())
+            .collect::<Vec<_>>();
+
+        Ok(PolicyCoverage {
+            context_count: complexity.len(),
+            layer_assignment_count: layer_assignments.len(),
+            dependency_constraint_count: dependency_constraints.len(),
+            missing_layer_assignments,
+        })
+    }
+
     fn unsourced_events(&self, workspace: &str) -> Result<Vec<[String; 2]>> {
         let params = params_map(&[("ws", workspace)]);
         let result = self
@@ -5152,6 +6444,7 @@ pub struct ModelHealth {
     pub god_contexts: Vec<String>,
     pub unsourced_events: Vec<[String; 2]>,
     pub complexity: Vec<ContextComplexity>,
+    pub policy_coverage: PolicyCoverage,
     pub bottleneck_contexts: Vec<String>,
     pub communities: Vec<CommunityMembership>,
 }
@@ -5170,6 +6463,35 @@ pub struct ContextComplexity {
     pub service_count: u32,
     pub event_count: u32,
     pub dep_count: u32,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PolicyCoverage {
+    pub context_count: usize,
+    pub layer_assignment_count: usize,
+    pub dependency_constraint_count: usize,
+    pub missing_layer_assignments: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedArchitecturePolicy {
+    version: u32,
+    layer_assignments: Vec<PersistedLayerAssignment>,
+    dependency_constraints: Vec<PersistedDependencyConstraint>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedLayerAssignment {
+    context: String,
+    layer: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedDependencyConstraint {
+    constraint_kind: String,
+    source: String,
+    target: String,
+    rule: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -5474,7 +6796,93 @@ fn int_dv(n: i64) -> cozo::DataValue {
 }
 
 fn text_matches(haystack: &str, needle_lowercase: &str) -> bool {
-    haystack.to_lowercase().contains(needle_lowercase)
+    let haystack = haystack.to_lowercase();
+    if haystack.contains(needle_lowercase) {
+        return true;
+    }
+    needle_lowercase
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .filter(|token| token.len() > 2)
+        .any(|token| haystack.contains(token))
+}
+
+fn import_references_symbol(to_module: &str, symbol: &str) -> bool {
+    to_module.split("::").any(|segment| segment == symbol)
+}
+
+fn type_references_symbol(type_name: &str, symbol: &str) -> bool {
+    type_name
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .any(|segment| segment == symbol)
+}
+
+fn symbol_lookup_aliases(symbol: &str) -> Vec<String> {
+    let mut aliases = vec![symbol.to_string()];
+    if let Some(short) = symbol.rsplit("::").next()
+        && short != symbol
+    {
+        aliases.push(short.to_string());
+    }
+    aliases
+}
+
+fn symbol_lookup_matches(stored: &str, requested: &str) -> bool {
+    if stored == requested {
+        return true;
+    }
+    let stored_short = stored.rsplit("::").next().unwrap_or(stored);
+    let requested_short = requested.rsplit("::").next().unwrap_or(requested);
+    stored_short == requested || stored == requested_short || stored_short == requested_short
+}
+
+fn collect_dependency_paths(
+    current: &str,
+    target: &str,
+    adjacency: &BTreeMap<String, Vec<String>>,
+    visited: &mut BTreeSet<String>,
+    path: &mut Vec<String>,
+    paths: &mut Vec<Vec<String>>,
+    max_depth: usize,
+) {
+    if current == target {
+        paths.push(path.clone());
+        return;
+    }
+    if path.len() > max_depth {
+        return;
+    }
+
+    if let Some(next_contexts) = adjacency.get(current) {
+        for next in next_contexts {
+            if visited.contains(next) {
+                continue;
+            }
+            visited.insert(next.clone());
+            path.push(next.clone());
+            collect_dependency_paths(next, target, adjacency, visited, path, paths, max_depth);
+            path.pop();
+            visited.remove(next);
+        }
+    }
+}
+
+fn rust_graph_schema_json() -> Value {
+    json!({
+        "node_relations": {
+            "context": ["workspace", "name", "description", "module_path"],
+            "module": ["workspace", "context", "name", "path", "public", "file_path", "description"],
+            "source_file": ["workspace", "path", "context", "language"],
+            "symbol": ["workspace", "name", "kind", "context", "file_path", "start_line", "end_line", "visibility"]
+        },
+        "edge_relations": {
+            "context_dep": ["from_ctx", "to_ctx"],
+            "import_edge": ["from_file", "to_module", "context"],
+            "calls_symbol": ["caller", "callee", "file_path", "line", "context"],
+            "ast_edge": ["from_node", "to_node", "edge_type"]
+        },
+        "query_views": ["overview", "relations", "nodes", "edges", "neighborhood", "paths"],
+        "safety": "Structured graph views only; arbitrary Datalog is intentionally not exposed through MCP."
+    })
 }
 
 /// Extract display string from a DataValue.
@@ -5492,14 +6900,6 @@ fn dv_str(val: &cozo::DataValue) -> String {
             format!("[{}]", items.join(", "))
         }
         _ => format!("{:?}", val),
-    }
-}
-
-fn dv_u32(val: &cozo::DataValue) -> u32 {
-    match val {
-        cozo::DataValue::Num(cozo::Num::Int(i)) => *i as u32,
-        cozo::DataValue::Num(cozo::Num::Float(f)) => *f as u32,
-        _ => 0,
     }
 }
 
@@ -5898,11 +7298,7 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let path = temp_dir().join(format!(
-            "axon_cozo_test_{}_{}.db",
-            std::process::id(),
-            id
-        ));
+        let path = temp_dir().join(format!("axon_cozo_test_{}_{}.db", std::process::id(), id));
         Store::open(&path).unwrap()
     }
 

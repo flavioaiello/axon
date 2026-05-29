@@ -215,16 +215,8 @@ mod tests {
                 .iter()
                 .any(|r| r.uri == "axon://architecture/overview")
         );
-        assert!(
-            resources
-                .iter()
-                .any(|r| r.uri == "axon://rust/ontology")
-        );
-        assert!(
-            resources
-                .iter()
-                .any(|r| r.uri == "axon://context/identity")
-        );
+        assert!(resources.iter().any(|r| r.uri == "axon://rust/ontology"));
+        assert!(resources.iter().any(|r| r.uri == "axon://context/identity"));
     }
 
     #[test]

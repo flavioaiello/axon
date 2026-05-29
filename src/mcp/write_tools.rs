@@ -9,14 +9,174 @@ use crate::store::cozo::{PersistedReasoningClaim, ReasoningFactRef};
 
 /// Returns the list of write tools the Axon server exposes.
 pub fn list_write_tools() -> Vec<ToolDefinition> {
+    rust_native_write_tools()
+}
+
+fn rust_native_write_tools() -> Vec<ToolDefinition> {
+    vec![
+        ToolDefinition {
+            name: "rust_scan".into(),
+            description: "Scan the workspace source code and refresh the actual Rust fact graph from implementation ground truth. Extracts modules, structs, functions, methods, imports, and call graphs from Rust source files.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "required": []
+            }),
+        },
+        ToolDefinition {
+            name: "rust_annotations".into(),
+            description: "Add, update, or remove semantic annotations layered on top of extracted Rust facts: module labels, ownership, policies, decisions, invariants, service roles, and rationale. This does not mutate source-extracted Rust facts; use rust_scan to refresh implementation ground truth.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "kind": {
+                        "type": "string",
+                        "enum": ["bounded_context", "aggregate", "entity", "policy", "read_model", "service", "event", "value_object", "repository", "module", "external_system", "architectural_decision"],
+                        "description": "Semantic annotation kind to upsert/remove"
+                    },
+                    "action": {
+                        "type": "string",
+                        "enum": ["upsert", "remove"],
+                        "description": "Whether to upsert or remove the annotation (default: upsert)"
+                    },
+                    "module": { "type": "string", "description": "Rust module target for the annotation" },
+                    "context": { "type": "string", "description": "Compatibility alias for module/context annotation target" },
+                    "name": { "type": "string", "description": "Annotation name" },
+                    "description": { "type": "string" },
+                    "module_path": { "type": "string", "description": "Rust module path" },
+                    "public": { "type": "boolean", "description": "Whether an annotated module is public (default: true)" },
+                    "dependencies": { "type": "array", "items": { "type": "string" }, "description": "Annotated dependency names" },
+                    "ownership": {
+                        "type": "object",
+                        "properties": {
+                            "team": { "type": "string" },
+                            "owners": { "type": "array", "items": { "type": "string" } },
+                            "rationale": { "type": "string" }
+                        },
+                        "description": "Ownership metadata"
+                    },
+                    "root_entity": { "type": "string", "description": "Aggregate root struct/entity name" },
+                    "entities": { "type": "array", "items": { "type": "string" }, "description": "Aggregate entity members" },
+                    "value_objects": { "type": "array", "items": { "type": "string" }, "description": "Aggregate value object members" },
+                    "policy_kind": { "type": "string", "enum": ["domain", "process_manager", "integration"], "description": "Policy classification" },
+                    "triggers": { "type": "array", "items": { "type": "string" }, "description": "Policy trigger events" },
+                    "commands": { "type": "array", "items": { "type": "string" }, "description": "Policy emitted commands" },
+                    "consumed_by_contexts": { "type": "array", "items": { "type": "string" }, "description": "Consumers of an external system annotation" },
+                    "kind_label": { "type": "string", "description": "Free-form kind label for external systems" },
+                    "rationale": { "type": "string", "description": "Architectural rationale" },
+                    "title": { "type": "string", "description": "Decision title" },
+                    "status": { "type": "string", "enum": ["proposed", "accepted", "superseded", "deprecated"], "description": "Decision status" },
+                    "scope": { "type": "string", "description": "Decision scope" },
+                    "date": { "type": "string", "description": "Decision date" },
+                    "contexts": { "type": "array", "items": { "type": "string" }, "description": "Related modules/semantic contexts" },
+                    "consequences": { "type": "array", "items": { "type": "string" }, "description": "Decision consequences" },
+                    "aggregate_root": { "type": "boolean", "description": "Entity annotation only" },
+                    "fields": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": { "type": "string" },
+                                "type": { "type": "string" },
+                                "required": { "type": "boolean" },
+                                "description": { "type": "string" }
+                            },
+                            "required": ["name", "type"]
+                        },
+                        "description": "Annotated fields"
+                    },
+                    "methods": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": { "type": "string" },
+                                "description": { "type": "string" },
+                                "parameters": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "name": { "type": "string" },
+                                            "type": { "type": "string" }
+                                        },
+                                        "required": ["name", "type"]
+                                    }
+                                },
+                                "return_type": { "type": "string" }
+                            },
+                            "required": ["name"]
+                        },
+                        "description": "Annotated methods"
+                    },
+                    "invariants": { "type": "array", "items": { "type": "string" }, "description": "Struct/entity invariants" },
+                    "service_kind": { "type": "string", "enum": ["domain", "application", "infrastructure"], "description": "Service role annotation" },
+                    "source": { "type": "string", "description": "Source struct/entity for event annotations" },
+                    "validation_rules": { "type": "array", "items": { "type": "string" }, "description": "Value-object validation rules" },
+                    "aggregate": { "type": "string", "description": "Aggregate struct/entity name" }
+                },
+                "required": ["kind", "name"]
+            }),
+        },
+        ToolDefinition {
+            name: "rust_diagnose".into(),
+            description: "Diagnose the actual Rust architecture and report temporal graph changes. Actions: diagnose runs the full analysis pipeline, plan summarizes current changes, and accept/reset remain compatibility no-ops in actual-first mode.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["diagnose", "plan", "accept", "reset"],
+                        "description": "Diagnostic action (default: plan)"
+                    }
+                },
+                "required": []
+            }),
+        },
+        ToolDefinition {
+            name: "rust_constraints".into(),
+            description: "Declare and evaluate constraints over Rust modules and optional semantic annotations: layer assignments, allowed or forbidden dependencies, list current constraints, or evaluate violations.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["assign_layer", "remove_layer", "add_constraint", "remove_constraint", "list", "evaluate"],
+                        "description": "Constraint action to perform"
+                    },
+                    "module": { "type": "string", "description": "Rust module or semantic context target" },
+                    "context": { "type": "string", "description": "Compatibility alias for module" },
+                    "layer": { "type": "string", "description": "Layer name, e.g. domain, application, infrastructure" },
+                    "constraint_kind": {
+                        "type": "string",
+                        "enum": ["layer", "context"],
+                        "description": "Whether the constraint applies to layers or module/context names"
+                    },
+                    "source": { "type": "string", "description": "Source layer or module/context name" },
+                    "target": { "type": "string", "description": "Target layer or module/context name" },
+                    "rule": {
+                        "type": "string",
+                        "enum": ["forbidden", "allowed"],
+                        "description": "Whether the dependency is forbidden or explicitly allowed (default: forbidden)"
+                    }
+                },
+                "required": ["action"]
+            }),
+        },
+    ]
+}
+
+#[allow(dead_code)]
+fn legacy_write_tools() -> Vec<ToolDefinition> {
     let mut tools = vec![
         ToolDefinition {
             name: "define".into(),
-            description: "Create, update, or remove semantic architecture overlays on top of the \
-                          Rust fact graph: modules, entities, services, events, value objects, \
-                          aggregates, repositories, ownership, decisions, and more. \
-                          Source-extracted Rust facts remain ground truth; use this when code or \
-                          conversation reveals meaning that static extraction cannot prove. \
+            description: "Create, update, or remove semantic annotations on top of the Rust fact \
+                          graph: context labels, module metadata, DDD candidates, ownership, \
+                          policies, decisions, and rationale. This does not mutate source-extracted \
+                          Rust facts; use sync to refresh ground truth and graph/query_rust_graph \
+                          to inspect it. Use define only when code or conversation reveals meaning \
+                          static extraction cannot prove. \
                           Fields, methods, and invariants are merged (not replaced). \
                           All changes are auto-saved. \
                           Returns suggested file paths for created/updated artifacts. \
@@ -35,14 +195,14 @@ pub fn list_write_tools() -> Vec<ToolDefinition> {
                         "enum": ["upsert", "remove"],
                         "description": "Whether to create/update or remove the element (default: upsert)"
                     },
-                    "context": { "type": "string", "description": "Compatibility semantic context/module name (required for entity, service, event overlays)" },
+                    "context": { "type": "string", "description": "Semantic context/module annotation target (required for DDD overlay kinds)" },
                     "name": { "type": "string", "description": "Element name" },
                     "description": { "type": "string" },
                     "module_path": { "type": "string", "description": "Module path (bounded_context or module)" },
                     "public": { "type": "boolean", "description": "Whether module is public (module only, default: true)" },
                     "dependencies": {
                         "type": "array", "items": { "type": "string" },
-                        "description": "Dependencies (bounded_context: allowed context deps; service: service deps)"
+                        "description": "Annotated dependencies (bounded_context: context deps; service: service deps)"
                     },
                     "ownership": {
                         "type": "object",
@@ -133,7 +293,8 @@ pub fn list_write_tools() -> Vec<ToolDefinition> {
             description: "Scan the workspace source code and populate the implemented Rust fact \
                           graph from what is actually implemented. Extracts modules, structs, \
                           functions, methods, imports, and call graphs from Rust source files. \
-                          Usually runs automatically via the file watcher."
+                          Usually runs automatically via the file watcher; call graph/query_rust_graph \
+                          after sync to inspect persisted Cozo facts."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -165,7 +326,7 @@ pub fn list_write_tools() -> Vec<ToolDefinition> {
         ToolDefinition {
             name: "constrain".into(),
             description: "Declare and evaluate architectural constraints. \
-                          Assign Rust modules/semantic contexts to layers (e.g., domain, application, infrastructure), \
+                          Assign Rust modules or semantic context annotations to layers (e.g., domain, application, infrastructure), \
                           declare forbidden or allowed dependencies between layers or modules, \
                           list current constraints, or evaluate all constraints to find violations."
                 .into(),
@@ -256,17 +417,24 @@ fn dispatch_write_tool(
     name: &str,
     args: &Value,
 ) -> ToolCallResult {
+    let canonical_name = canonical_write_tool_name(name);
     let mut normalized_args = args.clone();
+    let mut use_normalized_args = false;
     if name == "set_model" {
         normalize_set_model_args(&mut normalized_args);
+        use_normalized_args = true;
     }
-    let args = if name == "set_model" {
+    if matches!(name, "rust_annotations" | "rust_constraints") {
+        normalize_rust_native_write_args(&mut normalized_args);
+        use_normalized_args = true;
+    }
+    let args = if use_normalized_args {
         &normalized_args
     } else {
         args
     };
 
-    match canonical_write_tool_name(name) {
+    match canonical_name {
         "define" => {
             let kind = arg_str(args, "kind");
             let action = args
@@ -370,7 +538,7 @@ fn dispatch_write_tool(
                         .iter()
                         .map(|bc| bc.events.len())
                         .sum();
-                    let counts = SyncCounts {
+                    let mut counts = SyncCounts {
                         contexts_scanned: actual.bounded_contexts.len(),
                         entities: entity_count,
                         value_objects: vo_count,
@@ -380,11 +548,21 @@ fn dispatch_write_tool(
                         source_files: actual.source_files.len(),
                         symbols: actual.symbols.len(),
                         import_edges: actual.import_edges.len(),
+                        persisted_import_edges: None,
                         call_edges: actual.call_edges.len(),
+                        persisted_call_edges: None,
                     };
 
                     match store.save_actual(workspace_path, &actual) {
                         Ok(()) => {
+                            if let Ok(relation_counts) =
+                                store.rust_graph_relation_counts(workspace_path)
+                            {
+                                counts.persisted_import_edges =
+                                    relation_counts.get("import_edge").copied();
+                                counts.persisted_call_edges =
+                                    relation_counts.get("calls_symbol").copied();
+                            }
                             let had_previous = previous.is_some();
                             let mut follow_on_failures = Vec::new();
 
@@ -428,8 +606,12 @@ fn dispatch_write_tool(
                                     "events": counts.events,
                                     "source_files": counts.source_files,
                                     "symbols": counts.symbols,
-                                    "import_edges": counts.import_edges,
-                                    "call_edges": counts.call_edges,
+                                    "import_edges": counts.persisted_import_edges.unwrap_or(counts.import_edges),
+                                    "extracted_import_edges": counts.import_edges,
+                                    "persisted_import_edges": counts.persisted_import_edges,
+                                    "call_edges": counts.persisted_call_edges.unwrap_or(counts.call_edges),
+                                    "extracted_call_edges": counts.call_edges,
+                                    "persisted_call_edges": counts.persisted_call_edges,
                                 },
                                 "follow_on_failures": follow_on_failures,
                             });
@@ -845,11 +1027,23 @@ fn dispatch_write_tool(
 
 fn canonical_write_tool_name(name: &str) -> &str {
     match name {
-        "set_model" => "define",
-        "scan_model" => "sync",
-        "refactor_model" => "refactor",
-        "assert_model" => "constrain",
+        "rust_annotations" | "define" | "set_model" => "define",
+        "rust_scan" | "sync" | "scan_model" => "sync",
+        "rust_diagnose" | "refactor" | "refactor_model" => "refactor",
+        "rust_constraints" | "constrain" | "assert_model" => "constrain",
         other => other,
+    }
+}
+
+fn normalize_rust_native_write_args(args: &mut Value) {
+    let Some(object) = args.as_object_mut() else {
+        return;
+    };
+    if object.contains_key("context") {
+        return;
+    }
+    if let Some(module) = object.get("module").cloned() {
+        object.insert("context".into(), module);
     }
 }
 
@@ -1897,7 +2091,7 @@ fn suggested_path_for(
 
 /// Compute the suggested file path for a domain artifact, using project conventions.
 /// This replaces the standalone `suggest_file_path` tool — now implicit in every
-/// `define` response for artifacts that live in files (entity, service, event).
+/// `rust_annotations` response for artifacts that live in files (entity, service, event).
 fn suggest_path(pattern: &str, context: &str, kind: &str, name: &str) -> String {
     let layer = match kind {
         "entity" | "value_object" | "event" => "domain",
@@ -2015,7 +2209,9 @@ struct SyncCounts {
     source_files: usize,
     symbols: usize,
     import_edges: usize,
+    persisted_import_edges: Option<usize>,
     call_edges: usize,
+    persisted_call_edges: Option<usize>,
 }
 
 fn build_sync_report(
@@ -2030,6 +2226,8 @@ fn build_sync_report(
         "partial_failure"
     };
     let drift_recomputed = drift_entry_count.is_some();
+    let persisted_import_edges = counts.persisted_import_edges.unwrap_or(counts.import_edges);
+    let persisted_call_edges = counts.persisted_call_edges.unwrap_or(counts.call_edges);
     let message = if follow_on_failures.is_empty() {
         if had_previous {
             format!(
@@ -2076,8 +2274,12 @@ fn build_sync_report(
         "events": counts.events,
         "source_files": counts.source_files,
         "symbols": counts.symbols,
-        "import_edges": counts.import_edges,
-        "call_edges": counts.call_edges,
+        "import_edges": persisted_import_edges,
+        "extracted_import_edges": counts.import_edges,
+        "persisted_import_edges": counts.persisted_import_edges,
+        "call_edges": persisted_call_edges,
+        "extracted_call_edges": counts.call_edges,
+        "persisted_call_edges": counts.persisted_call_edges,
         "implemented_state_saved": true,
         "had_previous_snapshot": had_previous,
         "drift_recomputed": drift_recomputed,
@@ -2119,11 +2321,7 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let path = temp_dir().join(format!(
-            "axon_wt_test_{}_{}.db",
-            std::process::id(),
-            id
-        ));
+        let path = temp_dir().join(format!("axon_wt_test_{}_{}.db", std::process::id(), id));
         Store::open(&path).unwrap()
     }
 
@@ -2187,12 +2385,16 @@ mod tests {
     #[test]
     fn test_list_write_tools_count() {
         let tools = list_write_tools();
-        assert_eq!(tools.len(), 8);
+        assert_eq!(tools.len(), 4);
         let names: Vec<_> = tools.iter().map(|tool| tool.name.as_str()).collect();
-        assert!(names.contains(&"set_model"));
-        assert!(names.contains(&"scan_model"));
-        assert!(names.contains(&"refactor_model"));
-        assert!(names.contains(&"assert_model"));
+        assert!(names.contains(&"rust_scan"));
+        assert!(names.contains(&"rust_annotations"));
+        assert!(names.contains(&"rust_diagnose"));
+        assert!(names.contains(&"rust_constraints"));
+        assert!(!names.contains(&"set_model"));
+        assert!(!names.contains(&"scan_model"));
+        assert!(!names.contains(&"refactor_model"));
+        assert!(!names.contains(&"assert_model"));
     }
 
     #[test]
@@ -2240,7 +2442,9 @@ mod tests {
                 source_files: 6,
                 symbols: 9,
                 import_edges: 4,
+                persisted_import_edges: Some(3),
                 call_edges: 11,
+                persisted_call_edges: Some(7),
             },
             false,
             Some(5),
@@ -2254,8 +2458,12 @@ mod tests {
         assert_eq!(report["drift_entry_count"], 5);
         assert_eq!(report["source_files"], 6);
         assert_eq!(report["symbols"], 9);
-        assert_eq!(report["import_edges"], 4);
-        assert_eq!(report["call_edges"], 11);
+        assert_eq!(report["import_edges"], 3);
+        assert_eq!(report["extracted_import_edges"], 4);
+        assert_eq!(report["persisted_import_edges"], 3);
+        assert_eq!(report["call_edges"], 7);
+        assert_eq!(report["extracted_call_edges"], 11);
+        assert_eq!(report["persisted_call_edges"], 7);
         assert!(report["follow_on_failures"].as_array().unwrap().is_empty());
     }
 
@@ -2273,7 +2481,9 @@ mod tests {
                 source_files: 1,
                 symbols: 1,
                 import_edges: 0,
+                persisted_import_edges: None,
                 call_edges: 0,
+                persisted_call_edges: None,
             },
             false,
             None,
@@ -2793,10 +3003,10 @@ mod tests {
         call_write_tool(
             ws,
             &store,
-            "define",
+            "rust_annotations",
             &json!({"kind": "bounded_context", "name": "Billing", "description": "Billing context"}),
         );
-        let result = call_write_tool(ws, &store, "refactor", &json!({}));
+        let result = call_write_tool(ws, &store, "rust_diagnose", &json!({}));
         let text = match &result.content[0] {
             ContentBlock::Text { text } => text,
         };
@@ -2979,8 +3189,8 @@ mod tests {
             "must have next_actions"
         );
         assert!(
-            report.get("has_desired_model").is_some(),
-            "must have has_desired_model"
+            report.get("has_implemented_model").is_some(),
+            "must have has_implemented_model"
         );
         assert!(report.get("loop_hint").is_some(), "must have loop_hint");
         assert!(report.get("proof").is_some(), "must have proof");
@@ -3039,7 +3249,7 @@ mod tests {
             serde_json::from_str(&text).expect("diagnose must return valid JSON");
 
         // No current model → should suggest sync
-        assert_eq!(report["has_actual_model"], false);
+        assert_eq!(report["has_implemented_model"], false);
         assert!(report.get("truth_maintenance").is_some());
         let actions = report["next_actions"].as_array().unwrap();
         let first = &actions[0];

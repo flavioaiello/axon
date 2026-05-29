@@ -98,7 +98,6 @@ struct MaterializedReasoningData {
     pending_changes: Vec<Value>,
     drift_entries: Vec<Value>,
     has_actual: bool,
-    has_desired: bool,
     ast_stats: Option<Value>,
 }
 
@@ -201,9 +200,20 @@ impl<'a> ReasoningKernel<'a> {
         from: &str,
         to: &str,
     ) -> Result<PersistedReasoningClaim> {
-        let claim_id = how_connected_claim_id(from, to);
+        self.how_connected_with_relation(workspace_path, "context_dep", from, to)
+    }
+
+    pub fn how_connected_with_relation(
+        &self,
+        workspace_path: &str,
+        relation: &str,
+        from: &str,
+        to: &str,
+    ) -> Result<PersistedReasoningClaim> {
+        let relation = normalize_path_relation(relation)?;
+        let claim_id = how_connected_claim_id_for_relation(relation, from, to);
         self.parameterized_claim(workspace_path, &claim_id, |kernel, computed_at_us, data| {
-            kernel.how_connected_claim(workspace_path, from, to, data, computed_at_us)
+            kernel.how_connected_claim(workspace_path, relation, from, to, data, computed_at_us)
         })
     }
 
@@ -286,7 +296,8 @@ impl<'a> ReasoningKernel<'a> {
         F: FnOnce(&Self, i64, &MaterializedReasoningData) -> Result<PersistedReasoningClaim>,
     {
         if let Some(claim) = self.store.load_reasoning_claim(workspace_path, claim_id)? {
-            if !claim.stale {
+            let basis = self.snapshot_basis(workspace_path)?;
+            if !claim.stale && claim_dependencies_match_basis(&claim, &basis) {
                 return Ok(claim);
             }
         }
@@ -330,7 +341,6 @@ impl<'a> ReasoningKernel<'a> {
 
     fn load_materialized_data(&self, workspace_path: &str) -> Result<MaterializedReasoningData> {
         let canonical = canonicalize_path(workspace_path);
-        let desired = self.store.load_desired(workspace_path)?;
         let actual = self.store.load_actual(workspace_path)?;
         let truth = self.store.truth_maintenance_report(workspace_path)?;
         let basis = self.snapshot_basis(workspace_path)?;
@@ -371,9 +381,6 @@ impl<'a> ReasoningKernel<'a> {
             pending_changes,
             drift_entries,
             has_actual: actual
-                .as_ref()
-                .is_some_and(|model| !model.bounded_contexts.is_empty()),
-            has_desired: desired
                 .as_ref()
                 .is_some_and(|model| !model.bounded_contexts.is_empty()),
             ast_stats: build_ast_stats(actual.as_ref()),
@@ -588,9 +595,7 @@ impl<'a> ReasoningKernel<'a> {
     ) -> Result<PersistedReasoningClaim> {
         let raw_state = args["state"].as_str().unwrap_or("actual");
         let state = match raw_state {
-            "planned" => "desired",
-            "current" => "actual",
-            "implemented" => "actual",
+            "planned" | "current" | "implemented" => "actual",
             other => other,
         };
         let has_timestamps = args["ts_old"].is_number() || args["ts_new"].is_number();
@@ -644,7 +649,7 @@ impl<'a> ReasoningKernel<'a> {
             vec![
                 "History reflects persisted snapshots only; direct incremental mutations that do not record snapshots will not appear as separate history entries.".into(),
             ],
-            vec![dependency("snapshot", state, if state == "desired" { data.basis.desired_ts } else { data.basis.actual_ts })],
+            vec![dependency("snapshot", state, data.basis.actual_ts)],
             computed_at_us,
             "snapshot_history",
             state,
@@ -662,6 +667,57 @@ impl<'a> ReasoningKernel<'a> {
         let limit = subject["limit"].as_u64().unwrap_or(20) as usize;
         let payload = self.store.search_text(workspace_path, query, limit)?;
         let count = payload["count"].as_u64().unwrap_or(0) as usize;
+        let includes_rust_fact_results = payload["results"].as_array().is_some_and(|results| {
+            results.iter().any(|result| {
+                result["search_mode"].as_str() == Some("rust_fact_scan")
+                    || matches!(
+                        result["kind"].as_str(),
+                        Some("source_file" | "symbol" | "import_edge" | "calls_symbol")
+                    )
+            })
+        });
+        let includes_policy_results = payload["results"].as_array().is_some_and(|results| {
+            results.iter().any(|result| {
+                result["search_mode"].as_str() == Some("policy_scan")
+                    || matches!(
+                        result["kind"].as_str(),
+                        Some("layer_assignment" | "dependency_constraint")
+                    )
+            })
+        });
+        let mut derived_from = vec![
+            "context:fts".into(),
+            "entity:fts".into(),
+            "service:fts".into(),
+            "event:fts".into(),
+            "architectural_decision:title_fts".into(),
+        ];
+        if includes_rust_fact_results {
+            derived_from.push("source_file".into());
+            derived_from.push("symbol".into());
+            derived_from.push("import_edge".into());
+            derived_from.push("calls_symbol".into());
+        }
+        if includes_policy_results {
+            derived_from.push("layer_assignment".into());
+            derived_from.push("dependency_constraint".into());
+        }
+        let mut limitations = vec![
+            "Search may omit unindexed relation fields; a model-scan fallback is used when FTS returns no rows."
+                .into(),
+        ];
+        if includes_policy_results {
+            limitations.push(
+                "Policy search results come from exact stored policy relations, not Cozo FTS indices."
+                    .into(),
+            );
+        }
+        if includes_rust_fact_results {
+            limitations.push(
+                "Source-level Rust fact search uses stored scan relations when FTS has no row-level symbol index."
+                    .into(),
+            );
+        }
 
         Ok(build_claim(
             &search_claim_id(query, limit),
@@ -671,24 +727,20 @@ impl<'a> ReasoningKernel<'a> {
             format!("Search returned {count} architecture match(es) for '{query}'."),
             payload.clone(),
             vec![ReasoningDerivation {
-                rule: "search matches persisted implemented architecture entities across indexed relations or model scan fallback".into(),
-                derived_from: vec![
-                    "context:fts".into(),
-                    "entity:fts".into(),
-                    "service:fts".into(),
-                    "event:fts".into(),
-                    "architectural_decision:title_fts".into(),
-                ],
+                rule: "search matches persisted implemented architecture entities across indexed relations, policy relations, or model scan fallback".into(),
+                derived_from,
                 witness_count: count,
             }],
             vec![support("evidence", "Search results", payload)],
             vec![],
-            vec![
-                "Search may omit unindexed relation fields; a model-scan fallback is used when FTS returns no rows.".into(),
-            ],
+            limitations,
             vec![dependency("snapshot", "actual", data.basis.actual_ts)],
             computed_at_us,
-            "fts_search",
+            if includes_policy_results || includes_rust_fact_results {
+                "architecture_search"
+            } else {
+                "fts_search"
+            },
             "actual",
         ))
     }
@@ -836,23 +888,15 @@ impl<'a> ReasoningKernel<'a> {
                 }
                 "field_usage" => {
                     let field_type = required_arg(args, "field_type", analysis)?;
-                    let rows = self.store.run_datalog(
-                        &format!(
-                            "?[ctx, owner_kind, owner, field_name] := \
-                                *field{{workspace: $ws, context: ctx, owner_kind, owner, \
-                                       name: field_name, field_type: '{}', state: 'desired' @ 'NOW'}}",
-                            field_type.replace('\'', "''")
-                        ),
-                        &canonical,
-                    )?;
+                    let rows = self.store.field_usage(&canonical, &field_type)?;
                     let items: Vec<_> = rows
                         .iter()
-                        .map(|row| {
+                        .map(|(context, owner_kind, owner, field)| {
                             json!({
-                                "context": row[0],
-                                "owner_kind": row[1],
-                                "owner": row[2],
-                                "field": row[3],
+                                "context": context,
+                                "owner_kind": owner_kind,
+                                "owner": owner,
+                                "field": field,
                             })
                         })
                         .collect();
@@ -872,23 +916,15 @@ impl<'a> ReasoningKernel<'a> {
                 }
                 "method_search" => {
                     let method_name = required_arg(args, "method_name", analysis)?;
-                    let rows = self.store.run_datalog(
-                        &format!(
-                            "?[ctx, owner_kind, owner, return_type] := \
-                                *method{{workspace: $ws, context: ctx, owner_kind, owner, \
-                                        name: '{}', state: 'desired' @ 'NOW', return_type}}",
-                            method_name.replace('\'', "''")
-                        ),
-                        &canonical,
-                    )?;
+                    let rows = self.store.method_search(&canonical, &method_name)?;
                     let items: Vec<_> = rows
                         .iter()
-                        .map(|row| {
+                        .map(|(context, owner_kind, owner, return_type)| {
                             json!({
-                                "context": row[0],
-                                "owner_kind": row[1],
-                                "owner": row[2],
-                                "return_type": row[3],
+                                "context": context,
+                                "owner_kind": owner_kind,
+                                "owner": owner,
+                                "return_type": return_type,
                             })
                         })
                         .collect();
@@ -907,27 +943,16 @@ impl<'a> ReasoningKernel<'a> {
                     )
                 }
                 "shared_fields" => {
-                    let rows = self.store.run_datalog(
-                        "entity_field[ctx, owner, name, ft] := \
-                            *field{workspace: $ws, context: ctx, owner_kind: 'entity', \
-                                   owner, name, field_type: ft, state: 'desired' @ 'NOW'} \
-                         event_field[ctx, owner, name, ft] := \
-                            *field{workspace: $ws, context: ctx, owner_kind: 'event', \
-                                   owner, name, field_type: ft, state: 'desired' @ 'NOW'} \
-                         ?[ctx, entity, event, field_name, field_type] := \
-                            entity_field[ctx, entity, field_name, field_type], \
-                            event_field[ctx, event, field_name, field_type]",
-                        &canonical,
-                    )?;
+                    let rows = self.store.shared_fields(&canonical)?;
                     let items: Vec<_> = rows
                         .iter()
-                        .map(|row| {
+                        .map(|(context, entity, event, field, field_type)| {
                             json!({
-                                "context": row[0],
-                                "entity": row[1],
-                                "event": row[2],
-                                "field": row[3],
-                                "type": row[4],
+                                "context": context,
+                                "entity": entity,
+                                "event": event,
+                                "field": field,
+                                "type": field_type,
                             })
                         })
                         .collect();
@@ -950,68 +975,122 @@ impl<'a> ReasoningKernel<'a> {
                     )
                 }
                 "pagerank" => {
-                    let ranked = self.store.pagerank(&canonical)?;
-                    let items: Vec<_> = ranked
-                        .iter()
-                        .map(|(context, rank)| json!({ "context": context, "rank": rank }))
-                        .collect();
-                    (
-                        json!({
-                            "analysis": analysis,
-                            "ranking": items,
-                            "count": ranked.len(),
-                            "insight": "Higher PageRank indicates more architecturally important contexts (more dependencies flow through them).",
-                        }),
-                        vec!["context_dep".into()],
-                        "PageRank over implemented context dependency graph".to_string(),
-                        vec!["PageRank availability depends on Cozo graph-algorithm support in the current runtime.".into()],
-                        vec![dependency("snapshot", "actual", data.basis.actual_ts)],
-                        "actual",
-                    )
+                    match self.store.pagerank(&canonical) {
+                        Ok(ranked) => {
+                            let items: Vec<_> = ranked
+                                .iter()
+                                .map(|(context, rank)| json!({ "context": context, "rank": rank }))
+                                .collect();
+                            (
+                                json!({
+                                    "analysis": analysis,
+                                    "available": true,
+                                    "ranking": items,
+                                    "count": ranked.len(),
+                                    "insight": "Higher PageRank indicates more architecturally important contexts (more dependencies flow through them).",
+                                }),
+                                vec!["context_dep".into()],
+                                "PageRank over implemented context dependency graph".to_string(),
+                                vec!["PageRank availability depends on Cozo graph-algorithm support in the current runtime.".into()],
+                                vec![dependency("snapshot", "actual", data.basis.actual_ts)],
+                                "actual",
+                            )
+                        }
+                        Err(error) => (
+                            json!({
+                                "analysis": analysis,
+                                "available": false,
+                                "ranking": [],
+                                "count": 0,
+                                "reason": error.to_string(),
+                            }),
+                            vec!["context_dep".into()],
+                            "PageRank unavailable in the active Cozo runtime".to_string(),
+                            vec!["PageRank requires Cozo graph-algorithm fixed-rule support; this runtime did not provide it.".into()],
+                            vec![dependency("snapshot", "actual", data.basis.actual_ts)],
+                            "actual",
+                        ),
+                    }
                 }
                 "community_detection" => {
-                    let communities = self.store.community_detection(&canonical)?;
-                    let items: Vec<_> = communities
-                        .iter()
-                        .map(|(context, community)| {
-                            json!({ "context": context, "community": community })
-                        })
-                        .collect();
-                    (
-                        json!({
-                            "analysis": analysis,
-                            "communities": items,
-                            "count": communities.len(),
-                            "insight": "Contexts in the same community are tightly coupled. Consider aligning bounded context boundaries with community boundaries.",
-                        }),
-                        vec!["context_dep".into()],
-                        "community detection over implemented context dependency graph".to_string(),
-                        vec!["Community detection depends on Cozo graph-algorithm support in the current runtime.".into()],
-                        vec![dependency("snapshot", "actual", data.basis.actual_ts)],
-                        "actual",
-                    )
+                    match self.store.community_detection(&canonical) {
+                        Ok(communities) => {
+                            let items: Vec<_> = communities
+                                .iter()
+                                .map(|(context, community)| {
+                                    json!({ "context": context, "community": community })
+                                })
+                                .collect();
+                            (
+                                json!({
+                                    "analysis": analysis,
+                                    "available": true,
+                                    "communities": items,
+                                    "count": communities.len(),
+                                    "insight": "Contexts in the same community are tightly coupled. Consider aligning bounded context boundaries with community boundaries.",
+                                }),
+                                vec!["context_dep".into()],
+                                "community detection over implemented context dependency graph".to_string(),
+                                vec!["Community detection depends on Cozo graph-algorithm support in the current runtime.".into()],
+                                vec![dependency("snapshot", "actual", data.basis.actual_ts)],
+                                "actual",
+                            )
+                        }
+                        Err(error) => (
+                            json!({
+                                "analysis": analysis,
+                                "available": false,
+                                "communities": [],
+                                "count": 0,
+                                "reason": error.to_string(),
+                            }),
+                            vec!["context_dep".into()],
+                            "community detection unavailable in the active Cozo runtime".to_string(),
+                            vec!["Community detection requires Cozo graph-algorithm fixed-rule support; this runtime did not provide it.".into()],
+                            vec![dependency("snapshot", "actual", data.basis.actual_ts)],
+                            "actual",
+                        ),
+                    }
                 }
                 "betweenness_centrality" => {
-                    let ranked = self.store.betweenness_centrality(&canonical)?;
-                    let items: Vec<_> = ranked
-                        .iter()
-                        .map(|(context, centrality)| {
-                            json!({ "context": context, "centrality": centrality })
-                        })
-                        .collect();
-                    (
-                        json!({
-                            "analysis": analysis,
-                            "ranking": items,
-                            "count": ranked.len(),
-                            "insight": "High betweenness centrality indicates bottleneck contexts. Changes here have outsized downstream impact.",
-                        }),
-                        vec!["context_dep".into()],
-                        "betweenness centrality over implemented context dependency graph".to_string(),
-                        vec!["Betweenness centrality depends on Cozo graph-algorithm support in the current runtime.".into()],
-                        vec![dependency("snapshot", "actual", data.basis.actual_ts)],
-                        "actual",
-                    )
+                    match self.store.betweenness_centrality(&canonical) {
+                        Ok(ranked) => {
+                            let items: Vec<_> = ranked
+                                .iter()
+                                .map(|(context, centrality)| {
+                                    json!({ "context": context, "centrality": centrality })
+                                })
+                                .collect();
+                            (
+                                json!({
+                                    "analysis": analysis,
+                                    "available": true,
+                                    "ranking": items,
+                                    "count": ranked.len(),
+                                    "insight": "High betweenness centrality indicates bottleneck contexts. Changes here have outsized downstream impact.",
+                                }),
+                                vec!["context_dep".into()],
+                                "betweenness centrality over implemented context dependency graph".to_string(),
+                                vec!["Betweenness centrality depends on Cozo graph-algorithm support in the current runtime.".into()],
+                                vec![dependency("snapshot", "actual", data.basis.actual_ts)],
+                                "actual",
+                            )
+                        }
+                        Err(error) => (
+                            json!({
+                                "analysis": analysis,
+                                "available": false,
+                                "ranking": [],
+                                "count": 0,
+                                "reason": error.to_string(),
+                            }),
+                            vec!["context_dep".into()],
+                            "betweenness centrality unavailable in the active Cozo runtime".to_string(),
+                            vec!["Betweenness centrality requires Cozo graph-algorithm fixed-rule support; this runtime did not provide it.".into()],
+                            vec![dependency("snapshot", "actual", data.basis.actual_ts)],
+                            "actual",
+                        ),
+                    }
                 }
                 "degree_centrality" => {
                     let degrees = self.store.degree_centrality(&canonical)?;
@@ -1110,9 +1189,12 @@ impl<'a> ReasoningKernel<'a> {
                             "analysis": analysis,
                             "result": result,
                         }),
-                        vec!["calls_symbol".into()],
-                        "call graph summary statistics over actual-state call edges".to_string(),
-                        vec!["Call graph statistics depend on the latest successful actual-state scan.".into()],
+                        vec!["calls_symbol".into(), "symbol".into()],
+                        "call graph summary statistics over actual-state call edges and project symbol aliases".to_string(),
+                        vec![
+                            "Call graph statistics depend on the latest successful actual-state scan.".into(),
+                            "Project callee statistics match extracted callee names to stored symbol aliases; ambiguous short names may match multiple project symbols.".into(),
+                        ],
                         vec![dependency("snapshot", "actual", data.basis.actual_ts)],
                         "actual",
                     )
@@ -1193,7 +1275,7 @@ impl<'a> ReasoningKernel<'a> {
             vec![
                 "Results are limited to stored implemented service classifications and dependencies.".into(),
             ],
-            desired_dependencies(&data.basis),
+            actual_dependencies(&data.basis),
             computed_at_us,
             "datalog",
             "actual",
@@ -1236,7 +1318,7 @@ impl<'a> ReasoningKernel<'a> {
             vec![
                 "Cycles are computed from declared context dependencies, not runtime communication paths.".into(),
             ],
-            desired_dependencies(&data.basis),
+            actual_dependencies(&data.basis),
             computed_at_us,
             "datalog",
             "actual",
@@ -1286,7 +1368,7 @@ impl<'a> ReasoningKernel<'a> {
             vec![
                 "Aggregate quality is evaluated from stored implemented entity and invariant relations.".into(),
             ],
-            desired_dependencies(&data.basis),
+            actual_dependencies(&data.basis),
             computed_at_us,
             "datalog",
             "actual",
@@ -1326,7 +1408,7 @@ impl<'a> ReasoningKernel<'a> {
                 "Orphan detection is derived from stored implemented contexts and dependencies."
                     .into(),
             ],
-            desired_dependencies(&data.basis),
+            actual_dependencies(&data.basis),
             computed_at_us,
             "datalog",
             "actual",
@@ -1343,12 +1425,26 @@ impl<'a> ReasoningKernel<'a> {
             .cloned()
             .unwrap_or_default();
         let count = data.policy_result["count"].as_u64().unwrap_or(0) as usize;
+        let configured = data.policy_result["configured"].as_bool().unwrap_or(false);
+        let policy_coverage = data.policy_result["policy_coverage"].clone();
+        let mut limitations = vec![
+            "Policy evaluation depends on declared constraints and stored implemented dependencies."
+                .into(),
+        ];
+        if !configured {
+            limitations.push(
+                "Policy coverage is incomplete; an empty violation set is not proof of compliance."
+                    .into(),
+            );
+        }
         build_claim(
             CLAIM_CHECK_POLICY_VIOLATIONS,
             "check",
             "policy_violations",
             data.policy_result["status"].as_str().unwrap_or("unknown"),
-            if violations.is_empty() {
+            if !configured {
+                "Policy constraints are not fully configured.".into()
+            } else if violations.is_empty() {
                 "No policy violations detected.".into()
             } else {
                 format!("{} policy violation(s) found.", violations.len())
@@ -1356,6 +1452,8 @@ impl<'a> ReasoningKernel<'a> {
             json!({
                 "invariant": "policy_violations",
                 "status": data.policy_result["status"],
+                "configured": configured,
+                "policy_coverage": policy_coverage,
                 "violations": data.policy_result["violations"],
                 "count": data.policy_result["count"],
             }),
@@ -1370,14 +1468,16 @@ impl<'a> ReasoningKernel<'a> {
             }],
             vec![support(
                 "evidence",
-                "Policy violation witnesses",
-                json!(violations),
+                "Policy evaluation evidence",
+                json!({
+                    "configured": configured,
+                    "policy_coverage": data.policy_result["policy_coverage"],
+                    "violations": violations,
+                }),
             )],
             vec![],
-            vec![
-                "Policy evaluation depends on declared constraints and stored implemented dependencies.".into(),
-            ],
-            desired_dependencies(&data.basis),
+            limitations,
+            actual_dependencies(&data.basis),
             computed_at_us,
             "datalog",
             "actual",
@@ -1440,6 +1540,7 @@ impl<'a> ReasoningKernel<'a> {
         computed_at_us: i64,
     ) -> PersistedReasoningClaim {
         let policy_count = data.policy_result["count"].as_u64().unwrap_or(0);
+        let policy_configured = data.policy_result["configured"].as_bool().unwrap_or(false);
         let results = json!({
             "layer_violations": {
                 "status": data.layer_violations.is_empty(),
@@ -1461,6 +1562,11 @@ impl<'a> ReasoningKernel<'a> {
                 "status": policy_count == 0,
                 "count": policy_count,
             },
+            "policy_coverage": {
+                "status": policy_configured,
+                "configured": policy_configured,
+                "coverage": data.policy_result["policy_coverage"],
+            },
             "drift": {
                 "status": data.pending_changes.is_empty(),
                 "count": data.pending_changes.len(),
@@ -1471,6 +1577,7 @@ impl<'a> ReasoningKernel<'a> {
             && data.aggregate_quality.is_empty()
             && data.health.orphan_contexts.is_empty()
             && policy_count == 0
+            && policy_configured
             && data.pending_changes.is_empty();
         build_claim(
             CLAIM_CHECK_ALL,
@@ -1577,10 +1684,10 @@ impl<'a> ReasoningKernel<'a> {
             vec![
                 "Explanations are synthesized from stored witnesses and do not inspect implementation code paths directly.".into(),
             ],
-            desired_dependencies(&data.basis),
+            actual_dependencies(&data.basis),
             computed_at_us,
             "datalog",
-            "desired",
+            "actual",
         )
     }
 
@@ -1649,10 +1756,10 @@ impl<'a> ReasoningKernel<'a> {
                 "Cycle explanations are synthesized from stored witnesses, not runtime traces."
                     .into(),
             ],
-            desired_dependencies(&data.basis),
+            actual_dependencies(&data.basis),
             computed_at_us,
             "datalog",
-            "desired",
+            "actual",
         )
     }
 
@@ -1739,7 +1846,7 @@ impl<'a> ReasoningKernel<'a> {
             vec![
                 "Policy explanations depend on declared constraints and stored implemented dependencies.".into(),
             ],
-            desired_dependencies(&data.basis),
+            actual_dependencies(&data.basis),
             computed_at_us,
             "datalog",
             "actual",
@@ -1810,7 +1917,7 @@ impl<'a> ReasoningKernel<'a> {
             vec![
                 "Aggregate-quality explanations are synthesized from stored witnesses, not runtime aggregate behavior.".into(),
             ],
-            desired_dependencies(&data.basis),
+            actual_dependencies(&data.basis),
             computed_at_us,
             "datalog",
             "actual",
@@ -1881,7 +1988,7 @@ impl<'a> ReasoningKernel<'a> {
             vec![
                 "Orphan-context explanations are derived from stored implemented boundaries, not runtime interaction data.".into(),
             ],
-            desired_dependencies(&data.basis),
+            actual_dependencies(&data.basis),
             computed_at_us,
             "datalog",
             "actual",
@@ -2072,6 +2179,37 @@ impl<'a> ReasoningKernel<'a> {
                 "evidence": data.health.orphan_contexts,
             }));
         }
+        if !data
+            .health
+            .policy_coverage
+            .missing_layer_assignments
+            .is_empty()
+            || data.health.policy_coverage.dependency_constraint_count == 0
+        {
+            let mut evidence = Vec::new();
+            if !data
+                .health
+                .policy_coverage
+                .missing_layer_assignments
+                .is_empty()
+            {
+                evidence.push(json!({
+                    "missing_layer_assignments": data.health.policy_coverage.missing_layer_assignments,
+                }));
+            }
+            if data.health.policy_coverage.dependency_constraint_count == 0 {
+                evidence.push(json!({
+                    "missing_dependency_constraints": true,
+                }));
+            }
+            next_actions.push(json!({
+                "priority": priority,
+                "tool": "constrain",
+                "action": "list",
+                "reason": "Architecture policy coverage is incomplete; health is not fully constrained.",
+                "evidence": evidence,
+            }));
+        }
         if !data.pending_changes.is_empty() {
             next_actions.push(json!({
                 "priority": priority,
@@ -2128,8 +2266,7 @@ impl<'a> ReasoningKernel<'a> {
                     "pending_changes": data.pending_changes,
                 },
                 "ast_edges": data.ast_stats,
-                "has_actual_model": data.has_actual,
-                "has_desired_model": data.has_desired,
+                "has_implemented_model": data.has_actual,
                 "next_actions": next_actions,
                 "loop_hint": "After implementing fixes, call sync then diagnose again to verify improvement.",
             }),
@@ -2150,8 +2287,7 @@ impl<'a> ReasoningKernel<'a> {
                 "evidence",
                 "Diagnose summary inputs",
                 json!({
-                    "has_actual_model": data.has_actual,
-                    "has_desired_model": data.has_desired,
+                    "has_implemented_model": data.has_actual,
                     "failing_invariants": failing_invariants,
                     "next_action_count": next_actions.len(),
                 }),
@@ -2257,7 +2393,7 @@ impl<'a> ReasoningKernel<'a> {
         let can_delete = result["can_delete"].as_bool().unwrap_or(false);
 
         let mut assumptions = Vec::new();
-        if !data.has_desired {
+        if !data.has_actual {
             assumptions.push(
                 "No implemented domain model is stored; aggregate-, event-, and repository-level witnesses may be incomplete."
                     .to_string(),
@@ -2293,6 +2429,9 @@ impl<'a> ReasoningKernel<'a> {
                     "aggregate_member".into(),
                     "event".into(),
                     "repository".into(),
+                    "field".into(),
+                    "method".into(),
+                    "method_param".into(),
                     "import_edge".into(),
                     "ast_edge".into(),
                     "calls_symbol".into(),
@@ -2310,7 +2449,7 @@ impl<'a> ReasoningKernel<'a> {
             vec![
                 "Dynamic dispatch, reflection, string-based lookups, and out-of-repository consumers are not tracked.".into(),
             ],
-            desired_actual_dependencies(&data.basis),
+            actual_dependencies(&data.basis),
             computed_at_us,
             "deletion_safety",
             "actual",
@@ -2320,15 +2459,76 @@ impl<'a> ReasoningKernel<'a> {
     fn how_connected_claim(
         &self,
         workspace_path: &str,
+        relation: &str,
         from: &str,
         to: &str,
         data: &MaterializedReasoningData,
         computed_at_us: i64,
     ) -> Result<PersistedReasoningClaim> {
         let canonical = canonicalize_path(workspace_path);
+        if relation == "calls_symbol" {
+            let paths = self.store.query_call_paths(&canonical, from, to)?;
+            let result = self.store.call_graph_reachability(&canonical, from)?;
+            let reachable_symbols = result["reachable"].as_array().cloned().unwrap_or_default();
+            let reachable = !paths.is_empty();
+            let assumptions = if !data.has_actual {
+                vec![
+                    "No implemented domain model is stored; connectivity is derived from an empty call graph."
+                        .to_string(),
+                ]
+            } else {
+                Vec::new()
+            };
+            return Ok(build_claim(
+                &how_connected_claim_id_for_relation(relation, from, to),
+                "how_connected",
+                &json!({ "relation": relation, "from": from, "to": to }).to_string(),
+                if reachable {
+                    "reachable"
+                } else {
+                    "disconnected"
+                },
+                if reachable {
+                    format!("'{from}' reaches '{to}' through stored call graph edges.")
+                } else {
+                    format!("No stored call graph path from '{from}' to '{to}'.")
+                },
+                json!({
+                    "status": if reachable { "reachable" } else { "disconnected" },
+                    "relation": relation,
+                    "from": from,
+                    "to": to,
+                    "reachable": reachable,
+                    "paths": paths.clone(),
+                    "path_count": paths.len(),
+                    "reachable_symbols": reachable_symbols,
+                    "reachable_count": result["count"].clone(),
+                }),
+                vec![ReasoningDerivation {
+                    rule: "transitive reachability via calls_symbol".into(),
+                    derived_from: vec!["calls_symbol".into()],
+                    witness_count: paths.len(),
+                }],
+                vec![support(
+                    "evidence",
+                    "Call graph reachability witnesses",
+                    json!({ "paths": paths, "result": result }),
+                )],
+                assumptions,
+                vec![
+                    "Call graph reachability is computed from stored implemented calls_symbol edges and does not reconstruct every intermediate call path."
+                        .into(),
+                ],
+                actual_dependencies(&data.basis),
+                computed_at_us,
+                "call_graph_reachability",
+                "actual",
+            ));
+        }
+
         let paths = self.store.query_dependency_path(&canonical, from, to)?;
         let reachable = !paths.is_empty();
-        let assumptions = if !data.has_desired {
+        let assumptions = if !data.has_actual {
             vec![
                 "No implemented domain model is stored; connectivity is derived from an empty dependency graph."
                     .to_string(),
@@ -2338,9 +2538,9 @@ impl<'a> ReasoningKernel<'a> {
         };
 
         Ok(build_claim(
-            &how_connected_claim_id(from, to),
+            &how_connected_claim_id_for_relation(relation, from, to),
             "how_connected",
-            &json!({ "from": from, "to": to }).to_string(),
+            &json!({ "relation": relation, "from": from, "to": to }).to_string(),
             if reachable {
                 "reachable"
             } else {
@@ -2353,6 +2553,7 @@ impl<'a> ReasoningKernel<'a> {
             },
             json!({
                 "status": if reachable { "reachable" } else { "disconnected" },
+                "relation": relation,
                 "from": from,
                 "to": to,
                 "paths": paths.clone(),
@@ -2374,7 +2575,7 @@ impl<'a> ReasoningKernel<'a> {
                 "Connectivity is computed from stored implemented context dependencies only."
                     .into(),
             ],
-            desired_dependencies(&data.basis),
+            actual_dependencies(&data.basis),
             computed_at_us,
             "dependency_path",
             "actual",
@@ -2451,11 +2652,23 @@ fn dependency(
     }
 }
 
-fn desired_dependencies(basis: &SnapshotBasis) -> Vec<ReasoningDependency> {
-    vec![dependency("snapshot", "actual", basis.actual_ts)]
+fn claim_dependencies_match_basis(claim: &PersistedReasoningClaim, basis: &SnapshotBasis) -> bool {
+    if claim.dependencies.is_empty() {
+        return false;
+    }
+    claim.dependencies.iter().all(|dependency| {
+        match (
+            dependency.dependency_kind.as_str(),
+            dependency.dependency_state.as_str(),
+        ) {
+            ("snapshot", "actual") => dependency.basis_timestamp_us == basis.actual_ts,
+            ("materialized", "drift") => dependency.basis_timestamp_us == basis.drift_ts,
+            _ => true,
+        }
+    })
 }
 
-fn desired_actual_dependencies(basis: &SnapshotBasis) -> Vec<ReasoningDependency> {
+fn actual_dependencies(basis: &SnapshotBasis) -> Vec<ReasoningDependency> {
     vec![dependency("snapshot", "actual", basis.actual_ts)]
 }
 
@@ -2470,8 +2683,25 @@ fn safe_to_delete_claim_id(context: &str, entity: &str) -> String {
     format!("{CLAIM_SAFE_TO_DELETE_PREFIX}:{context}:{entity}")
 }
 
+#[cfg(test)]
 fn how_connected_claim_id(from: &str, to: &str) -> String {
-    format!("{CLAIM_HOW_CONNECTED_PREFIX}:{from}:{to}")
+    how_connected_claim_id_for_relation("context_dep", from, to)
+}
+
+fn how_connected_claim_id_for_relation(relation: &str, from: &str, to: &str) -> String {
+    if relation == "context_dep" {
+        format!("{CLAIM_HOW_CONNECTED_PREFIX}:{from}:{to}")
+    } else {
+        format!("{CLAIM_HOW_CONNECTED_PREFIX}:{relation}:{from}:{to}")
+    }
+}
+
+fn normalize_path_relation(relation: &str) -> Result<&'static str> {
+    match relation {
+        "" | "all" | "context_dep" => Ok("context_dep"),
+        "calls_symbol" => Ok("calls_symbol"),
+        other => anyhow::bail!("Unknown path relation '{other}'. Use context_dep or calls_symbol."),
+    }
 }
 
 fn parse_json_subject(subject: &str) -> Value {
@@ -2479,7 +2709,7 @@ fn parse_json_subject(subject: &str) -> Value {
 }
 
 fn witness_count_from_value(result: &Value) -> usize {
-    [
+    let direct = [
         "aggregates_referencing",
         "events_sourced",
         "repositories_managing",
@@ -2494,7 +2724,17 @@ fn witness_count_from_value(result: &Value) -> usize {
             .map(|items| items.len())
             .unwrap_or(0)
     })
-    .sum()
+    .sum::<usize>();
+    let type_refs = result["type_references"]
+        .as_object()
+        .map(|references| {
+            references
+                .values()
+                .map(|value| value.as_array().map(|items| items.len()).unwrap_or(0))
+                .sum::<usize>()
+        })
+        .unwrap_or(0);
+    direct + type_refs
 }
 
 fn build_ast_stats(actual: Option<&crate::domain::model::DomainModel>) -> Option<Value> {
@@ -2527,6 +2767,7 @@ fn health_json(health: &ModelHealth) -> Value {
         "orphan_contexts": health.orphan_contexts,
         "god_contexts": health.god_contexts,
         "unsourced_events": health.unsourced_events,
+        "policy_coverage": health.policy_coverage,
     })
 }
 
@@ -2538,12 +2779,6 @@ fn diagnose_limitations(data: &MaterializedReasoningData) -> Vec<String> {
     if !data.has_actual {
         limitations.push(
             "No implemented model is available; recommendations are based on empty scan data."
-                .into(),
-        );
-    }
-    if !data.has_desired {
-        limitations.push(
-            "No implemented domain model is available; run sync/scan to bootstrap current facts."
                 .into(),
         );
     }
@@ -2626,7 +2861,7 @@ fn enrich_plan(store: &Store, workspace_path: &str, changes: &[Value]) -> Value 
         "migration_notes": [
             "Apply changes in priority order (0 = highest).",
             "Context-level changes should be done before entity/service changes.",
-            "Run `sync` after implementing to update the current model.",
+            "Run `rust_scan` after implementing to update the actual Rust graph.",
             "In actual-first mode, `accept` and `reset` are compatibility no-ops."
         ]
     })
@@ -2943,7 +3178,9 @@ fn rebuild_how_connected_rule(
             claim.claim_id
         );
     }
-    kernel.how_connected_claim(workspace_path, from, to, data, computed_at_us)
+    let relation = subject["relation"].as_str().unwrap_or("context_dep");
+    let relation = normalize_path_relation(relation)?;
+    kernel.how_connected_claim(workspace_path, relation, from, to, data, computed_at_us)
 }
 
 fn rebuild_impact_rule(
@@ -2998,7 +3235,7 @@ fn impact_claim_id(args: &Value) -> Result<String> {
 }
 
 fn history_claim_id(args: &Value) -> String {
-    let raw_state = args["state"].as_str().unwrap_or("planned");
+    let raw_state = args["state"].as_str().unwrap_or("actual");
     match (args["ts_old"].as_i64(), args["ts_new"].as_i64()) {
         (Some(ts_old), ts_new) => format!(
             "{CLAIM_HISTORY_PREFIX}:{}:{}:{}",
@@ -3064,6 +3301,8 @@ fn impact_witness_count(payload: &Value) -> usize {
     payload["count"]
         .as_u64()
         .or_else(|| payload["result"]["count"].as_u64())
+        .or_else(|| payload["result"]["total_edges"].as_u64())
+        .or_else(|| payload["total_edges"].as_u64())
         .unwrap_or(0) as usize
 }
 
@@ -3628,16 +3867,6 @@ fn fact_justification(
     }
 }
 
-fn desired_relation_justifications(
-    basis: &SnapshotBasis,
-    relations: &[&str],
-) -> Vec<ReasoningJustification> {
-    relations
-        .iter()
-        .map(|relation| relation_justification(relation, "desired", basis.desired_ts))
-        .collect()
-}
-
 fn actual_relation_justifications(
     basis: &SnapshotBasis,
     relations: &[&str],
@@ -3654,7 +3883,7 @@ fn default_justifications_for_claim(
 ) -> Vec<ReasoningJustification> {
     let mut justifications = match claim.claim_id.as_str() {
         CLAIM_ARCHITECTURE_OVERVIEW => {
-            let mut items = desired_relation_justifications(
+            let mut items = actual_relation_justifications(
                 &data.basis,
                 &[
                     "project",
@@ -3699,19 +3928,19 @@ fn default_justifications_for_claim(
             items
         }
         CLAIM_CHECK_LAYER_VIOLATIONS | CLAIM_WHY_LAYER_VIOLATIONS => {
-            desired_relation_justifications(&data.basis, &["service", "service_dep"])
+            actual_relation_justifications(&data.basis, &["service", "service_dep"])
         }
         CLAIM_CHECK_CIRCULAR_DEPS | CLAIM_WHY_CIRCULAR_DEPS => {
-            desired_relation_justifications(&data.basis, &["context_dep"])
+            actual_relation_justifications(&data.basis, &["context_dep"])
         }
         CLAIM_CHECK_AGGREGATE_QUALITY | CLAIM_WHY_AGGREGATE_QUALITY => {
-            desired_relation_justifications(&data.basis, &["entity", "invariant"])
+            actual_relation_justifications(&data.basis, &["entity", "invariant"])
         }
         CLAIM_CHECK_ORPHAN_CONTEXTS | CLAIM_WHY_ORPHAN_CONTEXTS => {
-            desired_relation_justifications(&data.basis, &["context", "context_dep"])
+            actual_relation_justifications(&data.basis, &["context", "context_dep"])
         }
         CLAIM_CHECK_POLICY_VIOLATIONS | CLAIM_WHY_POLICY_VIOLATIONS => {
-            desired_relation_justifications(
+            actual_relation_justifications(
                 &data.basis,
                 &["context_dep", "layer_assignment", "dependency_constraint"],
             )
@@ -3720,7 +3949,7 @@ fn default_justifications_for_claim(
         | CLAIM_DRIFT_OVERVIEW
         | CLAIM_DIAGNOSE_REFACTOR
         | CLAIM_REFACTOR_PLAN => {
-            let mut items = desired_relation_justifications(
+            let mut items = actual_relation_justifications(
                 &data.basis,
                 &[
                     "context",
@@ -3759,7 +3988,7 @@ fn default_justifications_for_claim(
             items
         }
         CLAIM_CHECK_ALL => {
-            let mut items = desired_relation_justifications(
+            let mut items = actual_relation_justifications(
                 &data.basis,
                 &[
                     "context",
@@ -3802,7 +4031,7 @@ fn default_justifications_for_claim(
         let context = subject["context"].as_str().unwrap_or("");
         let entity = subject["entity"].as_str().unwrap_or("");
         let key = format!("{context}/{entity}");
-        justifications.extend(desired_relation_justifications(
+        justifications.extend(actual_relation_justifications(
             &data.basis,
             &["aggregate_member", "event", "repository"],
         ));
@@ -3813,8 +4042,8 @@ fn default_justifications_for_claim(
         justifications.push(fact_justification(
             "entity",
             &key,
-            "desired",
-            data.basis.desired_ts,
+            "actual",
+            data.basis.actual_ts,
         ));
         justifications.push(fact_justification(
             "symbol",
@@ -3831,7 +4060,7 @@ fn default_justifications_for_claim(
         let subject = parse_json_subject(&claim.subject);
         let from = subject["from"].as_str().unwrap_or("");
         let to = subject["to"].as_str().unwrap_or("");
-        justifications.extend(desired_relation_justifications(
+        justifications.extend(actual_relation_justifications(
             &data.basis,
             &["context", "context_dep"],
         ));
@@ -3839,16 +4068,16 @@ fn default_justifications_for_claim(
             justifications.push(fact_justification(
                 "context",
                 from,
-                "desired",
-                data.basis.desired_ts,
+                "actual",
+                data.basis.actual_ts,
             ));
         }
         if !to.is_empty() {
             justifications.push(fact_justification(
                 "context",
                 to,
-                "desired",
-                data.basis.desired_ts,
+                "actual",
+                data.basis.actual_ts,
             ));
         }
     }
@@ -3868,25 +4097,25 @@ fn default_justifications_for_claim(
             | "betweenness_centrality"
             | "degree_centrality"
             | "topological_order" => {
-                justifications.extend(desired_relation_justifications(
+                justifications.extend(actual_relation_justifications(
                     &data.basis,
                     &["context", "context_dep"],
                 ));
             }
             "layer_violations" => {
-                justifications.extend(desired_relation_justifications(
+                justifications.extend(actual_relation_justifications(
                     &data.basis,
                     &["service", "service_dep"],
                 ));
             }
             "aggregate_quality" => {
-                justifications.extend(desired_relation_justifications(
+                justifications.extend(actual_relation_justifications(
                     &data.basis,
                     &["entity", "invariant"],
                 ));
             }
             "impact_analysis" => {
-                justifications.extend(desired_relation_justifications(
+                justifications.extend(actual_relation_justifications(
                     &data.basis,
                     &["event", "repository", "service_dep", "context_dep"],
                 ));
@@ -3896,10 +4125,10 @@ fn default_justifications_for_claim(
                 ));
             }
             "field_usage" | "shared_fields" => {
-                justifications.extend(desired_relation_justifications(&data.basis, &["field"]));
+                justifications.extend(actual_relation_justifications(&data.basis, &["field"]));
             }
             "method_search" => {
-                justifications.extend(desired_relation_justifications(&data.basis, &["method"]));
+                justifications.extend(actual_relation_justifications(&data.basis, &["method"]));
             }
             "call_graph_callers"
             | "call_graph_callees"
@@ -3919,13 +4148,12 @@ fn default_justifications_for_claim(
                     "method_name" => "method_name",
                     _ => key,
                 };
-                let state = if key == "symbol" { "actual" } else { "desired" };
-                let basis_ts = if state == "actual" {
-                    data.basis.actual_ts
-                } else {
-                    data.basis.desired_ts
-                };
-                justifications.push(fact_justification(fact_kind, value, state, basis_ts));
+                justifications.push(fact_justification(
+                    fact_kind,
+                    value,
+                    "actual",
+                    data.basis.actual_ts,
+                ));
             }
         }
     }
@@ -3935,16 +4163,16 @@ fn default_justifications_for_claim(
         .starts_with(&format!("{CLAIM_HISTORY_PREFIX}:"))
     {
         let subject = parse_json_subject(&claim.subject);
-        let raw_state = subject["state"].as_str().unwrap_or("planned");
-        let state = if raw_state == "current" {
-            "actual"
-        } else {
+        let raw_state = subject["state"].as_str().unwrap_or("actual");
+        let state = if raw_state == "desired" {
             "desired"
-        };
-        let basis_ts = if state == "actual" {
-            data.basis.actual_ts
         } else {
+            "actual"
+        };
+        let basis_ts = if state == "desired" {
             data.basis.desired_ts
+        } else {
+            data.basis.actual_ts
         };
         justifications.push(fact_justification("snapshot_log", state, state, basis_ts));
     }
@@ -3953,7 +4181,7 @@ fn default_justifications_for_claim(
         .claim_id
         .starts_with(&format!("{CLAIM_SEARCH_PREFIX}:"))
     {
-        justifications.extend(desired_relation_justifications(
+        justifications.extend(actual_relation_justifications(
             &data.basis,
             &[
                 "context",

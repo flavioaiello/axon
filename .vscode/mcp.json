@@ -2,7 +2,7 @@
   "servers": {
     "axon": {
       "type": "stdio",
-      "command": "/Users/flavioaiello/.cargo/bin/axon",
+      "command": "${workspaceFolder}/target/debug/axon",
       "args": [
         "serve",
         "--workspace",

@@ -9,6 +9,196 @@ use crate::store::cozo::PersistedReasoningClaim;
 
 /// Returns the list of tools the Axon server exposes.
 pub fn list_tools() -> Vec<ToolDefinition> {
+    rust_native_read_tools()
+}
+
+fn rust_native_read_tools() -> Vec<ToolDefinition> {
+    vec![
+        ToolDefinition {
+            name: "rust_status".into(),
+            description: "Show the current actual-state Rust model: crate inventory, module tree, source files, Rust symbols, imports, calls, semantic annotations, health, and snapshot freshness. Call this first before planning Rust changes.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "detail": {
+                        "type": "string",
+                        "enum": ["summary", "full"],
+                        "description": "Response detail level. Summary is bounded for chat; full returns the complete architecture payload."
+                    }
+                },
+                "required": []
+            }),
+        },
+        ToolDefinition {
+            name: "rust_graph".into(),
+            description: "Query persisted actual-state Rust facts through bounded graph views: modules, source files, symbols, import edges, call edges, AST edges, neighborhoods, paths, and relation counts. Results use compact schema-plus-rows JSON (`schema`, `cols`, `rows`) for repeated facts. Arbitrary Datalog is not exposed.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "view": {
+                        "type": "string",
+                        "enum": ["overview", "relations", "nodes", "edges", "neighborhood", "paths"],
+                        "description": "Graph view to return (default: overview)"
+                    },
+                    "kind": {
+                        "type": "string",
+                        "enum": ["all", "module", "source_file", "symbol", "struct", "enum", "function", "method"],
+                        "description": "Rust node kind filter for nodes/neighborhood views"
+                    },
+                    "relation": {
+                        "type": "string",
+                        "enum": ["all", "context_dep", "import_edge", "calls_symbol", "ast_edge"],
+                        "description": "Rust relation filter for edges/paths views"
+                    },
+                    "module": { "type": "string", "description": "Rust module path/name filter" },
+                    "file": { "type": "string", "description": "Source file filter" },
+                    "symbol": { "type": "string", "description": "Rust symbol filter" },
+                    "struct": { "type": "string", "description": "Rust struct-name alias for symbol" },
+                    "from": { "type": "string", "description": "Source node for paths or edge filtering" },
+                    "to": { "type": "string", "description": "Target node for paths or edge filtering" },
+                    "limit": { "type": "integer", "description": "Max returned rows per collection (default: 50, max: 200)", "default": 50 }
+                },
+                "required": []
+            }),
+        },
+        ToolDefinition {
+            name: "rust_health".into(),
+            description: "Compute a Datalog-derived health report over actual Rust facts and optional semantic annotations: score, cycles, layer violations, missing invariants, orphan modules/contexts, and graph analytics when available.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "required": []
+            }),
+        },
+        ToolDefinition {
+            name: "rust_impact".into(),
+            description: "Analyze blast radius in the actual Rust graph. Use module for dependency analysis and symbol or struct for call graph analysis.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "analysis": {
+                        "type": "string",
+                        "enum": ["transitive_deps", "circular_deps", "layer_violations", "impact_analysis",
+                                 "aggregate_quality", "dependency_graph", "field_usage", "method_search",
+                                 "shared_fields", "pagerank", "community_detection", "betweenness_centrality",
+                                 "degree_centrality", "topological_order",
+                                 "call_graph_callers", "call_graph_callees", "call_graph_reachability", "call_graph_stats"],
+                        "description": "The specific actual-state Rust analysis to run"
+                    },
+                    "module": { "type": "string", "description": "Rust module name/path for dependency analyses" },
+                    "struct": { "type": "string", "description": "Rust struct name for struct/entity or call graph analyses" },
+                    "symbol": { "type": "string", "description": "Rust symbol name" },
+                    "field_type": { "type": "string", "description": "Field type to search (required for field_usage)" },
+                    "method_name": { "type": "string", "description": "Method name to search (required for method_search)" }
+                },
+                "required": ["analysis"]
+            }),
+        },
+        ToolDefinition {
+            name: "rust_delete_safety".into(),
+            description: "Check whether a Rust symbol or struct can be safely deleted. Evaluates inbound call edges, imports, AST references, and semantic annotation dependents. Module is optional; omit it for a workspace-wide symbol check.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "module": { "type": "string", "description": "Optional Rust module filter" },
+                    "struct": { "type": "string", "description": "Rust struct name" },
+                    "symbol": { "type": "string", "description": "Rust symbol name" }
+                },
+                "required": []
+            }),
+        },
+        ToolDefinition {
+            name: "rust_invariants".into(),
+            description: "Check actual Rust graph invariants and configured constraints: circular dependencies, layer violations, missing invariants on annotated core structs, isolated modules, policy violations, and drift freshness. Run without parameters to check everything.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "invariant": {
+                        "type": "string",
+                        "enum": ["layer_violations", "circular_deps", "aggregate_quality", "orphan_contexts", "policy_violations", "drift"],
+                        "description": "Specific invariant to run (default: all)"
+                    }
+                },
+                "required": []
+            }),
+        },
+        ToolDefinition {
+            name: "rust_path".into(),
+            description: "Show how two Rust modules/components or symbols are connected. Returns proof paths over stored dependency facts or call-graph reachability when available.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "from": { "type": "string", "description": "Source Rust module or component" },
+                    "to": { "type": "string", "description": "Target Rust module or component" },
+                    "relation": { "type": "string", "enum": ["context_dep", "calls_symbol"], "description": "Connectivity relation to traverse (default: context_dep)" }
+                },
+                "required": ["from", "to"]
+            }),
+        },
+        ToolDefinition {
+            name: "rust_explain".into(),
+            description: "Explain why a Rust graph invariant or configured constraint is failing. Returns evidence-backed witness paths and remediation context.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "violation_type": {
+                        "type": "string",
+                        "enum": ["layer_violations", "circular_deps", "policy_violations", "aggregate_quality", "orphan_contexts"],
+                        "description": "The failing invariant or constraint type to explain"
+                    }
+                },
+                "required": ["violation_type"]
+            }),
+        },
+        ToolDefinition {
+            name: "rust_diff".into(),
+            description: "Compare the two most recent actual Rust graph snapshots. Shows added and removed Rust facts over time.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "required": []
+            }),
+        },
+        ToolDefinition {
+            name: "rust_history".into(),
+            description: "List actual Rust graph snapshots or compare two snapshot timestamps to show what changed between them.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "state": {
+                        "type": "string",
+                        "enum": ["actual", "implemented", "current", "planned"],
+                        "description": "History stream to query (default: actual; implemented/current/planned are accepted aliases)"
+                    },
+                    "ts_old": {
+                        "type": "integer",
+                        "description": "Older snapshot timestamp (microseconds). Required for comparison."
+                    },
+                    "ts_new": {
+                        "type": "integer",
+                        "description": "Newer snapshot timestamp (microseconds). Omit for latest."
+                    }
+                },
+                "required": []
+            }),
+        },
+        ToolDefinition {
+            name: "rust_search".into(),
+            description: "Search actual Rust facts and semantic annotations by keyword. Finds modules, structs, symbols, labels, and decisions across the codebase.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Search keywords" },
+                    "limit": { "type": "integer", "description": "Max results (default: 20)", "default": 20 }
+                },
+                "required": ["query"]
+            }),
+        },
+    ]
+}
+
+#[allow(dead_code)]
+fn legacy_read_tools() -> Vec<ToolDefinition> {
     let mut tools = vec![
         ToolDefinition {
             name: "architecture".into(),
@@ -21,6 +211,44 @@ pub fn list_tools() -> Vec<ToolDefinition> {
             input_schema: json!({
                 "type": "object",
                 "properties": {},
+                "required": []
+            }),
+        },
+        ToolDefinition {
+            name: "graph".into(),
+            description: "Query the Rust graph database directly through bounded, structured views. \
+                          Exposes source files, symbols, modules, imports, call edges, dependency \
+                          edges, AST edges, neighborhoods, paths, and relation counts without \
+                          allowing arbitrary Datalog execution. Use this when an AI agent needs \
+                          precise graph facts before planning or editing Rust code."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "view": {
+                        "type": "string",
+                        "enum": ["overview", "relations", "nodes", "edges", "neighborhood", "paths"],
+                        "description": "Graph view to return (default: overview)"
+                    },
+                    "kind": {
+                        "type": "string",
+                        "enum": ["all", "context", "module", "source_file", "symbol", "struct", "enum", "function", "method"],
+                        "description": "Node kind filter for nodes/neighborhood views"
+                    },
+                    "relation": {
+                        "type": "string",
+                        "enum": ["all", "context_dep", "import_edge", "calls_symbol", "ast_edge"],
+                        "description": "Edge relation filter for edges/paths views"
+                    },
+                    "context": { "type": "string", "description": "Context/module filter" },
+                    "module": { "type": "string", "description": "Alias for context/module filter" },
+                    "file": { "type": "string", "description": "Source file filter" },
+                    "symbol": { "type": "string", "description": "Rust symbol filter" },
+                    "struct": { "type": "string", "description": "Alias for symbol when targeting a Rust struct" },
+                    "from": { "type": "string", "description": "Source node for paths or edge filtering" },
+                    "to": { "type": "string", "description": "Target node for paths or edge filtering" },
+                    "limit": { "type": "integer", "description": "Max returned rows per collection (default: 50, max: 200)", "default": 50 }
+                },
                 "required": []
             }),
         },
@@ -60,18 +288,19 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "safe_to_delete".into(),
-            description: "Check whether a Rust struct, symbol, or compatibility entity can be safely deleted. \
-                          Evaluates inbound references including callers, imports, dependents, and overlays — \
-                          and returns a clear yes/no with evidence."
+            description: "Check whether a Rust symbol or struct can be safely deleted. Evaluates \
+                          inbound call edges, imports, AST references, and any semantic overlay \
+                          dependents. Context/module is optional; provide it to narrow overlay \
+                          evidence, or omit it for a workspace-wide Rust symbol check."
                 .into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "context": { "type": "string", "description": "Compatibility context name" },
-                    "module": { "type": "string", "description": "Rust module name/path alias for context" },
-                    "entity": { "type": "string", "description": "Compatibility entity name" },
-                    "struct": { "type": "string", "description": "Rust struct name alias for entity" },
-                    "symbol": { "type": "string", "description": "Rust symbol name alias for entity" }
+                    "context": { "type": "string", "description": "Optional semantic context/module filter" },
+                    "module": { "type": "string", "description": "Optional Rust module/context filter" },
+                    "entity": { "type": "string", "description": "Compatibility entity name alias" },
+                    "struct": { "type": "string", "description": "Rust struct name alias" },
+                    "symbol": { "type": "string", "description": "Rust symbol name" }
                 },
                 "required": []
             }),
@@ -186,6 +415,12 @@ pub fn list_tools() -> Vec<ToolDefinition> {
     );
     add_tool_alias(
         &mut tools,
+        "graph",
+        "query_rust_graph",
+        "Alias for graph. Returns bounded Rust graph database views over source files, symbols, modules, imports, calls, and dependencies.",
+    );
+    add_tool_alias(
+        &mut tools,
         "impact",
         "query_blast_radius",
         "Alias for impact. Runs dependency, impact, graph, field, method, and call-graph analyses.",
@@ -257,6 +492,19 @@ fn add_tool_alias(
 /// Dispatches a tool call and returns the result.
 pub fn call_tool(store: &Store, workspace_path: &str, name: &str, args: &Value) -> ToolCallResult {
     match name {
+        "rust_status" => {
+            let kernel = ReasoningKernel::new(store);
+            match kernel.architecture(workspace_path) {
+                Ok(mut claim) => {
+                    if args["detail"].as_str().unwrap_or("summary") != "full" {
+                        claim.payload = compact_architecture_status_payload(claim.payload);
+                    }
+                    stored_claim_result(store, workspace_path, &claim)
+                }
+                Err(e) => error_result(format!("rust_status failed: {e}")),
+            }
+        }
+
         "architecture" | "get_model" => {
             let kernel = ReasoningKernel::new(store);
             match kernel.architecture(workspace_path) {
@@ -265,75 +513,129 @@ pub fn call_tool(store: &Store, workspace_path: &str, name: &str, args: &Value) 
             }
         }
 
-        "model_health" => {
-            match store.model_health(workspace_path) {
-                Ok(health) => json_result(with_reasoning_context(
-                    json!({
-                        "status": "ok",
-                        "model_health": health,
-                    }),
+        "rust_graph" | "graph" | "query_rust_graph" => {
+            match store.query_rust_graph(workspace_path, args) {
+                Ok(payload) => {
+                    let payload = compact_rust_graph_payload(payload);
+                    let witness_count = graph_witness_count(&payload);
+                    let relations_used = payload["relations_used"].clone();
+                    let mut envelope = with_reasoning_context(
+                    payload,
                     Some(json!({
-                        "rule": "model health is computed from persisted architecture relations",
-                        "derived_from": [
-                            "context_dep",
-                            "service",
-                            "entity",
-                            "invariant",
-                            "event",
-                            "context"
-                        ],
-                        "witness_count": health.circular_deps.len()
-                            + health.layer_violations.len()
-                            + health.missing_invariants.len()
-                            + health.orphan_contexts.len(),
+                        "rule": "bounded Rust graph query over persisted Cozo relations",
+                        "derived_from": relations_used,
+                        "witness_count": witness_count,
                     })),
                     Some(json!({
-                        "score": health.score,
-                        "circular_dependency_count": health.circular_deps.len(),
-                        "layer_violation_count": health.layer_violations.len(),
-                        "missing_invariant_count": health.missing_invariants.len(),
-                        "orphan_context_count": health.orphan_contexts.len(),
+                        "filters": args,
+                        "witness_count": witness_count,
                     })),
                     vec![
-                        "Model health uses the latest persisted implemented architecture facts.".into(),
-                        "Graph analytics are empty when the active Cozo runtime does not provide the required fixed rules.".into(),
+                        "Graph queries return persisted actual-state facts only; run rust_scan before relying on freshly edited files.".into(),
+                        "Output is bounded and may be truncated; increase limit up to 200 or narrow filters for exhaustive local evidence.".into(),
                     ],
-                    Some(json!({"source": "model_health", "state": "actual"})),
-                )),
-                Err(e) => error_result(format!("model_health failed: {e}")),
+                    Some(json!({"source": "rust_graph_query", "state": "actual"})),
+                );
+                    if let Some(object) = envelope.as_object_mut() {
+                        object.insert(
+                            "truth_maintenance".into(),
+                            compact_truth_maintenance_json(truth_maintenance_json(
+                                store,
+                                workspace_path,
+                            )),
+                        );
+                    }
+                    json_result(envelope)
+                }
+                Err(e) => error_result(format!("query_rust_graph failed: {e}")),
             }
         }
 
-        "impact" | "query_blast_radius" => {
+        "rust_health" | "model_health" => match store.model_health(workspace_path) {
+            Ok(health) => {
+                let policy_gap_count = if health.policy_coverage.context_count == 0 {
+                    0
+                } else {
+                    health.policy_coverage.missing_layer_assignments.len()
+                        + usize::from(health.policy_coverage.dependency_constraint_count == 0)
+                };
+                json_result(with_reasoning_context(
+                        json!({
+                            "status": "ok",
+                            "model_health": health,
+                        }),
+                        Some(json!({
+                            "rule": "model health is computed from persisted architecture relations",
+                            "derived_from": [
+                                "context_dep",
+                                "service",
+                                "entity",
+                                "invariant",
+                                "event",
+                                "context",
+                                "layer_assignment",
+                                "dependency_constraint"
+                            ],
+                            "witness_count": health.circular_deps.len()
+                                + health.layer_violations.len()
+                                + health.missing_invariants.len()
+                                + health.orphan_contexts.len()
+                                + policy_gap_count,
+                        })),
+                        Some(json!({
+                            "score": health.score,
+                            "circular_dependency_count": health.circular_deps.len(),
+                            "layer_violation_count": health.layer_violations.len(),
+                            "missing_invariant_count": health.missing_invariants.len(),
+                            "orphan_context_count": health.orphan_contexts.len(),
+                            "policy_gap_count": policy_gap_count,
+                            "policy_coverage": health.policy_coverage,
+                        })),
+                        vec![
+                            "Model health uses the latest persisted implemented architecture facts.".into(),
+                            "Graph analytics are empty when the active Cozo runtime does not provide the required fixed rules.".into(),
+                        ],
+                        Some(json!({"source": "model_health", "state": "actual"})),
+                    ))
+            }
+            Err(e) => error_result(format!("model_health failed: {e}")),
+        },
+
+        "rust_impact" | "impact" | "query_blast_radius" => {
             let kernel = ReasoningKernel::new(store);
             match kernel.impact(workspace_path, args) {
                 Ok(claim) => stored_claim_result(store, workspace_path, &claim),
-                Err(e) => error_result(format!("impact failed: {e}")),
+                Err(e) => error_result(format!("rust_impact failed: {e}")),
             }
         }
 
-        "safe_to_delete" | "can_delete_symbol" => {
-            let context = match args["context"].as_str().or_else(|| args["module"].as_str()) {
-                Some(c) => c,
-                None => return error_result("'context' or 'module' parameter is required".into()),
-            };
+        "rust_delete_safety" | "safe_to_delete" | "can_delete_symbol" => {
+            let context = args["context"]
+                .as_str()
+                .or_else(|| args["module"].as_str())
+                .unwrap_or("");
             let entity = match args["entity"]
                 .as_str()
                 .or_else(|| args["struct"].as_str())
                 .or_else(|| args["symbol"].as_str())
             {
                 Some(e) => e,
-                None => return error_result("'entity', 'struct', or 'symbol' parameter is required".into()),
+                None => {
+                    return error_result(
+                        "'entity', 'struct', or 'symbol' parameter is required".into(),
+                    );
+                }
             };
             let kernel = ReasoningKernel::new(store);
             match kernel.safe_to_delete(workspace_path, context, entity) {
                 Ok(claim) => stored_claim_result(store, workspace_path, &claim),
-                Err(e) => error_result(format!("can_delete_symbol failed: {e}")),
+                Err(e) => error_result(format!("rust_delete_safety failed: {e}")),
             }
         }
 
-        "check" | "check_architectural_invariant" => {
-            let invariant = args["check_name"].as_str()
+        "rust_invariants" | "check" | "check_architectural_invariant" => {
+            let invariant = args["check_name"]
+                .as_str()
                 .or_else(|| args["invariant"].as_str())
                 .unwrap_or("all");
             let kernel = ReasoningKernel::new(store);
@@ -341,32 +643,37 @@ pub fn call_tool(store: &Store, workspace_path: &str, name: &str, args: &Value) 
                 Ok(claim) => stored_claim_result(store, workspace_path, &claim),
                 Err(e) => error_result(format!(
                     "check '{}' failed: {e}",
-                    if invariant.is_empty() { "all" } else { invariant }
+                    if invariant.is_empty() {
+                        "all"
+                    } else {
+                        invariant
+                    }
                 )),
             }
         }
 
-        "how_connected" | "query_dependency_path" => {
-            let from = args["from"].as_str()
+        "rust_path" | "how_connected" | "query_dependency_path" => {
+            let from = args["from"]
+                .as_str()
                 .or_else(|| args["from_context"].as_str());
             let from = match from {
                 Some(f) => f,
                 None => return error_result("'from' parameter is required".into()),
             };
-            let to = args["to"].as_str()
-                .or_else(|| args["to_context"].as_str());
+            let to = args["to"].as_str().or_else(|| args["to_context"].as_str());
             let to = match to {
                 Some(t) => t,
                 None => return error_result("'to' parameter is required".into()),
             };
+            let relation = args["relation"].as_str().unwrap_or("context_dep");
             let kernel = ReasoningKernel::new(store);
-            match kernel.how_connected(workspace_path, from, to) {
+            match kernel.how_connected_with_relation(workspace_path, relation, from, to) {
                 Ok(claim) => stored_claim_result(store, workspace_path, &claim),
-                Err(e) => error_result(format!("query_dependency_path failed: {e}")),
+                Err(e) => error_result(format!("rust_path failed: {e}")),
             }
         }
 
-        "why" | "explain_violation" => {
+        "rust_explain" | "why" | "explain_violation" => {
             let violation_type = match args["violation_type"].as_str() {
                 Some(v) => v,
                 None => return error_result("'violation_type' parameter is required".into()),
@@ -379,15 +686,15 @@ pub fn call_tool(store: &Store, workspace_path: &str, name: &str, args: &Value) 
             }
         }
 
-        "drift" | "diff_models" => {
+        "rust_diff" | "drift" | "diff_models" => {
             let kernel = ReasoningKernel::new(store);
             match kernel.drift(workspace_path) {
                 Ok(claim) => stored_claim_result(store, workspace_path, &claim),
-                Err(e) => error_result(format!("drift failed: {e}")),
+                Err(e) => error_result(format!("rust_diff failed: {e}")),
             }
         }
 
-        "history" => {
+        "rust_history" | "history" => {
             let kernel = ReasoningKernel::new(store);
             match kernel.history(workspace_path, args) {
                 Ok(claim) => stored_claim_result(store, workspace_path, &claim),
@@ -395,7 +702,7 @@ pub fn call_tool(store: &Store, workspace_path: &str, name: &str, args: &Value) 
             }
         }
 
-        "search" | "search_architecture" => {
+        "rust_search" | "search" | "search_architecture" => {
             let query = match args["query"].as_str() {
                 Some(q) => q,
                 None => return error_result("'query' parameter is required".into()),
@@ -404,7 +711,7 @@ pub fn call_tool(store: &Store, workspace_path: &str, name: &str, args: &Value) 
             let kernel = ReasoningKernel::new(store);
             match kernel.search(workspace_path, query, limit) {
                 Ok(claim) => stored_claim_result(store, workspace_path, &claim),
-                Err(e) => error_result(format!("search_architecture failed: {e}")),
+                Err(e) => error_result(format!("rust_search failed: {e}")),
             }
         }
 
@@ -418,6 +725,257 @@ fn error_result(msg: String) -> ToolCallResult {
 
 fn json_result(payload: Value) -> ToolCallResult {
     json_tool_result(payload)
+}
+
+fn graph_witness_count(payload: &Value) -> usize {
+    payload["count"]
+        .as_u64()
+        .or_else(|| payload["rows"].as_array().map(|rows| rows.len() as u64))
+        .or_else(|| payload["summary"]["node_count"].as_u64())
+        .or_else(|| payload["summary"]["edge_count"].as_u64())
+        .or_else(|| payload["summary"]["relation_count"].as_u64())
+        .unwrap_or(0) as usize
+}
+
+fn compact_rust_graph_payload(mut payload: Value) -> Value {
+    let Some(object) = payload.as_object_mut() else {
+        return payload;
+    };
+    let view = object
+        .get("view")
+        .and_then(Value::as_str)
+        .unwrap_or("overview")
+        .to_string();
+    object.remove("workspace");
+    object.remove("graph_schema");
+    object.insert("schema".into(), json!(format!("axon.rust_graph.{view}.v1")));
+    object.insert("format".into(), json!("schema_rows"));
+
+    match view.as_str() {
+        "overview" | "relations" => {
+            if let Some(counts) = object.remove("relation_counts") {
+                object.insert("cols".into(), json!(["rel", "count"]));
+                object.insert("rows".into(), relation_count_rows(&counts));
+            }
+            if let Some(rows) = object.get("rows").and_then(Value::as_array) {
+                object.insert("count".into(), json!(rows.len()));
+            }
+        }
+        "nodes" => {
+            let rows = object
+                .remove("nodes")
+                .and_then(|nodes| nodes.as_array().map(|nodes| compact_node_rows(nodes)))
+                .unwrap_or_default();
+            object.insert("cols".into(), rust_graph_node_cols());
+            object.insert("rows".into(), Value::Array(rows));
+        }
+        "edges" => {
+            let rows = object
+                .remove("edges")
+                .and_then(|edges| edges.as_array().map(|edges| compact_edge_rows(edges)))
+                .unwrap_or_default();
+            object.insert("cols".into(), rust_graph_edge_cols());
+            object.insert("rows".into(), Value::Array(rows));
+        }
+        "neighborhood" => {
+            let node_rows = object
+                .remove("nodes")
+                .and_then(|nodes| nodes.as_array().map(|nodes| compact_node_rows(nodes)))
+                .unwrap_or_default();
+            let edge_rows = object
+                .remove("edges")
+                .and_then(|edges| edges.as_array().map(|edges| compact_edge_rows(edges)))
+                .unwrap_or_default();
+            object.insert(
+                "tables".into(),
+                json!({
+                    "nodes": {
+                        "cols": rust_graph_node_cols(),
+                        "rows": node_rows,
+                    },
+                    "edges": {
+                        "cols": rust_graph_edge_cols(),
+                        "rows": edge_rows,
+                    }
+                }),
+            );
+        }
+        "paths" => {
+            if let Some(paths) = object.remove("paths") {
+                let rows = paths
+                    .as_array()
+                    .map(|paths| paths.iter().map(|path| json!([path])).collect::<Vec<_>>())
+                    .unwrap_or_default();
+                object.insert("cols".into(), json!(["path"]));
+                object.insert("rows".into(), Value::Array(rows));
+            } else if let Some(result) = object.remove("result") {
+                let rows = result["reachable"]
+                    .as_array()
+                    .map(|items| items.iter().map(|item| json!([item])).collect::<Vec<_>>())
+                    .unwrap_or_default();
+                object.insert("cols".into(), json!(["callee"]));
+                object.insert("rows".into(), Value::Array(rows));
+            }
+        }
+        _ => {}
+    }
+
+    payload
+}
+
+fn relation_count_rows(counts: &Value) -> Value {
+    let rows = counts
+        .as_object()
+        .map(|counts| {
+            counts
+                .iter()
+                .map(|(relation, count)| json!([relation, count]))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Value::Array(rows)
+}
+
+fn rust_graph_node_cols() -> Value {
+    json!([
+        "id", "kind", "name", "ctx", "path", "file", "start", "end", "vis", "pub", "lang", "desc",
+        "rel"
+    ])
+}
+
+fn rust_graph_edge_cols() -> Value {
+    json!([
+        "id",
+        "rel",
+        "from",
+        "to",
+        "from_kind",
+        "to_kind",
+        "file",
+        "line",
+        "ctx",
+        "edge_type"
+    ])
+}
+
+fn compact_node_rows(nodes: &[Value]) -> Vec<Value> {
+    nodes.iter().map(compact_node_row).collect()
+}
+
+fn compact_node_row(node: &Value) -> Value {
+    json!([
+        node_str(node, "id"),
+        node_str(node, "kind"),
+        node_str(node, "name"),
+        node_str(node, "context"),
+        node_str(node, "module_path").or_else(|| node_str(node, "path")),
+        node_str(node, "file"),
+        node_value(node, "start_line"),
+        node_value(node, "end_line"),
+        node_str(node, "visibility"),
+        node_value(node, "public"),
+        node_str(node, "language"),
+        node_str(node, "description"),
+        node_str(node, "relation"),
+    ])
+}
+
+fn compact_edge_rows(edges: &[Value]) -> Vec<Value> {
+    edges.iter().map(compact_edge_row).collect()
+}
+
+fn compact_edge_row(edge: &Value) -> Value {
+    json!([
+        node_str(edge, "id"),
+        node_str(edge, "relation"),
+        node_str(edge, "from"),
+        node_str(edge, "to"),
+        node_str(edge, "from_kind"),
+        node_str(edge, "to_kind"),
+        node_str(edge, "file"),
+        node_value(edge, "line"),
+        node_str(edge, "context"),
+        node_str(edge, "edge_type"),
+    ])
+}
+
+fn node_str(value: &Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+        .map(ToString::to_string)
+}
+
+fn node_value(value: &Value, key: &str) -> Value {
+    value.get(key).cloned().unwrap_or(Value::Null)
+}
+
+fn compact_truth_maintenance_json(report: Value) -> Value {
+    let asserted = report.get("implemented").or_else(|| report.get("asserted"));
+    let scanned = report.get("scanned");
+    json!({
+        "schema": "axon.truth_maintenance.v1",
+        "format": "schema_rows",
+        "cols": ["kind", "ok", "ts", "ctx", "ent", "vo", "svc", "repo", "evt"],
+        "rows": [
+            compact_truth_row("implemented", asserted),
+            compact_truth_row("scanned", scanned),
+        ],
+        "drift_cols": ["status", "count", "computed_us", "basis_us"],
+        "drift_row": compact_drift_row(report.get("drift")),
+        "assumptions": report.get("assumptions").cloned().unwrap_or_else(|| json!([])),
+    })
+}
+
+fn compact_truth_row(kind: &str, section: Option<&Value>) -> Value {
+    json!([
+        kind,
+        section
+            .and_then(|value| value["available"].as_bool())
+            .unwrap_or(false),
+        section
+            .and_then(|value| value.get("snapshot_timestamp_us"))
+            .cloned()
+            .unwrap_or(Value::Null),
+        section
+            .and_then(|value| value["context_count"].as_u64())
+            .unwrap_or(0),
+        section
+            .and_then(|value| value["entity_count"].as_u64())
+            .unwrap_or(0),
+        section
+            .and_then(|value| value["value_object_count"].as_u64())
+            .unwrap_or(0),
+        section
+            .and_then(|value| value["service_count"].as_u64())
+            .unwrap_or(0),
+        section
+            .and_then(|value| value["repository_count"].as_u64())
+            .unwrap_or(0),
+        section
+            .and_then(|value| value["event_count"].as_u64())
+            .unwrap_or(0),
+    ])
+}
+
+fn compact_drift_row(drift: Option<&Value>) -> Value {
+    json!([
+        drift
+            .and_then(|value| value["status"].as_str())
+            .unwrap_or("unknown"),
+        drift
+            .and_then(|value| value["entry_count"].as_u64())
+            .unwrap_or(0),
+        drift
+            .and_then(|value| value.get("computed_at_us"))
+            .cloned()
+            .unwrap_or(Value::Null),
+        drift
+            .and_then(|value| value.get("basis_timestamp_us"))
+            .cloned()
+            .unwrap_or(Value::Null),
+    ])
 }
 
 fn truth_maintenance_json(store: &Store, workspace_path: &str) -> Value {
@@ -493,6 +1051,75 @@ fn stored_claim_result(
     }
 
     json_result(envelope)
+}
+
+fn compact_architecture_status_payload(mut payload: Value) -> Value {
+    if payload["implemented"].is_object() {
+        payload["implemented"] = compact_status_model(&payload["implemented"]);
+    }
+    if payload["current"].is_object() {
+        payload["current"] = json!({ "same_as": "implemented" });
+    }
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("detail".into(), json!("summary"));
+        object.insert(
+            "detail_hint".into(),
+            json!("Call rust_status with detail='full' or use architecture/get_model for full fields, methods, and semantic annotations."),
+        );
+    }
+    payload
+}
+
+fn compact_status_model(model: &Value) -> Value {
+    let contexts = model["bounded_contexts"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .map(|context| {
+                    json!({
+                        "name": context["name"],
+                        "module": context["module"],
+                        "depends_on": context["depends_on"],
+                        "counts": {
+                            "entities": context["entities"].as_array().map(|items| items.len()).unwrap_or(0),
+                            "services": context["services"].as_array().map(|items| items.len()).unwrap_or(0),
+                            "events": context["events"].as_array().map(|items| items.len()).unwrap_or(0),
+                            "value_objects": context["value_objects"].as_array().map(|items| items.len()).unwrap_or(0),
+                            "repositories": context["repositories"].as_array().map(|items| items.len()).unwrap_or(0),
+                        }
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    json!({
+        "project": model["project"],
+        "description": model["description"],
+        "ontology_contract": model["ontology_contract"],
+        "rust_ontology": compact_status_rust_ontology(&model["rust_ontology"]),
+        "context_count": contexts.len(),
+        "contexts": contexts,
+    })
+}
+
+fn compact_status_rust_ontology(ontology: &Value) -> Value {
+    let module_count = ontology["modules"]
+        .as_array()
+        .map(|items| items.len())
+        .unwrap_or(0);
+    json!({
+        "available": ontology["available"],
+        "contract": ontology["contract"],
+        "complete_fact_relations": ontology["complete_fact_relations"],
+        "overview_projection": ontology["overview_projection"],
+        "counts": ontology["counts"],
+        "module_count": module_count,
+        "modules": ontology["modules"],
+        "query_guidance": ontology["query_guidance"],
+        "omitted": ["structs"],
+    })
 }
 
 /// Build a model overview purely from Datalog relations — replaces DomainRegistry.
@@ -899,11 +1526,7 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let path = temp_dir().join(format!(
-            "axon_tools_test_{}_{}.db",
-            std::process::id(),
-            id
-        ));
+        let path = temp_dir().join(format!("axon_tools_test_{}_{}.db", std::process::id(), id));
         Store::open(&path).unwrap()
     }
 
@@ -917,17 +1540,31 @@ mod tests {
     #[test]
     fn test_list_tools_count() {
         let tools = list_tools();
-        assert_eq!(tools.len(), 18);
+        assert_eq!(tools.len(), 11);
         let names: Vec<_> = tools.iter().map(|tool| tool.name.as_str()).collect();
-        assert!(names.contains(&"get_model"));
-        assert!(names.contains(&"model_health"));
-        assert!(names.contains(&"query_blast_radius"));
-        assert!(names.contains(&"can_delete_symbol"));
-        assert!(names.contains(&"check_architectural_invariant"));
-        assert!(names.contains(&"query_dependency_path"));
-        assert!(names.contains(&"explain_violation"));
-        assert!(names.contains(&"diff_models"));
-        assert!(names.contains(&"search_architecture"));
+        for expected in [
+            "rust_status",
+            "rust_graph",
+            "rust_health",
+            "rust_impact",
+            "rust_delete_safety",
+            "rust_invariants",
+            "rust_path",
+            "rust_explain",
+            "rust_diff",
+            "rust_history",
+            "rust_search",
+        ] {
+            assert!(names.contains(&expected));
+        }
+        for legacy in [
+            "get_model",
+            "query_rust_graph",
+            "model_health",
+            "query_blast_radius",
+        ] {
+            assert!(!names.contains(&legacy));
+        }
     }
 
     #[test]
@@ -982,23 +1619,210 @@ mod tests {
         store.save_actual(&ws, &model).unwrap();
         store.compute_drift(&ws).unwrap();
 
-        let result = call_tool(&store, &ws, "architecture", &json!({}));
+        let result = call_tool(&store, &ws, "rust_status", &json!({}));
         assert_eq!(result.is_error, None);
         let ContentBlock::Text { text } = &result.content[0];
         let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
         assert_eq!(parsed["claim_kind"], "architecture");
         assert_eq!(parsed["status"], "ok");
+        assert_eq!(parsed["detail"], "summary");
         assert!(parsed["implemented"].is_object());
         assert_eq!(
             parsed["implemented"]["ontology_contract"]["ground_truth"],
             "rust"
         );
+        assert_eq!(parsed["implemented"]["context_count"], 1);
+        assert!(parsed["implemented"]["contexts"].is_array());
+        assert!(parsed["implemented"]["bounded_contexts"].is_null());
         assert_eq!(parsed["implemented"]["rust_ontology"]["available"], true);
         assert_eq!(
             parsed["implemented"]["rust_ontology"]["counts"]["structs"],
             1
         );
-        assert_eq!(parsed["health"]["score"], 98);
+        assert_eq!(parsed["health"]["score"], 94);
+        assert_eq!(
+            parsed["health"]["policy_coverage"]["dependency_constraint_count"],
+            0
+        );
+
+        let full_result = call_tool(&store, &ws, "rust_status", &json!({"detail": "full"}));
+        assert_eq!(full_result.is_error, None);
+        let ContentBlock::Text { text } = &full_result.content[0];
+        let full: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert!(full["implemented"]["bounded_contexts"].is_array());
+    }
+
+    #[test]
+    fn test_graph_dispatch_exposes_rust_facts() {
+        let store = test_store();
+        let ws = format!("/tmp/test-graph-{}", std::process::id());
+        let model = DomainModel {
+            name: "GraphProject".into(),
+            description: "Graph test".into(),
+            bounded_contexts: vec![BoundedContext {
+                name: "Core".into(),
+                description: "Core context".into(),
+                module_path: "src/core".into(),
+                ownership: Ownership::default(),
+                aggregates: vec![],
+                policies: vec![],
+                read_models: vec![],
+                entities: vec![],
+                value_objects: vec![],
+                services: vec![],
+                repositories: vec![],
+                events: vec![],
+                modules: vec![],
+                dependencies: vec![],
+                api_endpoints: vec![],
+            }],
+            external_systems: vec![],
+            architectural_decisions: vec![],
+            ownership: Ownership::default(),
+            rules: vec![],
+            tech_stack: TechStack::default(),
+            conventions: Conventions::default(),
+            ast_edges: vec![],
+            source_files: vec![SourceFile {
+                path: "src/core/lib.rs".into(),
+                context: "Core".into(),
+                language: "rust".into(),
+            }],
+            symbols: vec![SymbolDef {
+                name: "CoreService".into(),
+                kind: "struct".into(),
+                context: "Core".into(),
+                file_path: "src/core/lib.rs".into(),
+                start_line: 3,
+                end_line: 12,
+                visibility: "public".into(),
+            }],
+            import_edges: vec![ImportEdge {
+                from_file: "src/core/lib.rs".into(),
+                to_module: "crate::store::Store".into(),
+                context: "Core".into(),
+            }],
+            call_edges: vec![CallEdge {
+                caller: "CoreService::run".into(),
+                callee: "Store::load_actual".into(),
+                file_path: "src/core/lib.rs".into(),
+                line: 9,
+                context: "Core".into(),
+            }],
+        };
+        store.save_actual(&ws, &model).unwrap();
+
+        let result = call_tool(
+            &store,
+            &ws,
+            "graph",
+            &json!({
+                "view": "neighborhood",
+                "symbol": "CoreService",
+                "limit": 20
+            }),
+        );
+        assert_eq!(result.is_error, None);
+        let ContentBlock::Text { text } = &result.content[0];
+        let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["status"], "ok");
+        assert_eq!(parsed["view"], "neighborhood");
+        assert_eq!(parsed["format"], "schema_rows");
+        assert_eq!(parsed["schema"], "axon.rust_graph.neighborhood.v1");
+        assert_eq!(parsed["provenance"]["state"], "actual");
+        assert!(
+            parsed["tables"]["nodes"]["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| { row[0] == "symbol:CoreService" && row[1] == "struct" })
+        );
+        assert!(
+            parsed["proof"]["derived_from"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|relation| { relation.as_str() == Some("symbol") })
+        );
+    }
+
+    #[test]
+    fn test_graph_symbol_neighborhood_filters_before_limit() {
+        let store = test_store();
+        let ws = format!("/tmp/test-graph-symbol-{}", std::process::id());
+        let mut model = DomainModel::empty(&ws);
+        model.bounded_contexts = (0..30)
+            .map(|idx| BoundedContext {
+                name: format!("Context{idx:02}"),
+                description: "".into(),
+                module_path: format!("src/context_{idx:02}"),
+                ownership: Ownership::default(),
+                aggregates: vec![],
+                policies: vec![],
+                read_models: vec![],
+                entities: vec![],
+                value_objects: vec![],
+                services: vec![],
+                repositories: vec![],
+                events: vec![],
+                modules: vec![],
+                dependencies: vec![],
+                api_endpoints: vec![],
+            })
+            .collect();
+        model.call_edges = (0..600)
+            .map(|idx| CallEdge {
+                caller: format!("A{idx:03}::run"),
+                callee: "Irrelevant".into(),
+                file_path: format!("src/context_{:02}/lib.rs", idx % 30),
+                line: idx,
+                context: format!("Context{:02}", idx % 30),
+            })
+            .chain(std::iter::once(CallEdge {
+                caller: "ZCaller::run".into(),
+                callee: "TargetSymbol".into(),
+                file_path: "src/context_29/lib.rs".into(),
+                line: 700,
+                context: "Context29".into(),
+            }))
+            .collect();
+        store.save_actual(&ws, &model).unwrap();
+
+        let result = call_tool(
+            &store,
+            &ws,
+            "rust_graph",
+            &json!({
+                "view": "neighborhood",
+                "relation": "calls_symbol",
+                "symbol": "TargetSymbol",
+                "limit": 5
+            }),
+        );
+        assert_eq!(result.is_error, None);
+        let ContentBlock::Text { text } = &result.content[0];
+        let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["status"], "ok");
+        assert!(
+            parsed["tables"]["nodes"]["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| {
+                    row[0] == "symbol:TargetSymbol"
+                        && row[2] == "TargetSymbol"
+                        && row[12] == "calls_symbol"
+                })
+        );
+        assert!(
+            parsed["tables"]["edges"]["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| {
+                    row[1] == "calls_symbol" && row[2] == "ZCaller::run" && row[3] == "TargetSymbol"
+                })
+        );
     }
 
     #[test]
@@ -1080,6 +1904,88 @@ mod tests {
     }
 
     #[test]
+    fn test_impact_dispatch_refreshes_call_graph_after_rescan() {
+        let store = test_store();
+        let ws = format!("/tmp/test-impact-refresh-{}", std::process::id());
+        store.save_actual(&ws, &DomainModel::empty(&ws)).unwrap();
+
+        let initial = call_tool(
+            &store,
+            &ws,
+            "impact",
+            &json!({"analysis": "call_graph_callers", "symbol": "Store::query_call_paths"}),
+        );
+        assert_eq!(initial.is_error, None);
+        let ContentBlock::Text { text } = &initial.content[0];
+        let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["result"]["count"], 0);
+
+        let mut model = DomainModel::empty(&ws);
+        model.call_edges = vec![CallEdge {
+            caller: "ReasoningKernel::how_connected_claim".into(),
+            callee: "query_call_paths".into(),
+            file_path: "src/reasoning/mod.rs".into(),
+            line: 10,
+            context: "reasoning".into(),
+        }];
+        store.save_actual(&ws, &model).unwrap();
+
+        let refreshed = call_tool(
+            &store,
+            &ws,
+            "impact",
+            &json!({"analysis": "call_graph_callers", "symbol": "Store::query_call_paths"}),
+        );
+        assert_eq!(refreshed.is_error, None);
+        let ContentBlock::Text { text } = &refreshed.content[0];
+        let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["result"]["count"], 1);
+        assert_eq!(
+            parsed["result"]["callers"][0]["caller"],
+            "ReasoningKernel::how_connected_claim"
+        );
+    }
+
+    #[test]
+    fn test_impact_call_graph_stats_proof_cites_project_symbols() {
+        let store = test_store();
+        let ws = format!("/tmp/test-impact-stats-proof-{}", std::process::id());
+        let mut model = DomainModel::empty(&ws);
+        model.symbols = vec![SymbolDef {
+            name: "Store::load_actual".into(),
+            kind: "method".into(),
+            context: "store".into(),
+            file_path: "src/store/cozo.rs".into(),
+            start_line: 1,
+            end_line: 1,
+            visibility: "public".into(),
+        }];
+        model.call_edges = vec![CallEdge {
+            caller: "ReasoningKernel::architecture".into(),
+            callee: "load_actual".into(),
+            file_path: "src/reasoning/mod.rs".into(),
+            line: 10,
+            context: "reasoning".into(),
+        }];
+        store.save_actual(&ws, &model).unwrap();
+
+        let result = call_tool(
+            &store,
+            &ws,
+            "impact",
+            &json!({"analysis": "call_graph_stats"}),
+        );
+        assert_eq!(result.is_error, None);
+        let ContentBlock::Text { text } = &result.content[0];
+        let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+        let derived_from = parsed["proof"]["derived_from"].as_array().unwrap();
+        assert!(derived_from.iter().any(|item| item == "calls_symbol"));
+        assert!(derived_from.iter().any(|item| item == "symbol"));
+        assert_eq!(parsed["proof"]["witness_count"], 1);
+        assert_eq!(parsed["result"]["project_callee_edges"], 1);
+    }
+
+    #[test]
     fn test_history_dispatch() {
         let store = test_store();
         let ws = format!("/tmp/test-history-{}", std::process::id());
@@ -1105,7 +2011,7 @@ mod tests {
             )
             .unwrap();
 
-        let result = call_tool(&store, &ws, "history", &json!({"state": "planned"}));
+        let result = call_tool(&store, &ws, "rust_history", &json!({"state": "planned"}));
         assert_eq!(result.is_error, None);
         let ContentBlock::Text { text } = &result.content[0];
         let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
@@ -1166,13 +2072,110 @@ mod tests {
             )
             .unwrap();
 
-        let result = call_tool(&store, &ws, "search", &json!({"query": "identity"}));
+        let result = call_tool(&store, &ws, "rust_search", &json!({"query": "identity"}));
         assert_eq!(result.is_error, None);
         let ContentBlock::Text { text } = &result.content[0];
         let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
         assert_eq!(parsed["claim_kind"], "search");
         assert_eq!(parsed["query"], "identity");
         assert!(parsed["count"].as_u64().unwrap_or(0) >= 1);
+    }
+
+    #[test]
+    fn test_search_dispatch_includes_policy_sources() {
+        let store = test_store();
+        let ws = format!("/tmp/test-search-policy-{}", std::process::id());
+        store.save_actual(&ws, &DomainModel::empty(&ws)).unwrap();
+        store
+            .upsert_layer_assignment(&ws, "Domain", "domain")
+            .unwrap();
+        store
+            .upsert_dependency_constraint(&ws, "layer", "domain", "infrastructure", "forbidden")
+            .unwrap();
+
+        let result = call_tool(
+            &store,
+            &ws,
+            "rust_search",
+            &json!({"query": "policy dependency constraints"}),
+        );
+        assert_eq!(result.is_error, None);
+        let ContentBlock::Text { text } = &result.content[0];
+        let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["claim_kind"], "search");
+        assert!(parsed["count"].as_u64().unwrap_or(0) >= 1);
+        let derived_from = parsed["proof"]["derived_from"].as_array().unwrap();
+        assert!(derived_from.iter().any(|item| item == "layer_assignment"));
+        assert!(
+            derived_from
+                .iter()
+                .any(|item| item == "dependency_constraint")
+        );
+    }
+
+    #[test]
+    fn test_search_dispatch_finds_rust_symbols() {
+        let store = test_store();
+        let ws = format!("/tmp/test-search-rust-symbol-{}", std::process::id());
+        let mut model = DomainModel::empty(&ws);
+        model.symbols = vec![SymbolDef {
+            name: "Store::query_call_paths".into(),
+            kind: "method".into(),
+            context: "store".into(),
+            file_path: "src/store/cozo.rs".into(),
+            start_line: 10,
+            end_line: 20,
+            visibility: "public".into(),
+        }];
+        store.save_actual(&ws, &model).unwrap();
+
+        let result = call_tool(
+            &store,
+            &ws,
+            "rust_search",
+            &json!({"query": "query_call_paths"}),
+        );
+        assert_eq!(result.is_error, None);
+        let ContentBlock::Text { text } = &result.content[0];
+        let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["claim_kind"], "search");
+        assert_eq!(parsed["count"], 1);
+        assert_eq!(parsed["results"][0]["kind"], "symbol");
+        assert_eq!(parsed["results"][0]["search_mode"], "rust_fact_scan");
+        let derived_from = parsed["proof"]["derived_from"].as_array().unwrap();
+        assert!(derived_from.iter().any(|item| item == "symbol"));
+        assert_eq!(parsed["provenance"]["source"], "architecture_search");
+    }
+
+    #[test]
+    fn test_search_dispatch_limits_rust_fact_scan_results() {
+        let store = test_store();
+        let ws = format!("/tmp/test-search-limit-{}", std::process::id());
+        let mut model = DomainModel::empty(&ws);
+        model.call_edges = (0..8)
+            .map(|idx| CallEdge {
+                caller: "QueryOwner::run".into(),
+                callee: format!("Target{idx}"),
+                file_path: "src/query.rs".into(),
+                line: idx,
+                context: "query".into(),
+            })
+            .collect();
+        store.save_actual(&ws, &model).unwrap();
+
+        let result = call_tool(
+            &store,
+            &ws,
+            "rust_search",
+            &json!({"query": "QueryOwner", "limit": 3}),
+        );
+        assert_eq!(result.is_error, None);
+        let ContentBlock::Text { text } = &result.content[0];
+        let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["count"], 3);
+        assert_eq!(parsed["total_before_limit"], 8);
+        assert_eq!(parsed["truncated"], true);
+        assert_eq!(parsed["results"].as_array().unwrap().len(), 3);
     }
 
     #[test]
@@ -1250,6 +2253,109 @@ mod tests {
                 .contains("deletable")
         );
         assert!(!parsed["limitations"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_safe_to_delete_accepts_symbol_without_context() {
+        let store = test_store();
+        let ws = format!("/tmp/test-can-del-symbol-{}", std::process::id());
+        let model = DomainModel {
+            name: "P".into(),
+            description: "".into(),
+            bounded_contexts: vec![],
+            external_systems: vec![],
+            architectural_decisions: vec![],
+            ownership: Ownership::default(),
+            rules: vec![],
+            tech_stack: TechStack::default(),
+            conventions: Conventions::default(),
+            ast_edges: vec![],
+            source_files: vec![],
+            symbols: vec![],
+            import_edges: vec![],
+            call_edges: vec![CallEdge {
+                caller: "Caller::run".into(),
+                callee: "TargetSymbol".into(),
+                file_path: "src/caller.rs".into(),
+                line: 7,
+                context: "Core".into(),
+            }],
+        };
+        store.save_actual(&ws, &model).unwrap();
+
+        let result = call_tool(
+            &store,
+            &ws,
+            "safe_to_delete",
+            &json!({ "symbol": "TargetSymbol" }),
+        );
+        assert_eq!(result.is_error, None);
+        let ContentBlock::Text { text } = &result.content[0];
+        let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["can_delete"], false);
+        assert_eq!(parsed["entity"], "TargetSymbol");
+        assert_eq!(
+            parsed["result"]["call_references"][0]["caller"],
+            "Caller::run"
+        );
+    }
+
+    #[test]
+    fn test_safe_to_delete_counts_type_reference_witnesses() {
+        let store = test_store();
+        let ws = format!("/tmp/test-can-del-types-{}", std::process::id());
+        let mut model = DomainModel::empty(&ws);
+        model.bounded_contexts = vec![BoundedContext {
+            name: "Store".into(),
+            description: "".into(),
+            module_path: "src/store".into(),
+            ownership: Ownership::default(),
+            aggregates: vec![],
+            policies: vec![],
+            read_models: vec![],
+            entities: vec![Entity {
+                name: "ModelHealth".into(),
+                description: "".into(),
+                aggregate_root: false,
+                fields: vec![Field {
+                    name: "policy_coverage".into(),
+                    field_type: "PolicyCoverage".into(),
+                    required: true,
+                    description: "".into(),
+                }],
+                methods: vec![],
+                invariants: vec![],
+                file_path: None,
+                start_line: None,
+                end_line: None,
+            }],
+            value_objects: vec![],
+            services: vec![],
+            repositories: vec![],
+            events: vec![],
+            modules: vec![],
+            dependencies: vec![],
+            api_endpoints: vec![],
+        }];
+        store.save_actual(&ws, &model).unwrap();
+
+        let result = call_tool(
+            &store,
+            &ws,
+            "rust_delete_safety",
+            &json!({ "symbol": "PolicyCoverage" }),
+        );
+        assert_eq!(result.is_error, None);
+        let ContentBlock::Text { text } = &result.content[0];
+        let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["can_delete"], false);
+        assert_eq!(parsed["proof"]["witness_count"], 1);
+        assert_eq!(
+            parsed["result"]["type_references"]["fields"][0]["owner"],
+            "ModelHealth"
+        );
+        let derived_from = parsed["proof"]["derived_from"].as_array().unwrap();
+        assert!(derived_from.iter().any(|item| item == "field"));
     }
 
     #[test]
@@ -1370,6 +2476,64 @@ mod tests {
     }
 
     #[test]
+    fn test_how_connected_dispatch_uses_call_graph_relation() {
+        let store = test_store();
+        let ws = format!("/tmp/test-callpath-{}", std::process::id());
+        let mut model = DomainModel::empty(&ws);
+        model.call_edges = vec![CallEdge {
+            caller: "Store::upsert_layer_assignment".into(),
+            callee: "persist_policy".into(),
+            file_path: "src/store/cozo.rs".into(),
+            line: 4102,
+            context: "store".into(),
+        }];
+        store.save_actual(&ws, &model).unwrap();
+
+        let result = call_tool(
+            &store,
+            &ws,
+            "rust_path",
+            &json!({
+                "relation": "calls_symbol",
+                "from": "Store::upsert_layer_assignment",
+                "to": "persist_policy"
+            }),
+        );
+        assert_eq!(result.is_error, None);
+        let ContentBlock::Text { text } = &result.content[0];
+        let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["reachable"], true);
+        assert_eq!(parsed["relation"], "calls_symbol");
+        assert_eq!(
+            parsed["paths"][0],
+            json!(["Store::upsert_layer_assignment", "persist_policy"])
+        );
+        assert_eq!(parsed["provenance"]["source"], "call_graph_reachability");
+        assert_eq!(parsed["proof"]["derived_from"][0], "calls_symbol");
+        assert_eq!(parsed["proof"]["witness_count"], 1);
+
+        let graph_result = call_tool(
+            &store,
+            &ws,
+            "rust_graph",
+            &json!({
+                "view": "paths",
+                "relation": "calls_symbol",
+                "from": "Store::upsert_layer_assignment",
+                "to": "persist_policy"
+            }),
+        );
+        assert_eq!(graph_result.is_error, None);
+        let ContentBlock::Text { text } = &graph_result.content[0];
+        let graph: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(graph["reachable"], true);
+        assert_eq!(
+            graph["rows"][0][0],
+            json!(["Store::upsert_layer_assignment", "persist_policy"])
+        );
+    }
+
+    #[test]
     fn test_why_dispatch_includes_reasoning_context() {
         let store = test_store();
         let ws = format!("/tmp/test-why-{}", std::process::id());
@@ -1387,7 +2551,7 @@ mod tests {
         let ContentBlock::Text { text } = &result.content[0];
         let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
         assert_eq!(parsed["status"], "true");
-        assert_eq!(parsed["provenance"]["state"], "desired");
+        assert_eq!(parsed["provenance"]["state"], "actual");
         assert_eq!(parsed["proof"]["witness_count"], 0);
         assert!(parsed["evidence"].as_array().unwrap().is_empty());
         assert!(!parsed["limitations"].as_array().unwrap().is_empty());
