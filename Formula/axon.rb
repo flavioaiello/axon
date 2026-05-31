@@ -2,9 +2,9 @@ class Axon < Formula
   desc "Domain Model Context Protocol Server — architectural meta-layer for GitHub Copilot"
   homepage "https://github.com/flavioaiello/axon"
   license "MIT"
-  url "https://github.com/flavioaiello/axon/archive/refs/tags/v0.4.0.tar.gz"
-  sha256 "a4970f17217d993e4c7fcc19e957f39bf3d0d6202a4c555affeabcc375b7b243"
-  version "0.4.0"
+  url "https://github.com/flavioaiello/axon/archive/refs/tags/v0.4.1.tar.gz"
+  sha256 "5ee1c25c7fdafb323e6949ece2e99b2409881eaf830386b96cf4e3b165da9eb9"
+  version "0.4.1"
 
   head "https://github.com/flavioaiello/axon.git", branch: "main"
 
