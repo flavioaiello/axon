@@ -7299,20 +7299,33 @@ fn text_matches(haystack: &str, needle_lowercase: &str) -> bool {
         return true;
     }
     // For path- or namespace-qualified needles (containing '/', '::', or '.'),
-    // require a full-substring match. Token-splitting would let a shared segment
-    // like "src" or "domain" match unrelated files (e.g. filtering for
-    // `src/domain/model.rs` would also match `src/domain/analyze.rs`). Keep the
-    // loose token fallback only for single-token needles (fuzzy symbol search).
+    // match only on a path-boundary suffix in either direction: an absolute-path
+    // filter (`/repo/src/dht.rs`) matches a stored relative path (`src/dht.rs`)
+    // and vice-versa, while a shared mid-segment like "src" or "domain" still
+    // does NOT match (so `src/domain/model.rs` won't match `src/domain/analyze.rs`).
+    // The loose token fallback below stays for single-token needles (symbol search).
     if needle_lowercase.contains('/')
         || needle_lowercase.contains("::")
         || needle_lowercase.contains('.')
     {
-        return false;
+        return path_boundary_suffix(&haystack, needle_lowercase)
+            || path_boundary_suffix(needle_lowercase, &haystack);
     }
     needle_lowercase
         .split(|c: char| !c.is_alphanumeric() && c != '_')
         .filter(|token| token.len() > 2)
         .any(|token| haystack.contains(token))
+}
+
+/// True if `short` equals `long`, or `short` is a suffix of `long` at a
+/// path/namespace boundary (the character before the suffix is `/` or `:`).
+/// Lets absolute and relative paths match without matching a shared mid-segment.
+fn path_boundary_suffix(long: &str, short: &str) -> bool {
+    match long.strip_suffix(short) {
+        Some("") => true,
+        Some(prefix) => prefix.ends_with('/') || prefix.ends_with(':'),
+        None => false,
+    }
 }
 
 /// Context dependency graph as (node names, directed edges) — the shared shape
@@ -7969,6 +7982,29 @@ mod tests {
         // Single-token needles keep the loose fuzzy fallback (symbol search).
         assert!(text_matches("DomainModel", "domain"));
         assert!(text_matches("CozoStore::save_actual", "save_actual"));
+        // An absolute-path filter matches a stored relative path at a path
+        // boundary (and vice-versa), without matching an unrelated sibling.
+        // Needles arrive already lowercased from the caller.
+        assert!(text_matches(
+            "src/dht.rs",
+            "/users/flavioaiello/git/magik.run/korium/src/dht.rs"
+        ));
+        assert!(text_matches(
+            "src/domain/model.rs",
+            "/users/me/proj/src/domain/model.rs"
+        ));
+        assert!(text_matches(
+            "/users/me/proj/src/domain/model.rs",
+            "src/domain/model.rs"
+        ));
+        assert!(!text_matches(
+            "src/domain/analyze.rs",
+            "/users/me/proj/src/domain/model.rs"
+        ));
+        assert!(!text_matches(
+            "src/fabric.rs",
+            "/users/flavioaiello/git/magik.run/korium/src/dht.rs"
+        ));
     }
 
     #[test]
