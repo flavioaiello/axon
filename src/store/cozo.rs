@@ -239,10 +239,10 @@ impl Store {
             ":create live_import { workspace: String, from_file: String, to_module: String }",
             // AST structural edges (extends, implements, decorators)
             ":create ast_edge { workspace: String, from_node: String, to_node: String, edge_type: String, vld: Validity default 'ASSERT' => file_path: String default '', line: Int default 0 }",
-            // Resolved trait impls from rustdoc JSON (post-macro-expansion, name-resolved).
-            // Includes derive-generated impls and fully-qualified trait/type paths
-            // that the syn scanner structurally cannot see. Populated by `rust_resolve`.
-            ":create resolved_impl { workspace: String, type_path: String, trait_path: String, vld: Validity default 'ASSERT' => type_name: String default '', trait_name: String default '' }",
+            // Resolved call edges from rust-analyzer (name resolution + type
+            // inference): which concrete definition a call site actually targets —
+            // something the syn scanner cannot determine. Populated by `rust_resolve`.
+            ":create resolved_call { workspace: String, caller: String, callee: String, callee_file: String, vld: Validity default 'ASSERT' => callee_line: Int default 0 }",
             // ── Source-level relations ──
             ":create source_file { workspace: String, path: String, vld: Validity default 'ASSERT' => context: String default '', language: String default '' }",
             ":create symbol { workspace: String, name: String, vld: Validity default 'ASSERT' => kind: String default '', context: String default '', file_path: String default '', start_line: Int default 0, end_line: Int default 0, visibility: String default 'public' }",
@@ -403,46 +403,46 @@ impl Store {
         self.record_snapshot(&ws, "actual")
     }
 
-    /// Persist resolved trait impls ingested from rustdoc JSON, replacing any
-    /// previous generation (retract-then-assert) so removed impls don't linger.
-    pub fn save_resolved_impls(
+    /// Persist resolved call edges from rust-analyzer, replacing any previous
+    /// generation (retract-then-assert) so stale edges don't linger.
+    pub fn save_resolved_calls(
         &self,
         workspace_path: &str,
-        impls: &[crate::domain::rustdoc::ResolvedImpl],
+        calls: &[crate::domain::rust_analyzer::ResolvedCall],
     ) -> Result<usize> {
         let ws = canonicalize_path(workspace_path);
         let sv = |x: &str| cozo::DataValue::Str(x.into());
 
         // Retract the prior set. An empty relation derives no rows → harmless no-op.
         self.run_script(
-            "?[workspace, type_path, trait_path, vld] := \
-               *resolved_impl{workspace, type_path, trait_path @ 'NOW'}, \
+            "?[workspace, caller, callee, callee_file, vld] := \
+               *resolved_call{workspace, caller, callee, callee_file @ 'NOW'}, \
                workspace = $ws, vld = 'RETRACT' \
-             :put resolved_impl { workspace, type_path, trait_path, vld }",
+             :put resolved_call { workspace, caller, callee, callee_file, vld }",
             params_map(&[("ws", &ws)]),
             ScriptMutability::Mutable,
         )
-        .map_err(|e| anyhow::anyhow!("retract resolved_impl: {e:?}"))?;
+        .map_err(|e| anyhow::anyhow!("retract resolved_call: {e:?}"))?;
 
-        let rows: Vec<cozo::DataValue> = impls
+        let rows: Vec<cozo::DataValue> = calls
             .iter()
-            .map(|i| {
+            .map(|c| {
                 cozo::DataValue::List(vec![
                     sv(&ws),
-                    sv(&i.type_path),
-                    sv(&i.trait_path),
-                    sv(&i.type_name),
-                    sv(&i.trait_name),
+                    sv(&c.caller),
+                    sv(&c.callee),
+                    sv(&c.callee_file),
+                    cozo::DataValue::from(c.callee_line as i64),
                 ])
             })
             .collect();
         self.batch_put(
             rows,
-            "?[workspace, type_path, trait_path, type_name, trait_name] <- $rows \
-             :put resolved_impl { workspace, type_path, trait_path, type_name, trait_name }",
-            "save resolved_impls",
+            "?[workspace, caller, callee, callee_file, callee_line] <- $rows \
+             :put resolved_call { workspace, caller, callee, callee_file, callee_line }",
+            "save resolved_calls",
         )?;
-        Ok(impls.len())
+        Ok(calls.len())
     }
 
     fn run_mutation_script(
@@ -4964,50 +4964,43 @@ impl Store {
                         }));
                     }
                 }
-                if relation == "all" || relation == "resolved_impl" {
-                    relations_used.insert("resolved_impl".to_string());
+                if relation == "all" || relation == "resolved_call" {
+                    relations_used.insert("resolved_call".to_string());
                     let rows = self
                         .run_script(
-                            "?[type_path, trait_path, type_name, trait_name] := *resolved_impl{workspace: $ws, state: 'actual', type_path, trait_path, type_name, trait_name @ 'NOW'} :limit 500",
+                            "?[caller, callee, callee_file, callee_line] := *resolved_call{workspace: $ws, state: 'actual', caller, callee, callee_file, callee_line @ 'NOW'} :limit 500",
                             params_map(&[("ws", &ws)]),
                             ScriptMutability::Immutable,
                         )
-                        .map_err(|e| anyhow::anyhow!("graph resolved_impl edges: {:?}", e))?;
+                        .map_err(|e| anyhow::anyhow!("graph resolved_call edges: {:?}", e))?;
                     for row in &rows.rows {
-                        let type_path = dv_str(&row[0]);
-                        let trait_path = dv_str(&row[1]);
-                        let type_name = dv_str(&row[2]);
-                        let trait_name = dv_str(&row[3]);
-                        // `symbol`/`from` match the implementing type (by short name
-                        // or full path); `to` matches the trait. So `to="Serialize"`
-                        // lists every type deriving/implementing Serialize.
+                        let caller = dv_str(&row[0]);
+                        let callee = dv_str(&row[1]);
+                        let callee_file = dv_str(&row[2]);
+                        // `symbol`/`from` match the caller; `to` matches the resolved
+                        // callee. So `from="Store::save"` lists what it actually calls.
                         if !filter_symbol.is_empty()
-                            && !text_matches(&type_name, &filter_symbol)
-                            && !text_matches(&type_path, &filter_symbol)
-                            && !text_matches(&trait_name, &filter_symbol)
+                            && !text_matches(&caller, &filter_symbol)
+                            && !text_matches(&callee, &filter_symbol)
                         {
                             continue;
                         }
-                        if !filter_from.is_empty()
-                            && !text_matches(&type_name, &filter_from)
-                            && !text_matches(&type_path, &filter_from)
-                        {
+                        if !filter_from.is_empty() && !text_matches(&caller, &filter_from) {
                             continue;
                         }
-                        if !filter_to.is_empty()
-                            && !text_matches(&trait_name, &filter_to)
-                            && !text_matches(&trait_path, &filter_to)
-                        {
+                        if !filter_to.is_empty() && !text_matches(&callee, &filter_to) {
                             continue;
                         }
                         edges.push(json!({
-                            "id": format!("resolved_impl:{type_path}->{trait_path}"),
-                            "relation": "resolved_impl",
-                            "from": type_path,
-                            "to": trait_path,
-                            "from_kind": "type",
-                            "to_kind": "trait",
-                            "edge_type": "implements",
+                            "id": format!("resolved_call:{caller}->{callee}"),
+                            "relation": "resolved_call",
+                            "from": caller,
+                            "to": callee,
+                            "from_kind": "symbol",
+                            "to_kind": "symbol",
+                            "edge_type": "calls",
+                            "file": callee_file,
+                            "line": dv_i64(&row[3]),
                         }));
                     }
                 }
@@ -7523,69 +7516,63 @@ mod tests {
     }
 
     #[test]
-    fn resolved_impls_are_queryable_via_graph() {
-        use crate::domain::rustdoc::ResolvedImpl;
+    fn resolved_calls_are_queryable_via_graph() {
+        use crate::domain::rust_analyzer::ResolvedCall;
         let store = temp_store();
         let ws = "/tmp/resolved_ws";
-        let impls = vec![
-            ResolvedImpl {
-                type_path: "axon::domain::model::DomainModel".into(),
-                type_name: "DomainModel".into(),
-                trait_path: "serde_core::ser::Serialize".into(),
-                trait_name: "Serialize".into(),
+        let calls = vec![
+            ResolvedCall {
+                caller: "CozoStore::save_actual".into(),
+                callee: "CozoStore::save_state".into(),
+                callee_file: "src/store/cozo.rs".into(),
+                callee_line: 410,
             },
-            ResolvedImpl {
-                type_path: "axon::domain::model::ASTEdge".into(),
-                type_name: "ASTEdge".into(),
-                trait_path: "serde_core::ser::Serialize".into(),
-                trait_name: "Serialize".into(),
+            ResolvedCall {
+                caller: "CozoStore::save_actual".into(),
+                callee: "canonicalize_path".into(),
+                callee_file: "src/store/cozo.rs".into(),
+                callee_line: 7000,
             },
-            ResolvedImpl {
-                type_path: "axon::domain::model::DomainModel".into(),
-                type_name: "DomainModel".into(),
-                trait_path: "core::fmt::Debug".into(),
-                trait_name: "Debug".into(),
+            ResolvedCall {
+                caller: "main".into(),
+                callee: "CozoStore::save_state".into(),
+                callee_file: "src/store/cozo.rs".into(),
+                callee_line: 410,
             },
         ];
-        assert_eq!(store.save_resolved_impls(ws, &impls).unwrap(), 3);
+        assert_eq!(store.save_resolved_calls(ws, &calls).unwrap(), 3);
 
-        // `to="Serialize"` → every type implementing Serialize (both).
+        // `from="CozoStore::save_actual"` → what it actually calls (two edges).
         let q = store
             .query_rust_graph(
                 ws,
-                &json!({ "view": "edges", "relation": "resolved_impl", "to": "Serialize" }),
+                &json!({ "view": "edges", "relation": "resolved_call", "from": "CozoStore::save_actual" }),
             )
             .unwrap();
         let edges = q["edges"].as_array().unwrap();
-        assert_eq!(edges.len(), 2, "two types impl Serialize: {edges:?}");
-        assert!(edges.iter().all(|e| e["to"] == "serde_core::ser::Serialize"));
-        assert!(
-            edges
-                .iter()
-                .any(|e| e["from"] == "axon::domain::model::DomainModel")
-        );
+        assert_eq!(edges.len(), 2, "save_actual makes two resolved calls: {edges:?}");
+        assert!(edges.iter().all(|e| e["from"] == "CozoStore::save_actual"));
+        assert!(edges.iter().any(|e| e["to"] == "CozoStore::save_state"));
+        assert!(edges.iter().any(|e| e["file"] == "src/store/cozo.rs"));
 
-        // `from="DomainModel"` → that type's resolved traits (Serialize + Debug).
+        // `to="save_state"` → every caller resolving to save_state (two callers).
         let q2 = store
             .query_rust_graph(
                 ws,
-                &json!({ "view": "edges", "relation": "resolved_impl", "from": "DomainModel" }),
+                &json!({ "view": "edges", "relation": "resolved_call", "to": "save_state" }),
             )
             .unwrap();
         assert_eq!(q2["edges"].as_array().unwrap().len(), 2);
 
         // Re-saving replaces (retract-then-assert): a smaller set shrinks the relation.
-        assert_eq!(store.save_resolved_impls(ws, &impls[..1]).unwrap(), 1);
+        assert_eq!(store.save_resolved_calls(ws, &calls[..1]).unwrap(), 1);
         let q3 = store
-            .query_rust_graph(
-                ws,
-                &json!({ "view": "edges", "relation": "resolved_impl" }),
-            )
+            .query_rust_graph(ws, &json!({ "view": "edges", "relation": "resolved_call" }))
             .unwrap();
         assert_eq!(
             q3["edges"].as_array().unwrap().len(),
             1,
-            "stale impls must be retracted on re-save"
+            "stale edges must be retracted on re-save"
         );
     }
 

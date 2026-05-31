@@ -47,7 +47,7 @@ fn rust_native_read_tools() -> Vec<ToolDefinition> {
                     },
                     "relation": {
                         "type": "string",
-                        "enum": ["all", "context_dep", "import_edge", "calls_symbol", "ast_edge", "resolved_impl"],
+                        "enum": ["all", "context_dep", "import_edge", "calls_symbol", "ast_edge", "resolved_call"],
                         "description": "Rust relation filter for edges/paths views"
                     },
                     "module": { "type": "string", "description": "Rust module path/name filter" },
@@ -63,7 +63,7 @@ fn rust_native_read_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "rust_resolve".into(),
-            description: "Ingest a compiler-resolved semantic layer from rustdoc JSON to complement the syn scanner. Generates rustdoc JSON (nightly `cargo doc --output-format json`, post macro-expansion + name resolution) and persists resolved trait impls into the `resolved_impl` relation — including derive- and macro-generated impls the syn scanner cannot see (e.g. `impl serde::Serialize for X` from `#[derive(Serialize)]`), with fully-qualified trait and type paths. Opt-in and slow: requires a nightly toolchain and a full compile (tens of seconds). After it runs, query via `rust_graph(view=edges, relation=resolved_impl, to=\"Serialize\")` (types implementing a trait) or `from=\"DomainModel\"` (a type's resolved traits).".into(),
+            description: "Ingest a compiler-resolved call graph from rust-analyzer to complement the syn scanner. Drives a rust-analyzer LSP session (name resolution + type inference) to resolve each call site to the concrete function it actually targets — which the syn scanner cannot determine — and persists them into the `resolved_call` relation with the callee's definition location. Opt-in and slow: spawns rust-analyzer and waits for it to index the workspace (tens of seconds); needs the `rust-analyzer` component (`rustup component add rust-analyzer`, runs on stable). After it runs, query via `rust_graph(view=edges, relation=resolved_call, from=\"Store::save\")` (what a function actually calls) or `to=\"save_state\"` (who resolves to a callee).".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {},
@@ -246,7 +246,7 @@ fn legacy_read_tools() -> Vec<ToolDefinition> {
                     },
                     "relation": {
                         "type": "string",
-                        "enum": ["all", "context_dep", "import_edge", "calls_symbol", "ast_edge", "resolved_impl"],
+                        "enum": ["all", "context_dep", "import_edge", "calls_symbol", "ast_edge", "resolved_call"],
                         "description": "Edge relation filter for edges/paths views"
                     },
                     "context": { "type": "string", "description": "Context/module filter" },
@@ -562,29 +562,27 @@ pub fn call_tool(store: &Store, workspace_path: &str, name: &str, args: &Value) 
 
         "rust_resolve" => {
             let crate_dir = std::path::Path::new(workspace_path);
-            match crate::domain::rustdoc::generate_rustdoc_json(crate_dir)
-                .and_then(|json| crate::domain::rustdoc::parse_resolved_impls(&json))
-            {
-                Ok(impls) => match store.save_resolved_impls(workspace_path, &impls) {
+            match crate::domain::rust_analyzer::resolve_calls(crate_dir) {
+                Ok(calls) => match store.save_resolved_calls(workspace_path, &calls) {
                     Ok(count) => {
-                        let sample: Vec<String> = impls
+                        let sample: Vec<String> = calls
                             .iter()
                             .take(10)
-                            .map(|i| format!("{} → {}", i.type_name, i.trait_path))
+                            .map(|c| format!("{} → {} [{}:{}]", c.caller, c.callee, c.callee_file, c.callee_line))
                             .collect();
                         json_result(json!({
                             "status": "ok",
-                            "resolved_impls": count,
+                            "resolved_calls": count,
                             "sample": sample,
-                            "note": "Query with rust_graph(view=edges, relation=resolved_impl). \
-                                     Includes derive/macro-generated impls invisible to the syn scanner.",
+                            "note": "Query with rust_graph(view=edges, relation=resolved_call). \
+                                     Each edge resolves a call site to the concrete function it targets.",
                         }))
                     }
                     Err(e) => error_result(format!("rust_resolve: failed to persist: {e}")),
                 },
                 Err(e) => error_result(format!(
-                    "rust_resolve: rustdoc JSON generation/parse failed \
-                     (requires a nightly toolchain — `rustup toolchain install nightly`): {e}"
+                    "rust_resolve: rust-analyzer call resolution failed \
+                     (needs the rust-analyzer component — `rustup component add rust-analyzer`): {e}"
                 )),
             }
         }
