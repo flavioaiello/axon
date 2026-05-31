@@ -242,6 +242,7 @@ pub fn call_tool(store: &Store, workspace_path: &str, name: &str, args: &Value) 
                     vec![
                         "Graph queries return persisted actual-state facts only; run rust_scan before relying on freshly edited files.".into(),
                         "Output is bounded and may be truncated; increase limit up to 200 or narrow filters for exhaustive local evidence.".into(),
+                        "Fact resolution: `import_edge` (use-paths) and `calls_symbol` (caller/callee names) are syntactic/name-based from the syn scanner and may be ambiguous across same-named symbols; `resolved_call` is compiler-resolved (run rust_resolve to populate it).".into(),
                     ],
                     Some(json!({"source": "rust_graph_query", "state": "actual"})),
                 );
@@ -329,7 +330,7 @@ pub fn call_tool(store: &Store, workspace_path: &str, name: &str, args: &Value) 
                         })),
                         vec![
                             "Model health uses the latest persisted implemented architecture facts.".into(),
-                            "Graph analytics are empty when the active Cozo runtime does not provide the required fixed rules.".into(),
+                            "Graph analytics (PageRank, betweenness, community, module cycles) are computed in-process over the context/module graph and do not depend on Cozo fixed rules.".into(),
                         ],
                         Some(json!({"source": "model_health", "state": "actual"})),
                     ))

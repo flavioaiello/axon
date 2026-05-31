@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use cozo::{DbInstance, ScriptMutability};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -4164,6 +4164,123 @@ impl Store {
             .collect())
     }
 
+    /// Detect module-level import cycles from the syntactic `import_edge` facts.
+    ///
+    /// The context-level `circular_deps` only sees cycles between bounded
+    /// contexts; a cycle between two modules *inside* one context (e.g.
+    /// `dht` ⇄ `fabric`) is invisible there. This resolves each import's
+    /// `to_module` use-path to an internal module and returns strongly-connected
+    /// components (size > 1) of the resulting module graph. Heuristics: only
+    /// `crate::`/`super::`/`self::`-qualified paths count as internal, and
+    /// parent/child module pairs are excluded (structural, not dependency
+    /// cycles). It runs over actual (implemented) imports, not the desired model.
+    pub fn module_cycles(&self, workspace: &str) -> Result<Vec<Vec<String>>> {
+        let params = params_map(&[("ws", workspace)]);
+        let files = self
+            .run_script(
+                "?[path] := *source_file{workspace: $ws, path @ 'NOW'}",
+                params.clone(),
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| anyhow::anyhow!("module_cycles files: {:?}", e))?;
+        let imports = self
+            .run_script(
+                "?[from_file, to_module] := *import_edge{workspace: $ws, from_file, to_module @ 'NOW'}",
+                params,
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| anyhow::anyhow!("module_cycles imports: {:?}", e))?;
+
+        // Map every internal source file to its module path and collect the set
+        // of known internal modules (used for longest-prefix resolution).
+        let mut file_to_mod: HashMap<String, String> = HashMap::new();
+        for row in &files.rows {
+            let path = dv_str(&row[0]);
+            let m = file_module_path(&path);
+            file_to_mod.insert(path, m);
+        }
+        for row in &imports.rows {
+            let path = dv_str(&row[0]);
+            file_to_mod
+                .entry(path.clone())
+                .or_insert_with(|| file_module_path(&path));
+        }
+        let known: BTreeSet<String> = file_to_mod.values().cloned().collect();
+
+        // Build the directed module graph from cross-branch internal imports.
+        let mut node_set: BTreeSet<String> = BTreeSet::new();
+        let mut raw_edges: BTreeSet<(String, String)> = BTreeSet::new();
+        for row in &imports.rows {
+            let from_file = dv_str(&row[0]);
+            let to_module = dv_str(&row[1]);
+            let Some(from_mod) = file_to_mod.get(&from_file) else {
+                continue;
+            };
+            let Some(to_mod) = resolve_internal_module(&to_module, from_mod, &known) else {
+                continue;
+            };
+            if &to_mod == from_mod || is_ancestor(from_mod, &to_mod) || is_ancestor(&to_mod, from_mod)
+            {
+                continue;
+            }
+            node_set.insert(from_mod.clone());
+            node_set.insert(to_mod.clone());
+            raw_edges.insert((from_mod.clone(), to_mod));
+        }
+
+        let nodes: Vec<String> = node_set.into_iter().collect();
+        let n = nodes.len();
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        let idx: HashMap<&str, usize> =
+            nodes.iter().enumerate().map(|(i, s)| (s.as_str(), i)).collect();
+        let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for (from, to) in &raw_edges {
+            if let (Some(&fi), Some(&ti)) = (idx.get(from.as_str()), idx.get(to.as_str())) {
+                adj[fi].push(ti);
+            }
+        }
+        // Reachability per node (BFS), then group strongly-connected components.
+        let mut reach: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); n];
+        for s in 0..n {
+            let mut seen: BTreeSet<usize> = BTreeSet::new();
+            let mut queue: VecDeque<usize> = adj[s].iter().copied().collect();
+            while let Some(v) = queue.pop_front() {
+                if seen.insert(v) {
+                    for &w in &adj[v] {
+                        if !seen.contains(&w) {
+                            queue.push_back(w);
+                        }
+                    }
+                }
+            }
+            reach[s] = seen;
+        }
+        let mut visited = vec![false; n];
+        let mut cycles: Vec<Vec<String>> = Vec::new();
+        for u in 0..n {
+            if visited[u] {
+                continue;
+            }
+            visited[u] = true;
+            let mut group = vec![u];
+            for v in (u + 1)..n {
+                if !visited[v] && reach[u].contains(&v) && reach[v].contains(&u) {
+                    visited[v] = true;
+                    group.push(v);
+                }
+            }
+            if group.len() > 1 {
+                let mut names: Vec<String> = group.iter().map(|&i| nodes[i].clone()).collect();
+                names.sort();
+                cycles.push(names);
+            }
+        }
+        cycles.sort();
+        Ok(cycles)
+    }
+
     pub fn layer_violations(&self, workspace: &str) -> Result<Vec<(String, String, String)>> {
         let params = params_map(&[("ws", workspace)]);
         let result = self
@@ -4801,9 +4918,19 @@ impl Store {
                 let mut edges = Vec::new();
                 if relation == "all" || relation == "context_dep" {
                     relations_used.insert("context_dep".to_string());
+                    // Drop the in-DB row cap when a filter is active so the Rust-side
+                    // filter sees every row (the final result is capped by `truncate`).
+                    let context_dep_query = if filter_context.is_empty()
+                        && filter_from.is_empty()
+                        && filter_to.is_empty()
+                    {
+                        "?[from_ctx, to_ctx] := *context_dep{workspace: $ws, from_ctx, to_ctx, state: 'actual' @ 'NOW'} :limit 500"
+                    } else {
+                        "?[from_ctx, to_ctx] := *context_dep{workspace: $ws, from_ctx, to_ctx, state: 'actual' @ 'NOW'}"
+                    };
                     let rows = self
                         .run_script(
-                            "?[from_ctx, to_ctx] := *context_dep{workspace: $ws, from_ctx, to_ctx, state: 'actual' @ 'NOW'} :limit 500",
+                            context_dep_query,
                             params_map(&[("ws", &ws)]),
                             ScriptMutability::Immutable,
                         )
@@ -4835,9 +4962,19 @@ impl Store {
                 }
                 if relation == "all" || relation == "import_edge" {
                     relations_used.insert("import_edge".to_string());
+                    let import_edge_query = if filter_context.is_empty()
+                        && filter_file.is_empty()
+                        && filter_symbol.is_empty()
+                        && filter_from.is_empty()
+                        && filter_to.is_empty()
+                    {
+                        "?[from_file, to_module, context] := *import_edge{workspace: $ws, from_file, to_module, state: 'actual', context @ 'NOW'} :limit 500"
+                    } else {
+                        "?[from_file, to_module, context] := *import_edge{workspace: $ws, from_file, to_module, state: 'actual', context @ 'NOW'}"
+                    };
                     let rows = self
                         .run_script(
-                            "?[from_file, to_module, context] := *import_edge{workspace: $ws, from_file, to_module, state: 'actual', context @ 'NOW'} :limit 500",
+                            import_edge_query,
                             params_map(&[("ws", &ws)]),
                             ScriptMutability::Immutable,
                         )
@@ -4929,9 +5066,17 @@ impl Store {
                 }
                 if relation == "all" || relation == "ast_edge" {
                     relations_used.insert("ast_edge".to_string());
+                    let ast_edge_query = if filter_symbol.is_empty()
+                        && filter_from.is_empty()
+                        && filter_to.is_empty()
+                    {
+                        "?[from_node, to_node, edge_type, file_path, line] := *ast_edge{workspace: $ws, state: 'actual', from_node, to_node, edge_type, file_path, line @ 'NOW'} :limit 500"
+                    } else {
+                        "?[from_node, to_node, edge_type, file_path, line] := *ast_edge{workspace: $ws, state: 'actual', from_node, to_node, edge_type, file_path, line @ 'NOW'}"
+                    };
                     let rows = self
                         .run_script(
-                            "?[from_node, to_node, edge_type, file_path, line] := *ast_edge{workspace: $ws, state: 'actual', from_node, to_node, edge_type, file_path, line @ 'NOW'} :limit 500",
+                            ast_edge_query,
                             params_map(&[("ws", &ws)]),
                             ScriptMutability::Immutable,
                         )
@@ -4966,9 +5111,17 @@ impl Store {
                 }
                 if relation == "all" || relation == "resolved_call" {
                     relations_used.insert("resolved_call".to_string());
+                    let resolved_call_query = if filter_symbol.is_empty()
+                        && filter_from.is_empty()
+                        && filter_to.is_empty()
+                    {
+                        "?[caller, callee, callee_file, callee_line] := *resolved_call{workspace: $ws, state: 'actual', caller, callee, callee_file, callee_line @ 'NOW'} :limit 500"
+                    } else {
+                        "?[caller, callee, callee_file, callee_line] := *resolved_call{workspace: $ws, state: 'actual', caller, callee, callee_file, callee_line @ 'NOW'}"
+                    };
                     let rows = self
                         .run_script(
-                            "?[caller, callee, callee_file, callee_line] := *resolved_call{workspace: $ws, state: 'actual', caller, callee, callee_file, callee_line @ 'NOW'} :limit 500",
+                            resolved_call_query,
                             params_map(&[("ws", &ws)]),
                             ScriptMutability::Immutable,
                         )
@@ -6231,73 +6384,199 @@ impl Store {
     // ── Graph Algorithms (CozoDB Fixed Rules) ─────────────────────────────
 
     /// Compute PageRank over the context dependency graph.
-    pub fn pagerank(&self, workspace: &str) -> Result<Vec<(String, f64)>> {
+    /// Fetch the context dependency graph as (nodes, directed edges). Nodes
+    /// include every named context plus any endpoint that appears only in an
+    /// edge, sorted for deterministic output.
+    fn context_graph(&self, workspace: &str) -> Result<ContextGraph> {
         let params = params_map(&[("ws", workspace)]);
-        let result = self.run_script(
-            "edges[from, to] := *context_dep{workspace: $ws, from_ctx: from, to_ctx: to @ 'NOW'} \
-             ?[node, rank] <~ PageRank(edges[])",
-            params,
-            ScriptMutability::Immutable,
-        ).map_err(|e| anyhow::anyhow!("pagerank: {:?}", e))?;
-        let mut ranked: Vec<(String, f64)> = result
+        let contexts = self
+            .run_script(
+                "?[ctx] := *context{workspace: $ws, name: ctx @ 'NOW'}",
+                params.clone(),
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| anyhow::anyhow!("context_graph contexts: {:?}", e))?;
+        let edges = self
+            .run_script(
+                "?[from_ctx, to_ctx] := *context_dep{workspace: $ws, from_ctx, to_ctx @ 'NOW'}",
+                params,
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| anyhow::anyhow!("context_graph edges: {:?}", e))?;
+        let edge_list: Vec<(String, String)> = edges
             .rows
             .iter()
-            .map(|r| {
-                let rank = match &r[1] {
-                    cozo::DataValue::Num(cozo::Num::Float(f)) => *f,
-                    cozo::DataValue::Num(cozo::Num::Int(i)) => *i as f64,
-                    _ => 0.0,
-                };
-                (dv_str(&r[0]), rank)
-            })
+            .map(|r| (dv_str(&r[0]), dv_str(&r[1])))
             .collect();
+        let mut node_set: BTreeSet<String> =
+            contexts.rows.iter().map(|r| dv_str(&r[0])).collect();
+        for (from, to) in &edge_list {
+            node_set.insert(from.clone());
+            node_set.insert(to.clone());
+        }
+        Ok((node_set.into_iter().collect(), edge_list))
+    }
+
+    /// PageRank over the context dependency graph (power iteration, damping 0.85).
+    /// Computed in pure Rust — the graph is tiny (one node per bounded context) —
+    /// so it works regardless of which Cozo fixed-rules the build ships.
+    pub fn pagerank(&self, workspace: &str) -> Result<Vec<(String, f64)>> {
+        let (nodes, edges) = self.context_graph(workspace)?;
+        let n = nodes.len();
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        let idx: HashMap<&str, usize> =
+            nodes.iter().enumerate().map(|(i, s)| (s.as_str(), i)).collect();
+        let mut out: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for (from, to) in &edges {
+            if let (Some(&fi), Some(&ti)) = (idx.get(from.as_str()), idx.get(to.as_str())) {
+                out[fi].push(ti);
+            }
+        }
+        let damping = 0.85;
+        let base = (1.0 - damping) / n as f64;
+        let mut rank = vec![1.0_f64 / n as f64; n];
+        for _ in 0..200 {
+            let mut next = vec![base; n];
+            let mut dangling = 0.0;
+            for i in 0..n {
+                if out[i].is_empty() {
+                    dangling += damping * rank[i] / n as f64;
+                } else {
+                    let share = damping * rank[i] / out[i].len() as f64;
+                    for &j in &out[i] {
+                        next[j] += share;
+                    }
+                }
+            }
+            for v in next.iter_mut() {
+                *v += dangling;
+            }
+            let diff: f64 = next.iter().zip(&rank).map(|(a, b)| (a - b).abs()).sum();
+            rank = next;
+            if diff < 1e-9 {
+                break;
+            }
+        }
+        let mut ranked: Vec<(String, f64)> = nodes.into_iter().zip(rank).collect();
         ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         Ok(ranked)
     }
 
-    /// Compute community detection (Louvain) over the context dependency graph.
+    /// Community detection over the context dependency graph via synchronous
+    /// label propagation on the undirected projection. Pure Rust; deterministic
+    /// (ties broken by lowest label). Community ids are normalized to 0..k.
     pub fn community_detection(&self, workspace: &str) -> Result<Vec<(String, u64)>> {
-        let params = params_map(&[("ws", workspace)]);
-        let result = self.run_script(
-            "edges[from, to] := *context_dep{workspace: $ws, from_ctx: from, to_ctx: to @ 'NOW'} \
-             ?[node, community] <~ CommunityDetectionLouvain(edges[])",
-            params,
-            ScriptMutability::Immutable,
-        ).map_err(|e| anyhow::anyhow!("community_detection: {:?}", e))?;
-        Ok(result
-            .rows
-            .iter()
-            .map(|r| {
-                let community = match &r[1] {
-                    cozo::DataValue::Num(cozo::Num::Int(i)) => *i as u64,
-                    _ => 0,
-                };
-                (dv_str(&r[0]), community)
+        let (nodes, edges) = self.context_graph(workspace)?;
+        let n = nodes.len();
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        let idx: HashMap<&str, usize> =
+            nodes.iter().enumerate().map(|(i, s)| (s.as_str(), i)).collect();
+        let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for (from, to) in &edges {
+            let (Some(&fi), Some(&ti)) = (idx.get(from.as_str()), idx.get(to.as_str())) else {
+                continue;
+            };
+            if fi != ti {
+                adj[fi].push(ti);
+                adj[ti].push(fi);
+            }
+        }
+        let mut label: Vec<usize> = (0..n).collect();
+        for _ in 0..100 {
+            let mut changed = false;
+            for v in 0..n {
+                if adj[v].is_empty() {
+                    continue;
+                }
+                let mut counts: BTreeMap<usize, usize> = BTreeMap::new();
+                for &w in &adj[v] {
+                    *counts.entry(label[w]).or_default() += 1;
+                }
+                // Highest neighbor-label count; ties broken toward the lowest label.
+                let best = counts
+                    .iter()
+                    .max_by(|a, b| a.1.cmp(b.1).then(b.0.cmp(a.0)))
+                    .map(|(l, _)| *l)
+                    .unwrap_or(label[v]);
+                if best != label[v] {
+                    label[v] = best;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        let mut remap: BTreeMap<usize, u64> = BTreeMap::new();
+        let mut next_id = 0_u64;
+        Ok(nodes
+            .into_iter()
+            .enumerate()
+            .map(|(i, name)| {
+                let cid = *remap.entry(label[i]).or_insert_with(|| {
+                    let id = next_id;
+                    next_id += 1;
+                    id
+                });
+                (name, cid)
             })
             .collect())
     }
 
-    /// Compute betweenness centrality over the context dependency graph.
+    /// Betweenness centrality over the context dependency graph (Brandes'
+    /// algorithm, directed unweighted). Pure Rust.
     pub fn betweenness_centrality(&self, workspace: &str) -> Result<Vec<(String, f64)>> {
-        let params = params_map(&[("ws", workspace)]);
-        let result = self.run_script(
-            "edges[from, to] := *context_dep{workspace: $ws, from_ctx: from, to_ctx: to @ 'NOW'} \
-             ?[node, centrality] <~ BetweennessCentrality(edges[])",
-            params,
-            ScriptMutability::Immutable,
-        ).map_err(|e| anyhow::anyhow!("betweenness_centrality: {:?}", e))?;
-        let mut ranked: Vec<(String, f64)> = result
-            .rows
-            .iter()
-            .map(|r| {
-                let centrality = match &r[1] {
-                    cozo::DataValue::Num(cozo::Num::Float(f)) => *f,
-                    cozo::DataValue::Num(cozo::Num::Int(i)) => *i as f64,
-                    _ => 0.0,
-                };
-                (dv_str(&r[0]), centrality)
-            })
-            .collect();
+        let (nodes, edges) = self.context_graph(workspace)?;
+        let n = nodes.len();
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        let idx: HashMap<&str, usize> =
+            nodes.iter().enumerate().map(|(i, s)| (s.as_str(), i)).collect();
+        let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for (from, to) in &edges {
+            if let (Some(&fi), Some(&ti)) = (idx.get(from.as_str()), idx.get(to.as_str())) {
+                adj[fi].push(ti);
+            }
+        }
+        let mut bc = vec![0.0_f64; n];
+        for s in 0..n {
+            let mut stack: Vec<usize> = Vec::new();
+            let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
+            let mut sigma = vec![0.0_f64; n];
+            sigma[s] = 1.0;
+            let mut dist = vec![-1_i64; n];
+            dist[s] = 0;
+            let mut queue: VecDeque<usize> = VecDeque::new();
+            queue.push_back(s);
+            while let Some(v) = queue.pop_front() {
+                stack.push(v);
+                for &w in &adj[v] {
+                    if dist[w] < 0 {
+                        dist[w] = dist[v] + 1;
+                        queue.push_back(w);
+                    }
+                    if dist[w] == dist[v] + 1 {
+                        sigma[w] += sigma[v];
+                        preds[w].push(v);
+                    }
+                }
+            }
+            let mut delta = vec![0.0_f64; n];
+            while let Some(w) = stack.pop() {
+                for &v in &preds[w] {
+                    delta[v] += (sigma[v] / sigma[w]) * (1.0 + delta[w]);
+                }
+                if w != s {
+                    bc[w] += delta[w];
+                }
+            }
+        }
+        let mut ranked: Vec<(String, f64)> = nodes.into_iter().zip(bc).collect();
         ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         Ok(ranked)
     }
@@ -6421,6 +6700,7 @@ impl Store {
     pub fn model_health(&self, workspace: &str) -> Result<ModelHealth> {
         let canonical = canonicalize_path(workspace);
         let circular = self.circular_deps(&canonical)?;
+        let module_cycles = self.module_cycles(&canonical).unwrap_or_default();
         let violations = self.layer_violations(&canonical)?;
         let missing_invariants = self.aggregate_roots_without_invariants(&canonical)?;
         let orphans = self.orphan_contexts(&canonical)?;
@@ -6468,6 +6748,7 @@ impl Store {
         Ok(ModelHealth {
             score,
             circular_deps: circular.into_iter().map(|(a, b)| [a, b]).collect(),
+            module_cycles,
             layer_violations: violations
                 .into_iter()
                 .map(|(ctx, svc, dep)| LayerViolation {
@@ -6629,6 +6910,10 @@ pub struct ProjectInfo {
 pub struct ModelHealth {
     pub score: u32,
     pub circular_deps: Vec<[String; 2]>,
+    /// Module-level import cycles (each a strongly-connected set of module paths)
+    /// derived from syntactic `import_edge` facts. Complements `circular_deps`,
+    /// which only covers cycles between bounded contexts.
+    pub module_cycles: Vec<Vec<String>>,
     pub layer_violations: Vec<LayerViolation>,
     pub missing_invariants: Vec<[String; 2]>,
     pub orphan_contexts: Vec<String>,
@@ -7013,10 +7298,107 @@ fn text_matches(haystack: &str, needle_lowercase: &str) -> bool {
     if haystack.contains(needle_lowercase) {
         return true;
     }
+    // For path- or namespace-qualified needles (containing '/', '::', or '.'),
+    // require a full-substring match. Token-splitting would let a shared segment
+    // like "src" or "domain" match unrelated files (e.g. filtering for
+    // `src/domain/model.rs` would also match `src/domain/analyze.rs`). Keep the
+    // loose token fallback only for single-token needles (fuzzy symbol search).
+    if needle_lowercase.contains('/')
+        || needle_lowercase.contains("::")
+        || needle_lowercase.contains('.')
+    {
+        return false;
+    }
     needle_lowercase
         .split(|c: char| !c.is_alphanumeric() && c != '_')
         .filter(|token| token.len() > 2)
         .any(|token| haystack.contains(token))
+}
+
+/// Context dependency graph as (node names, directed edges) — the shared shape
+/// fed to the pure-Rust centrality/community algorithms.
+type ContextGraph = (Vec<String>, Vec<(String, String)>);
+
+/// Derive a Rust module path from a source-file path: strip a leading `src/`,
+/// drop the extension, and collapse `mod.rs`/`lib.rs`/`main.rs` to their
+/// directory (crate root for lib/main). e.g. `src/domain/scanner.rs` →
+/// `domain::scanner`, `src/domain/mod.rs` → `domain`, `src/lib.rs` → ``.
+fn file_module_path(path: &str) -> String {
+    let p = path.strip_prefix("./").unwrap_or(path);
+    let rel = p.strip_prefix("src/").unwrap_or(p);
+    let rel = rel.strip_suffix(".rs").unwrap_or(rel);
+    let segs: Vec<&str> = rel.split('/').filter(|s| !s.is_empty()).collect();
+    let mut mods: Vec<&str> = Vec::new();
+    for (i, seg) in segs.iter().enumerate() {
+        let is_last = i == segs.len() - 1;
+        if is_last && (*seg == "mod" || *seg == "lib" || *seg == "main") {
+            break;
+        }
+        mods.push(seg);
+    }
+    mods.join("::")
+}
+
+/// Resolve an import `to_module` use-path to an internal module path, relative to
+/// the importing module. Only `crate::`/`super::`/`self::`-qualified paths are
+/// internal; everything else (std, external crates) returns `None`. The resolved
+/// candidate is matched to the longest known internal module that is a prefix.
+fn resolve_internal_module(
+    to_module: &str,
+    from_mod: &str,
+    known: &BTreeSet<String>,
+) -> Option<String> {
+    let segs: Vec<&str> = to_module.split("::").filter(|s| !s.is_empty()).collect();
+    if segs.is_empty() {
+        return None;
+    }
+    let from_segs: Vec<&str> = from_mod.split("::").filter(|s| !s.is_empty()).collect();
+    let mut base: Vec<String>;
+    let rest: Vec<&str>;
+    match segs[0] {
+        "crate" => {
+            base = Vec::new();
+            rest = segs[1..].to_vec();
+        }
+        "self" => {
+            base = from_segs.iter().map(|s| s.to_string()).collect();
+            rest = segs[1..].to_vec();
+        }
+        "super" => {
+            base = from_segs.iter().map(|s| s.to_string()).collect();
+            let mut i = 0;
+            while i < segs.len() && segs[i] == "super" {
+                base.pop();
+                i += 1;
+            }
+            rest = segs[i..].to_vec();
+        }
+        _ => return None,
+    }
+    for seg in rest {
+        if seg == "*" {
+            continue;
+        }
+        base.push(seg.to_string());
+    }
+    let candidate = base.join("::");
+    if candidate.is_empty() {
+        return None;
+    }
+    known
+        .iter()
+        .filter(|m| !m.is_empty() && (**m == candidate || candidate.starts_with(&format!("{m}::"))))
+        .max_by_key(|m| m.len())
+        .cloned()
+}
+
+/// True if `ancestor` is a strict module-path ancestor of `descendant` (the
+/// crate root, ``, is an ancestor of every non-root module).
+fn is_ancestor(ancestor: &str, descendant: &str) -> bool {
+    if ancestor.is_empty() {
+        return !descendant.is_empty();
+    }
+    descendant.starts_with(&format!("{ancestor}::"))
 }
 
 fn import_references_symbol(to_module: &str, symbol: &str) -> bool {
@@ -7574,6 +7956,124 @@ mod tests {
             1,
             "stale edges must be retracted on re-save"
         );
+    }
+
+    #[test]
+    fn text_matches_is_precise_for_paths_but_fuzzy_for_symbols() {
+        // Path/namespace-qualified needles require a full-substring match: a shared
+        // segment like "src"/"domain" must NOT match an unrelated file (the bug).
+        assert!(text_matches("src/domain/model.rs", "src/domain/model.rs"));
+        assert!(!text_matches("src/domain/analyze.rs", "src/domain/model.rs"));
+        assert!(!text_matches("src/store/cozo.rs", "src/domain/model.rs"));
+        assert!(!text_matches("Store::open", "store::save"));
+        // Single-token needles keep the loose fuzzy fallback (symbol search).
+        assert!(text_matches("DomainModel", "domain"));
+        assert!(text_matches("CozoStore::save_actual", "save_actual"));
+    }
+
+    #[test]
+    fn file_module_path_derivation() {
+        assert_eq!(file_module_path("src/domain/scanner.rs"), "domain::scanner");
+        assert_eq!(file_module_path("src/domain/mod.rs"), "domain");
+        assert_eq!(file_module_path("src/server/web.rs"), "server::web");
+        assert_eq!(file_module_path("src/lib.rs"), "");
+        assert_eq!(file_module_path("src/main.rs"), "");
+    }
+
+    #[test]
+    fn resolve_internal_module_handles_super_self_crate() {
+        let known: BTreeSet<String> =
+            ["domain", "domain::analyze", "domain::scanner", "fabric", "dht"]
+                .into_iter()
+                .map(String::from)
+                .collect();
+        assert_eq!(
+            resolve_internal_module("crate::domain::scanner::AstScanner", "mcp::tools", &known),
+            Some("domain::scanner".into())
+        );
+        assert_eq!(
+            resolve_internal_module("super::analyze::CallInfo", "domain::rust_syn", &known),
+            Some("domain::analyze".into())
+        );
+        assert_eq!(
+            resolve_internal_module("super::*", "domain::rust_syn", &known),
+            Some("domain".into())
+        );
+        assert_eq!(
+            resolve_internal_module("std::fs", "domain::analyze", &known),
+            None
+        );
+        assert_eq!(
+            resolve_internal_module("anyhow::Result", "domain::analyze", &known),
+            None
+        );
+    }
+
+    #[test]
+    fn is_ancestor_detects_parent_child() {
+        assert!(is_ancestor("domain", "domain::analyze"));
+        assert!(is_ancestor("", "domain"));
+        assert!(!is_ancestor("domain::analyze", "domain"));
+        assert!(!is_ancestor("dht", "fabric"));
+    }
+
+    #[test]
+    fn module_cycles_finds_sibling_cycle() {
+        let store = temp_store();
+        let ws = "/tmp/modcyc_ws";
+        let model: DomainModel = serde_json::from_value(json!({
+            "name": "cyc",
+            "source_files": [
+                {"path": "src/dht.rs", "context": "core", "language": "rust"},
+                {"path": "src/fabric.rs", "context": "core", "language": "rust"},
+                {"path": "src/util.rs", "context": "core", "language": "rust"}
+            ],
+            "import_edges": [
+                {"from_file": "src/dht.rs", "to_module": "crate::fabric::Frame", "context": "core"},
+                {"from_file": "src/fabric.rs", "to_module": "crate::dht::Node", "context": "core"},
+                {"from_file": "src/dht.rs", "to_module": "std::collections::HashMap", "context": "core"},
+                {"from_file": "src/util.rs", "to_module": "crate::dht::Node", "context": "core"}
+            ]
+        }))
+        .unwrap();
+        store.save_actual(ws, &model).unwrap();
+
+        let cycles = store.module_cycles(ws).unwrap();
+        assert_eq!(
+            cycles,
+            vec![vec!["dht".to_string(), "fabric".to_string()]],
+            "dht⇄fabric is a 2-module cycle; util->dht is one-way; std is external: {cycles:?}"
+        );
+    }
+
+    #[test]
+    fn pure_rust_graph_algorithms_run_without_cozo_fixed_rules() {
+        let store = temp_store();
+        let ws = "/tmp/algo_ws";
+        let model: DomainModel = serde_json::from_value(json!({
+            "name": "deps",
+            "bounded_contexts": [
+                {"name": "A", "dependencies": ["B"]},
+                {"name": "B", "dependencies": ["C"]},
+                {"name": "C", "dependencies": []}
+            ]
+        }))
+        .unwrap();
+        store.save_actual(ws, &model).unwrap();
+
+        // PageRank: every context ranked; sink C accumulates the most rank.
+        let pr = store.pagerank(ws).unwrap();
+        assert_eq!(pr.len(), 3, "one rank per context: {pr:?}");
+        assert_eq!(pr[0].0, "C", "sink context should rank highest: {pr:?}");
+
+        // Betweenness: B sits on the only shortest path A->C.
+        let bc = store.betweenness_centrality(ws).unwrap();
+        assert_eq!(bc.len(), 3);
+        let b = bc.iter().find(|(n, _)| n == "B").unwrap().1;
+        assert!(b > 0.0, "B is a bridge, betweenness must be > 0: {bc:?}");
+
+        // Community detection returns one assignment per context.
+        assert_eq!(store.community_detection(ws).unwrap().len(), 3);
     }
 
     #[test]
