@@ -7,7 +7,11 @@ use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
-#[command(name = "axon", about = "Domain Model Context Protocol Server")]
+#[command(
+    name = "axon",
+    version,
+    about = "Domain Model Context Protocol Server"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
