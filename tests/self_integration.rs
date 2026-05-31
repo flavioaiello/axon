@@ -869,3 +869,46 @@ fn self_diagnose_improvement_loop() {
 
     eprintln!("── Self-improvement loop: diagnose verified ──");
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Compiler directives: list every dead_code flag in one MCP call
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn self_dead_code_flags_listed_via_single_graph_call() {
+    let store = temp_store();
+    let ws_root = axon_root();
+    let ws = ws_root.to_string_lossy().to_string();
+
+    let actual = scan_actual_model(&ws_root, None).expect("scan_actual_model must succeed");
+    store.save_actual(&ws, &actual).expect("save_actual must succeed");
+
+    // A single MCP graph call returns every `#[allow(dead_code)]` flag, including
+    // the ones on private fns and struct fields, each with a source location.
+    let result = call_tool(
+        &store,
+        &ws,
+        "graph",
+        &json!({
+            "view": "edges",
+            "relation": "ast_edge",
+            "to": "dead_code",
+            "limit": 200,
+        }),
+    );
+    let payload = unwrap_tool_text(&result);
+    let text = serde_json::to_string(&payload).expect("serialize graph payload");
+
+    assert!(
+        text.contains("dead_code"),
+        "graph must list dead_code directives in one call: {text}"
+    );
+    // Flags carry their declaration site so they are actionable (the repo
+    // annotates private items in src/mcp/*.rs).
+    assert!(
+        text.contains(".rs"),
+        "dead_code flags must carry a file location: {text}"
+    );
+
+    eprintln!("── dead_code flags via single graph call: verified ──");
+}

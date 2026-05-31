@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use axon::domain::model::*;
 use axon::store::Store;
-use axon::store::cozo::canonicalize_path;
+use axon::store::cozo::{canonicalize_path, default_layer_constraints};
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -69,6 +69,24 @@ fn empty_model() -> DomainModel {
 
 fn canonicalize(path: &str) -> String {
     canonicalize_path(path)
+}
+
+/// Create a unique temp directory that looks like a crate root (has a
+/// `Cargo.toml`), so `Store::open` enables `.axon/policy.json` persistence and
+/// keys all operations under the same canonical workspace.
+fn unique_crate_root(prefix: &str) -> std::path::PathBuf {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = temp_dir().join(format!("{}_{}_{}", prefix, std::process::id(), unique));
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"axon-policy-test\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .unwrap();
+    root
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -431,9 +449,11 @@ fn policy_assignments_survive_store_reopen_for_crate_root() {
 
     {
         let store = Store::open(&root).unwrap();
+        // "A" matches no layer convention, so this is a genuine explicit override.
         store.upsert_layer_assignment(&ws, "A", "domain").unwrap();
+        // A non-default constraint that must round-trip across reopen.
         store
-            .upsert_dependency_constraint(&ws, "layer", "domain", "infrastructure", "forbidden")
+            .upsert_dependency_constraint(&ws, "context", "Auth", "Billing", "forbidden")
             .unwrap();
     }
 
@@ -442,14 +462,117 @@ fn policy_assignments_survive_store_reopen_for_crate_root() {
         reopened.list_layer_assignments(&ws).unwrap(),
         vec![("A".into(), "domain".into())]
     );
-    assert_eq!(
-        reopened.list_dependency_constraints(&ws).unwrap(),
-        vec![(
-            "layer".into(),
-            "domain".into(),
-            "infrastructure".into(),
+
+    let constraints = reopened.list_dependency_constraints(&ws).unwrap();
+    // The explicit override survives the reopen…
+    assert!(
+        constraints.contains(&(
+            "context".into(),
+            "Auth".into(),
+            "Billing".into(),
             "forbidden".into()
-        )]
+        )),
+        "explicit override should survive reopen, got {constraints:?}"
+    );
+    // …alongside the always-seeded Clean-Architecture defaults.
+    for (kind, source, target, rule) in default_layer_constraints() {
+        assert!(
+            constraints.contains(&(
+                kind.to_string(),
+                source.to_string(),
+                target.to_string(),
+                rule.to_string()
+            )),
+            "default {source}->{target} should be present after reopen"
+        );
+    }
+}
+
+#[test]
+fn default_constraints_seeded_at_crate_root() {
+    let root = unique_crate_root("axon_policy_defaults");
+    let ws = canonicalize_path(&root.to_string_lossy());
+    let store = Store::open(&root).unwrap();
+
+    let constraints = store.list_dependency_constraints(&ws).unwrap();
+    assert_eq!(
+        constraints.len(),
+        default_layer_constraints().len(),
+        "a fresh store should carry exactly the seeded defaults, got {constraints:?}"
+    );
+    for (kind, source, target, rule) in default_layer_constraints() {
+        assert!(constraints.contains(&(
+            kind.to_string(),
+            source.to_string(),
+            target.to_string(),
+            rule.to_string()
+        )));
+    }
+}
+
+#[test]
+fn inferred_layers_flag_violation_without_manual_policy() {
+    let root = unique_crate_root("axon_policy_infer");
+    let ws = canonicalize_path(&root.to_string_lossy());
+    let store = Store::open(&root).unwrap();
+
+    // Conventionally-named contexts: domain depends on infrastructure (outward).
+    let mut domain = empty_ctx("domain");
+    domain.dependencies = vec!["infrastructure".into()];
+    let infra = empty_ctx("infrastructure");
+    let mut model = empty_model();
+    model.bounded_contexts = vec![domain, infra];
+    store.save_actual(&ws, &model).unwrap();
+
+    // No upsert_layer_assignment / upsert_dependency_constraint calls at all.
+    let assignments = store.list_layer_assignments(&ws).unwrap();
+    assert!(assignments.contains(&("domain".into(), "domain".into())));
+    assert!(assignments.contains(&("infrastructure".into(), "infrastructure".into())));
+
+    let result = store.evaluate_policy_violations(&ws).unwrap();
+    assert_eq!(result["status"], "false", "domain->infra must be flagged");
+    let violations = result["violations"].as_array().unwrap();
+    assert!(violations.iter().any(|v| {
+        v["from_context"] == "domain"
+            && v["to_context"] == "infrastructure"
+            && v["from_layer"] == "domain"
+            && v["to_layer"] == "infrastructure"
+    }));
+}
+
+#[test]
+fn inferred_and_default_policy_are_not_persisted() {
+    let root = unique_crate_root("axon_policy_overrideonly");
+    let ws = canonicalize_path(&root.to_string_lossy());
+
+    {
+        let store = Store::open(&root).unwrap();
+        let mut model = empty_model();
+        model.bounded_contexts = vec![empty_ctx("domain"), empty_ctx("infrastructure")];
+        store.save_actual(&ws, &model).unwrap();
+
+        // Inferred assignments exist in-memory before any explicit action.
+        let before = store.list_layer_assignments(&ws).unwrap();
+        assert!(before.contains(&("domain".into(), "domain".into())));
+        assert!(before.contains(&("infrastructure".into(), "infrastructure".into())));
+
+        // An explicit override on an unconventional context triggers persistence.
+        store
+            .upsert_layer_assignment(&ws, "billing", "domain")
+            .unwrap();
+    }
+
+    // Reopen WITHOUT re-scanning: only explicit overrides should reload.
+    let reopened = Store::open(&root).unwrap();
+    assert_eq!(
+        reopened.list_layer_assignments(&ws).unwrap(),
+        vec![("billing".into(), "domain".into())],
+        "inferred layers must not be persisted — only the explicit override"
+    );
+    assert_eq!(
+        reopened.list_dependency_constraints(&ws).unwrap().len(),
+        default_layer_constraints().len(),
+        "no constraints beyond the re-seeded defaults should be persisted"
     );
 }
 
@@ -1506,6 +1629,8 @@ fn copy_state_copies_ast_edges() {
         from_node: "OrderHandler".into(),
         to_node: "Handler".into(),
         edge_type: "implements".into(),
+        file_path: String::new(),
+        line: 0,
     }];
     store.save_desired(&ws, &model).unwrap();
 

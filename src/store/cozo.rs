@@ -38,7 +38,11 @@ impl Store {
 
         Self::init_schema(&db)?;
         let store = Self { db, policy_path };
-        store.load_persisted_policy(&canonicalize_path(&root.to_string_lossy()))?;
+        let ws = canonicalize_path(&root.to_string_lossy());
+        // Seed conventional Clean-Architecture rules first, then let any
+        // persisted overrides win by upserting over the same keys.
+        store.seed_default_constraints(&ws)?;
+        store.load_persisted_policy(&ws)?;
         Ok(store)
     }
 
@@ -234,7 +238,11 @@ impl Store {
             // Ephemeral — no state column
             ":create live_import { workspace: String, from_file: String, to_module: String }",
             // AST structural edges (extends, implements, decorators)
-            ":create ast_edge { workspace: String, from_node: String, to_node: String, edge_type: String, vld: Validity default 'ASSERT' }",
+            ":create ast_edge { workspace: String, from_node: String, to_node: String, edge_type: String, vld: Validity default 'ASSERT' => file_path: String default '', line: Int default 0 }",
+            // Resolved trait impls from rustdoc JSON (post-macro-expansion, name-resolved).
+            // Includes derive-generated impls and fully-qualified trait/type paths
+            // that the syn scanner structurally cannot see. Populated by `rust_resolve`.
+            ":create resolved_impl { workspace: String, type_path: String, trait_path: String, vld: Validity default 'ASSERT' => type_name: String default '', trait_name: String default '' }",
             // ── Source-level relations ──
             ":create source_file { workspace: String, path: String, vld: Validity default 'ASSERT' => context: String default '', language: String default '' }",
             ":create symbol { workspace: String, name: String, vld: Validity default 'ASSERT' => kind: String default '', context: String default '', file_path: String default '', start_line: Int default 0, end_line: Int default 0, visibility: String default 'public' }",
@@ -395,6 +403,48 @@ impl Store {
         self.record_snapshot(&ws, "actual")
     }
 
+    /// Persist resolved trait impls ingested from rustdoc JSON, replacing any
+    /// previous generation (retract-then-assert) so removed impls don't linger.
+    pub fn save_resolved_impls(
+        &self,
+        workspace_path: &str,
+        impls: &[crate::domain::rustdoc::ResolvedImpl],
+    ) -> Result<usize> {
+        let ws = canonicalize_path(workspace_path);
+        let sv = |x: &str| cozo::DataValue::Str(x.into());
+
+        // Retract the prior set. An empty relation derives no rows → harmless no-op.
+        self.run_script(
+            "?[workspace, type_path, trait_path, vld] := \
+               *resolved_impl{workspace, type_path, trait_path @ 'NOW'}, \
+               workspace = $ws, vld = 'RETRACT' \
+             :put resolved_impl { workspace, type_path, trait_path, vld }",
+            params_map(&[("ws", &ws)]),
+            ScriptMutability::Mutable,
+        )
+        .map_err(|e| anyhow::anyhow!("retract resolved_impl: {e:?}"))?;
+
+        let rows: Vec<cozo::DataValue> = impls
+            .iter()
+            .map(|i| {
+                cozo::DataValue::List(vec![
+                    sv(&ws),
+                    sv(&i.type_path),
+                    sv(&i.trait_path),
+                    sv(&i.type_name),
+                    sv(&i.trait_name),
+                ])
+            })
+            .collect();
+        self.batch_put(
+            rows,
+            "?[workspace, type_path, trait_path, type_name, trait_name] <- $rows \
+             :put resolved_impl { workspace, type_path, trait_path, type_name, trait_name }",
+            "save resolved_impls",
+        )?;
+        Ok(impls.len())
+    }
+
     fn run_mutation_script(
         &self,
         script: &str,
@@ -405,6 +455,28 @@ impl Store {
         self.run_script(script, params, ScriptMutability::Mutable)
             .map(|_| ())
             .map_err(|e| anyhow::anyhow!("{context}: {:?}", e))
+    }
+
+    /// Insert many rows with a single `:put` instead of one script per row.
+    ///
+    /// `rows` is one `DataValue::List` per row; `script` must bind them via
+    /// `<- $rows`. An empty input is a no-op (an empty `<-` is rejected by
+    /// CozoDB). This collapses thousands of per-row script executions into one,
+    /// which dominates `save_actual` cost on call-heavy graphs.
+    fn batch_put(
+        &self,
+        rows: Vec<cozo::DataValue>,
+        script: &str,
+        context: impl Into<String>,
+    ) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut params = BTreeMap::new();
+        params.insert("rows".to_string(), cozo::DataValue::List(rows));
+        self.run_script(script, params, ScriptMutability::Mutable)
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("{}: {:?}", context.into(), e))
     }
 
     fn run_script(
@@ -1409,20 +1481,31 @@ impl Store {
             }
         }
 
+        // Batched bulk inserts for the high-volume flat relations. `sv` builds a
+        // string `DataValue`; each relation sends all rows in one `:put`.
+        let sv = |x: &str| cozo::DataValue::Str(x.into());
+
         // Save AST edges
-        for edge in &model.ast_edges {
-            self.run_script(
-                "?[workspace, state, from_node, to_node, edge_type] <- [[$ws, $st, $from, $to, $kind]] :put ast_edge { workspace, state, from_node, to_node, edge_type }",
-                params_map(&[
-                    ("ws", workspace),
-                    ("st", state),
-                    ("from", &edge.from_node),
-                    ("to", &edge.to_node),
-                    ("kind", &edge.edge_type),
-                ]),
-                ScriptMutability::Mutable,
-            ).map_err(|e| anyhow::anyhow!("save ast_edge: {:?}", e))?;
-        }
+        let ast_rows: Vec<cozo::DataValue> = model
+            .ast_edges
+            .iter()
+            .map(|edge| {
+                cozo::DataValue::List(vec![
+                    sv(workspace),
+                    sv(&edge.from_node),
+                    sv(&edge.to_node),
+                    sv(&edge.edge_type),
+                    sv(&edge.file_path),
+                    cozo::DataValue::from(edge.line as i64),
+                ])
+            })
+            .collect();
+        self.batch_put(
+            ast_rows,
+            "?[workspace, from_node, to_node, edge_type, file_path, line] <- $rows \
+             :put ast_edge { workspace, from_node, to_node, edge_type, file_path, line }",
+            "save ast_edges",
+        )?;
 
         // Save source files
         for sf in &model.source_files {
@@ -1442,62 +1525,72 @@ impl Store {
         }
 
         // Save symbols
-        for sym in &model.symbols {
-            let mut params = params_map(&[
-                ("ws", workspace),
-                ("name", &sym.name),
-                ("st", state),
-                ("kind", &sym.kind),
-                ("ctx", &sym.context),
-                ("fp", &sym.file_path),
-                ("vis", &sym.visibility),
-            ]);
-            params.insert("sl".into(), int_dv(sym.start_line as i64));
-            params.insert("el".into(), int_dv(sym.end_line as i64));
-            self.run_script(
-                "?[workspace, name, state, kind, context, file_path, start_line, end_line, visibility] <- \
-                 [[$ws, $name, $st, $kind, $ctx, $fp, $sl, $el, $vis]] \
-                 :put symbol { workspace, name, state => kind, context, file_path, start_line, end_line, visibility }",
-                params,
-                ScriptMutability::Mutable,
-            ).map_err(|e| anyhow::anyhow!("save symbol '{}': {:?}", sym.name, e))?;
-        }
+        let sym_rows: Vec<cozo::DataValue> = model
+            .symbols
+            .iter()
+            .map(|sym| {
+                cozo::DataValue::List(vec![
+                    sv(workspace),
+                    sv(&sym.name),
+                    sv(&sym.kind),
+                    sv(&sym.context),
+                    sv(&sym.file_path),
+                    int_dv(sym.start_line as i64),
+                    int_dv(sym.end_line as i64),
+                    sv(&sym.visibility),
+                ])
+            })
+            .collect();
+        self.batch_put(
+            sym_rows,
+            "?[workspace, name, kind, context, file_path, start_line, end_line, visibility] <- $rows \
+             :put symbol { workspace, name => kind, context, file_path, start_line, end_line, visibility }",
+            "save symbols",
+        )?;
 
         // Save import edges
-        for ie in &model.import_edges {
-            self.run_script(
-                "?[workspace, from_file, to_module, state, context] <- [[$ws, $ff, $tm, $st, $ctx]] \
-                 :put import_edge { workspace, from_file, to_module, state => context }",
-                params_map(&[
-                    ("ws", workspace),
-                    ("ff", &ie.from_file),
-                    ("tm", &ie.to_module),
-                    ("st", state),
-                    ("ctx", &ie.context),
-                ]),
-                ScriptMutability::Mutable,
-            ).map_err(|e| anyhow::anyhow!("save import_edge: {:?}", e))?;
-        }
+        let import_rows: Vec<cozo::DataValue> = model
+            .import_edges
+            .iter()
+            .map(|ie| {
+                cozo::DataValue::List(vec![
+                    sv(workspace),
+                    sv(&ie.from_file),
+                    sv(&ie.to_module),
+                    sv(&ie.context),
+                ])
+            })
+            .collect();
+        self.batch_put(
+            import_rows,
+            "?[workspace, from_file, to_module, context] <- $rows \
+             :put import_edge { workspace, from_file, to_module => context }",
+            "save import_edges",
+        )?;
 
         // Save call edges
-        for ce in &model.call_edges {
-            let mut params = params_map(&[
-                ("ws", workspace),
-                ("caller", &ce.caller),
-                ("callee", &ce.callee),
-                ("st", state),
-                ("fp", &ce.file_path),
-                ("ctx", &ce.context),
-            ]);
-            params.insert("line".into(), int_dv(ce.line as i64));
-            self.run_script(
-                "?[workspace, caller, callee, state, file_path, line, context] <- [[$ws, $caller, $callee, $st, $fp, $line, $ctx]] \
-                 :put calls_symbol { workspace, caller, callee, state => file_path, line, context }",
-                params,
-                ScriptMutability::Mutable,
-            ).map_err(|e| anyhow::anyhow!("save calls_symbol: {:?}", e))?;
-        }
+        let call_rows: Vec<cozo::DataValue> = model
+            .call_edges
+            .iter()
+            .map(|ce| {
+                cozo::DataValue::List(vec![
+                    sv(workspace),
+                    sv(&ce.caller),
+                    sv(&ce.callee),
+                    sv(&ce.file_path),
+                    int_dv(ce.line as i64),
+                    sv(&ce.context),
+                ])
+            })
+            .collect();
+        self.batch_put(
+            call_rows,
+            "?[workspace, caller, callee, file_path, line, context] <- $rows \
+             :put calls_symbol { workspace, caller, callee => file_path, line, context }",
+            "save call_edges",
+        )?;
 
+        self.apply_inferred_layers(workspace, model)?;
         self.record_snapshot(workspace, state)?;
         self.invalidate_reasoning_claims_for_dependency(workspace, state)?;
 
@@ -2077,7 +2170,7 @@ impl Store {
             conventions,
             ast_edges: {
                 let rows = self.run_script(
-                    "?[from_node, to_node, edge_type] := *ast_edge{workspace: $ws, state: $st, from_node, to_node, edge_type @ 'NOW'}",
+                    "?[from_node, to_node, edge_type, file_path, line] := *ast_edge{workspace: $ws, state: $st, from_node, to_node, edge_type, file_path, line @ 'NOW'}",
                     params_map(&[("ws", &ws), ("st", state)]),
                     ScriptMutability::Immutable,
                 ).map(|r| r.rows).unwrap_or_default();
@@ -2086,6 +2179,8 @@ impl Store {
                         from_node: dv_str(&r[0]),
                         to_node: dv_str(&r[1]),
                         edge_type: dv_str(&r[2]),
+                        file_path: dv_str(&r[3]),
+                        line: dv_i64(&r[4]).max(0) as usize,
                     })
                     .collect()
             },
@@ -4254,6 +4349,41 @@ impl Store {
             .collect())
     }
 
+    /// Seed the built-in [`default_layer_constraints`] into the in-memory store.
+    /// Idempotent and never persisted — re-applied on every open.
+    fn seed_default_constraints(&self, workspace: &str) -> Result<()> {
+        let ws = canonicalize_path(workspace);
+        for (kind, source, target, rule) in default_layer_constraints() {
+            self.upsert_dependency_constraint_in_memory(&ws, kind, source, target, rule)?;
+        }
+        Ok(())
+    }
+
+    /// Materialize convention-inferred layer assignments for the model's
+    /// contexts. A context is assigned only when its name maps to a known layer
+    /// (via [`crate::domain::analyze::classify_layer`]) *and* it has no existing
+    /// assignment, so explicit/persisted assignments are never overwritten.
+    ///
+    /// Inferred rows live in-memory only; [`Self::persist_policy`] filters them
+    /// back out, keeping `.axon/policy.json` override-only.
+    fn apply_inferred_layers(&self, workspace: &str, model: &DomainModel) -> Result<()> {
+        let ws = canonicalize_path(workspace);
+        let assigned = self
+            .list_layer_assignments(&ws)?
+            .into_iter()
+            .map(|(context, _)| context)
+            .collect::<BTreeSet<_>>();
+        for bc in &model.bounded_contexts {
+            if assigned.contains(&bc.name) {
+                continue;
+            }
+            if let Some(layer) = crate::domain::analyze::classify_layer(&bc.name) {
+                self.upsert_layer_assignment_in_memory(&ws, &bc.name, layer)?;
+            }
+        }
+        Ok(())
+    }
+
     fn load_persisted_policy(&self, workspace: &str) -> Result<()> {
         let Some(path) = &self.policy_path else {
             return Ok(());
@@ -4294,16 +4424,35 @@ impl Store {
             return Ok(());
         };
 
+        // Persist only explicit overrides: drop assignments that merely match
+        // what convention-inference would produce, so the policy file stays
+        // override-only rather than echoing every inferred layer.
         let mut layer_assignments = self
             .list_layer_assignments(workspace)?
             .into_iter()
+            .filter(|(context, layer)| {
+                crate::domain::analyze::classify_layer(context) != Some(layer.as_str())
+            })
             .map(|(context, layer)| PersistedLayerAssignment { context, layer })
             .collect::<Vec<_>>();
         layer_assignments.sort_by(|a, b| a.context.cmp(&b.context));
 
+        // Likewise drop any constraint identical to a seeded default.
+        let defaults = default_layer_constraints()
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
         let mut dependency_constraints = self
             .list_dependency_constraints(workspace)?
             .into_iter()
+            .filter(|(constraint_kind, source, target, rule)| {
+                !defaults.contains(&(
+                    constraint_kind.as_str(),
+                    source.as_str(),
+                    target.as_str(),
+                    rule.as_str(),
+                ))
+            })
             .map(
                 |(constraint_kind, source, target, rule)| PersistedDependencyConstraint {
                     constraint_kind,
@@ -4782,7 +4931,7 @@ impl Store {
                     relations_used.insert("ast_edge".to_string());
                     let rows = self
                         .run_script(
-                            "?[from_node, to_node, edge_type] := *ast_edge{workspace: $ws, state: 'actual', from_node, to_node, edge_type @ 'NOW'} :limit 500",
+                            "?[from_node, to_node, edge_type, file_path, line] := *ast_edge{workspace: $ws, state: 'actual', from_node, to_node, edge_type, file_path, line @ 'NOW'} :limit 500",
                             params_map(&[("ws", &ws)]),
                             ScriptMutability::Immutable,
                         )
@@ -4810,6 +4959,55 @@ impl Store {
                             "from_kind": "symbol",
                             "to_kind": "symbol",
                             "edge_type": dv_str(&row[2]),
+                            "file": dv_str(&row[3]),
+                            "line": dv_i64(&row[4]),
+                        }));
+                    }
+                }
+                if relation == "all" || relation == "resolved_impl" {
+                    relations_used.insert("resolved_impl".to_string());
+                    let rows = self
+                        .run_script(
+                            "?[type_path, trait_path, type_name, trait_name] := *resolved_impl{workspace: $ws, state: 'actual', type_path, trait_path, type_name, trait_name @ 'NOW'} :limit 500",
+                            params_map(&[("ws", &ws)]),
+                            ScriptMutability::Immutable,
+                        )
+                        .map_err(|e| anyhow::anyhow!("graph resolved_impl edges: {:?}", e))?;
+                    for row in &rows.rows {
+                        let type_path = dv_str(&row[0]);
+                        let trait_path = dv_str(&row[1]);
+                        let type_name = dv_str(&row[2]);
+                        let trait_name = dv_str(&row[3]);
+                        // `symbol`/`from` match the implementing type (by short name
+                        // or full path); `to` matches the trait. So `to="Serialize"`
+                        // lists every type deriving/implementing Serialize.
+                        if !filter_symbol.is_empty()
+                            && !text_matches(&type_name, &filter_symbol)
+                            && !text_matches(&type_path, &filter_symbol)
+                            && !text_matches(&trait_name, &filter_symbol)
+                        {
+                            continue;
+                        }
+                        if !filter_from.is_empty()
+                            && !text_matches(&type_name, &filter_from)
+                            && !text_matches(&type_path, &filter_from)
+                        {
+                            continue;
+                        }
+                        if !filter_to.is_empty()
+                            && !text_matches(&trait_name, &filter_to)
+                            && !text_matches(&trait_path, &filter_to)
+                        {
+                            continue;
+                        }
+                        edges.push(json!({
+                            "id": format!("resolved_impl:{type_path}->{trait_path}"),
+                            "relation": "resolved_impl",
+                            "from": type_path,
+                            "to": trait_path,
+                            "from_kind": "type",
+                            "to_kind": "trait",
+                            "edge_type": "implements",
                         }));
                     }
                 }
@@ -6784,6 +6982,28 @@ fn strip_state_dimension_from_script(script: &str) -> String {
     }
 }
 
+/// Default Clean-Architecture layer dependency constraints, seeded into every
+/// store at open.
+///
+/// These encode the universal "dependencies point inward" rule shared by
+/// Clean / Hexagonal / Onion architecture: `domain` is innermost (may depend on
+/// nothing), `application` sits above it, and `infrastructure`/presentation are
+/// the outer ring. Every outward-pointing layer dependency is forbidden. Because
+/// this grammar is the same for every Rust/DDD project, it ships as a default so
+/// a conventionally-structured workspace gets architecture governance with no
+/// hand-written policy. These rows are never written to `.axon/policy.json`;
+/// only explicit overrides are persisted (see [`Store::persist_policy`]).
+pub fn default_layer_constraints()
+-> &'static [(&'static str, &'static str, &'static str, &'static str)] {
+    &[
+        ("layer", "domain", "application", "forbidden"),
+        ("layer", "domain", "infrastructure", "forbidden"),
+        ("layer", "domain", "presentation", "forbidden"),
+        ("layer", "application", "infrastructure", "forbidden"),
+        ("layer", "application", "presentation", "forbidden"),
+    ]
+}
+
 fn params_map(pairs: &[(&str, &str)]) -> BTreeMap<String, cozo::DataValue> {
     pairs
         .iter()
@@ -7300,6 +7520,73 @@ mod tests {
         let id = COUNTER.fetch_add(1, Ordering::SeqCst);
         let path = temp_dir().join(format!("axon_cozo_test_{}_{}.db", std::process::id(), id));
         Store::open(&path).unwrap()
+    }
+
+    #[test]
+    fn resolved_impls_are_queryable_via_graph() {
+        use crate::domain::rustdoc::ResolvedImpl;
+        let store = temp_store();
+        let ws = "/tmp/resolved_ws";
+        let impls = vec![
+            ResolvedImpl {
+                type_path: "axon::domain::model::DomainModel".into(),
+                type_name: "DomainModel".into(),
+                trait_path: "serde_core::ser::Serialize".into(),
+                trait_name: "Serialize".into(),
+            },
+            ResolvedImpl {
+                type_path: "axon::domain::model::ASTEdge".into(),
+                type_name: "ASTEdge".into(),
+                trait_path: "serde_core::ser::Serialize".into(),
+                trait_name: "Serialize".into(),
+            },
+            ResolvedImpl {
+                type_path: "axon::domain::model::DomainModel".into(),
+                type_name: "DomainModel".into(),
+                trait_path: "core::fmt::Debug".into(),
+                trait_name: "Debug".into(),
+            },
+        ];
+        assert_eq!(store.save_resolved_impls(ws, &impls).unwrap(), 3);
+
+        // `to="Serialize"` → every type implementing Serialize (both).
+        let q = store
+            .query_rust_graph(
+                ws,
+                &json!({ "view": "edges", "relation": "resolved_impl", "to": "Serialize" }),
+            )
+            .unwrap();
+        let edges = q["edges"].as_array().unwrap();
+        assert_eq!(edges.len(), 2, "two types impl Serialize: {edges:?}");
+        assert!(edges.iter().all(|e| e["to"] == "serde_core::ser::Serialize"));
+        assert!(
+            edges
+                .iter()
+                .any(|e| e["from"] == "axon::domain::model::DomainModel")
+        );
+
+        // `from="DomainModel"` → that type's resolved traits (Serialize + Debug).
+        let q2 = store
+            .query_rust_graph(
+                ws,
+                &json!({ "view": "edges", "relation": "resolved_impl", "from": "DomainModel" }),
+            )
+            .unwrap();
+        assert_eq!(q2["edges"].as_array().unwrap().len(), 2);
+
+        // Re-saving replaces (retract-then-assert): a smaller set shrinks the relation.
+        assert_eq!(store.save_resolved_impls(ws, &impls[..1]).unwrap(), 1);
+        let q3 = store
+            .query_rust_graph(
+                ws,
+                &json!({ "view": "edges", "relation": "resolved_impl" }),
+            )
+            .unwrap();
+        assert_eq!(
+            q3["edges"].as_array().unwrap().len(),
+            1,
+            "stale impls must be retracted on re-save"
+        );
     }
 
     #[test]

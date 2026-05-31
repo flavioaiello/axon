@@ -31,7 +31,7 @@ fn rust_native_read_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "rust_graph".into(),
-            description: "Query persisted actual-state Rust facts through bounded graph views: modules, source files, symbols, import edges, call edges, AST edges, neighborhoods, paths, and relation counts. Results use compact schema-plus-rows JSON (`schema`, `cols`, `rows`) for repeated facts. Arbitrary Datalog is not exposed.".into(),
+            description: "Query persisted actual-state Rust facts through bounded graph views: modules, source files, symbols, import edges, call edges, AST edges, neighborhoods, paths, and relation counts. AST edges (`relation=ast_edge`) carry `extends`/`implements` plus compiler directives as `decorators` edges — `to_node` is the directive text (e.g. `allow(dead_code)`, `cfg(feature = \"x\")`, `Debug`) and `from_node` the annotated item (`Owner::method`, `Owner.field`, or a bare name), each with a `file`/`line`. So `view=edges, relation=ast_edge, to=\"dead_code\"` lists every dead-code flag in one call (directives are captured on items/fields of any visibility). Results use compact schema-plus-rows JSON (`schema`, `cols`, `rows`) for repeated facts. Arbitrary Datalog is not exposed.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -47,7 +47,7 @@ fn rust_native_read_tools() -> Vec<ToolDefinition> {
                     },
                     "relation": {
                         "type": "string",
-                        "enum": ["all", "context_dep", "import_edge", "calls_symbol", "ast_edge"],
+                        "enum": ["all", "context_dep", "import_edge", "calls_symbol", "ast_edge", "resolved_impl"],
                         "description": "Rust relation filter for edges/paths views"
                     },
                     "module": { "type": "string", "description": "Rust module path/name filter" },
@@ -58,6 +58,15 @@ fn rust_native_read_tools() -> Vec<ToolDefinition> {
                     "to": { "type": "string", "description": "Target node for paths or edge filtering" },
                     "limit": { "type": "integer", "description": "Max returned rows per collection (default: 50, max: 200)", "default": 50 }
                 },
+                "required": []
+            }),
+        },
+        ToolDefinition {
+            name: "rust_resolve".into(),
+            description: "Ingest a compiler-resolved semantic layer from rustdoc JSON to complement the syn scanner. Generates rustdoc JSON (nightly `cargo doc --output-format json`, post macro-expansion + name resolution) and persists resolved trait impls into the `resolved_impl` relation — including derive- and macro-generated impls the syn scanner cannot see (e.g. `impl serde::Serialize for X` from `#[derive(Serialize)]`), with fully-qualified trait and type paths. Opt-in and slow: requires a nightly toolchain and a full compile (tens of seconds). After it runs, query via `rust_graph(view=edges, relation=resolved_impl, to=\"Serialize\")` (types implementing a trait) or `from=\"DomainModel\"` (a type's resolved traits).".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
                 "required": []
             }),
         },
@@ -237,7 +246,7 @@ fn legacy_read_tools() -> Vec<ToolDefinition> {
                     },
                     "relation": {
                         "type": "string",
-                        "enum": ["all", "context_dep", "import_edge", "calls_symbol", "ast_edge"],
+                        "enum": ["all", "context_dep", "import_edge", "calls_symbol", "ast_edge", "resolved_impl"],
                         "description": "Edge relation filter for edges/paths views"
                     },
                     "context": { "type": "string", "description": "Context/module filter" },
@@ -548,6 +557,35 @@ pub fn call_tool(store: &Store, workspace_path: &str, name: &str, args: &Value) 
                     json_result(envelope)
                 }
                 Err(e) => error_result(format!("query_rust_graph failed: {e}")),
+            }
+        }
+
+        "rust_resolve" => {
+            let crate_dir = std::path::Path::new(workspace_path);
+            match crate::domain::rustdoc::generate_rustdoc_json(crate_dir)
+                .and_then(|json| crate::domain::rustdoc::parse_resolved_impls(&json))
+            {
+                Ok(impls) => match store.save_resolved_impls(workspace_path, &impls) {
+                    Ok(count) => {
+                        let sample: Vec<String> = impls
+                            .iter()
+                            .take(10)
+                            .map(|i| format!("{} → {}", i.type_name, i.trait_path))
+                            .collect();
+                        json_result(json!({
+                            "status": "ok",
+                            "resolved_impls": count,
+                            "sample": sample,
+                            "note": "Query with rust_graph(view=edges, relation=resolved_impl). \
+                                     Includes derive/macro-generated impls invisible to the syn scanner.",
+                        }))
+                    }
+                    Err(e) => error_result(format!("rust_resolve: failed to persist: {e}")),
+                },
+                Err(e) => error_result(format!(
+                    "rust_resolve: rustdoc JSON generation/parse failed \
+                     (requires a nightly toolchain — `rustup toolchain install nightly`): {e}"
+                )),
             }
         }
 
@@ -1540,11 +1578,12 @@ mod tests {
     #[test]
     fn test_list_tools_count() {
         let tools = list_tools();
-        assert_eq!(tools.len(), 11);
+        assert_eq!(tools.len(), 12);
         let names: Vec<_> = tools.iter().map(|tool| tool.name.as_str()).collect();
         for expected in [
             "rust_status",
             "rust_graph",
+            "rust_resolve",
             "rust_health",
             "rust_impact",
             "rust_delete_safety",

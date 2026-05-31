@@ -71,6 +71,21 @@ enum Commands {
         #[arg(short, long)]
         workspace: String,
     },
+
+    /// Run the shared in-memory daemon that holds every workspace's model.
+    ///
+    /// Editors keep launching `axon serve` (stdio); those bridge to this one
+    /// long-running process so all workspaces stay warm and isolated in memory.
+    /// Intended to be run via `brew services start axon`.
+    Daemon {
+        /// Unix socket path (defaults to $AXON_SOCKET or ~/.axon/daemon.sock)
+        #[arg(short, long)]
+        socket: Option<String>,
+
+        /// Port for the multi-workspace web graph
+        #[arg(long, default_value_t = server::web::DEFAULT_WEB_PORT)]
+        web_port: u16,
+    },
 }
 
 #[tokio::main]
@@ -93,62 +108,19 @@ async fn main() -> Result<()> {
     };
 
     match cli.command {
-        // Default: serve from cwd
-        None => {
-            let workspace = resolve_workspace(None);
-            let registry = std::sync::Arc::new(store::CrateRegistry::open(std::path::Path::new(
-                &workspace,
-            ))?);
-            tracing::info!(
-                "Axon Server starting for workspace: {} ({} crate(s))",
-                workspace,
-                registry.crates().len()
-            );
-
-            let watcher =
-                server::watcher::ActualStateWatcher::new(std::sync::Arc::clone(&registry));
-
-            tokio::spawn(async move {
-                if let Err(e) = watcher.spawn().await {
-                    tracing::error!("AST Watcher failed: {}", e);
-                }
-            });
-
-            spawn_web_graph(
-                std::sync::Arc::clone(&registry),
-                server::web::DEFAULT_WEB_PORT,
-            );
-
-            server::stdio::run(registry).await?;
-        }
+        // Default: serve from cwd (bridges to the daemon if one is running).
+        None => serve_or_bridge(resolve_workspace(None), server::web::DEFAULT_WEB_PORT).await?,
 
         Some(Commands::Serve {
             workspace,
             web_port,
-        }) => {
-            let workspace = resolve_workspace(workspace);
-            let registry = std::sync::Arc::new(store::CrateRegistry::open(std::path::Path::new(
-                &workspace,
-            ))?);
-            tracing::info!(
-                "Axon Server starting for workspace: {} ({} crate(s))",
-                workspace,
-                registry.crates().len()
-            );
+        }) => serve_or_bridge(resolve_workspace(workspace), web_port).await?,
 
-            let watcher =
-                server::watcher::ActualStateWatcher::new(std::sync::Arc::clone(&registry));
-
-            // Spawn the background watcher
-            tokio::spawn(async move {
-                if let Err(e) = watcher.spawn().await {
-                    tracing::error!("AST Watcher failed: {}", e);
-                }
-            });
-
-            spawn_web_graph(std::sync::Arc::clone(&registry), web_port);
-
-            server::stdio::run(registry).await?;
+        Some(Commands::Daemon { socket, web_port }) => {
+            let socket = socket
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(daemon_socket_path);
+            server::daemon::run(&socket, web_port).await?;
         }
 
         Some(Commands::Web { workspace, port }) => {
@@ -298,4 +270,52 @@ fn spawn_web_graph(registry: std::sync::Arc<store::CrateRegistry>, port: u16) {
             tracing::warn!("Web graph unavailable: {e:#}");
         }
     });
+}
+
+/// Where the daemon listens and where `serve` looks for it.
+fn daemon_socket_path() -> std::path::PathBuf {
+    if let Ok(p) = std::env::var("AXON_SOCKET") {
+        return std::path::PathBuf::from(p);
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    std::path::PathBuf::from(home)
+        .join(".axon")
+        .join("daemon.sock")
+}
+
+/// Serve an MCP session: bridge to the shared daemon if one is running, else run
+/// the standalone in-process server (which also hosts the local web graph).
+async fn serve_or_bridge(workspace: String, web_port: u16) -> Result<()> {
+    let socket = daemon_socket_path();
+    match server::bridge::try_bridge(&socket, &workspace).await {
+        Ok(true) => Ok(()),
+        Ok(false) => run_standalone(workspace, web_port).await,
+        Err(e) => {
+            tracing::warn!("daemon bridge failed ({e:#}); running standalone");
+            run_standalone(workspace, web_port).await
+        }
+    }
+}
+
+/// The original single-workspace in-process server: builds a registry, starts a
+/// watcher and the web graph, and serves MCP over stdio.
+async fn run_standalone(workspace: String, web_port: u16) -> Result<()> {
+    let registry = std::sync::Arc::new(store::CrateRegistry::open(std::path::Path::new(
+        &workspace,
+    ))?);
+    tracing::info!(
+        "Axon Server starting for workspace: {} ({} crate(s))",
+        workspace,
+        registry.crates().len()
+    );
+
+    let watcher = server::watcher::ActualStateWatcher::new(std::sync::Arc::clone(&registry));
+    tokio::spawn(async move {
+        if let Err(e) = watcher.spawn().await {
+            tracing::error!("AST Watcher failed: {}", e);
+        }
+    });
+
+    spawn_web_graph(std::sync::Arc::clone(&registry), web_port);
+    server::stdio::run(registry).await
 }

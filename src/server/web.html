@@ -399,6 +399,10 @@
       <h1>Axon</h1>
       <div id="subtitle">Live Rust architecture overview</div>
     </div>
+    <label class="search" id="workspace-field" style="display:none">
+      <span>Workspace</span>
+      <select id="workspace"></select>
+    </label>
     <label class="search">
       <span>Search</span>
       <input id="search" type="search" autocomplete="off" placeholder="crate, module, struct, path" />
@@ -474,13 +478,45 @@
       lastLayout: null,
     };
 
-    fetch('/api/graph')
-      .then(response => response.json())
-      .then(render)
-      .catch(error => {
-        details.textContent = String(error);
-        hoverReadout.textContent = 'Load failed';
-      });
+    const workspaceField = document.getElementById('workspace-field');
+    const workspaceSelect = document.getElementById('workspace');
+
+    function loadGraph(workspace) {
+      const url = workspace
+        ? '/api/graph?workspace=' + encodeURIComponent(workspace)
+        : '/api/graph';
+      fetch(url)
+        .then(response => response.json())
+        .then(render)
+        .catch(error => {
+          details.textContent = String(error);
+          hoverReadout.textContent = 'Load failed';
+        });
+    }
+
+    // When served by the daemon, /api/workspaces lists every loaded workspace
+    // and a selector switches between them. The standalone server has no such
+    // endpoint, so we hide the selector and load its single graph.
+    fetch('/api/workspaces')
+      .then(response => (response.ok ? response.json() : Promise.reject()))
+      .then(data => {
+        const list = (data && data.workspaces) || [];
+        if (list.length > 1) {
+          workspaceSelect.innerHTML = '';
+          list.forEach(ws => {
+            const option = document.createElement('option');
+            option.value = ws.workspace;
+            option.textContent = ws.name + ' (' + ws.crates + (ws.crates === 1 ? ' crate)' : ' crates)');
+            workspaceSelect.appendChild(option);
+          });
+          workspaceField.style.display = '';
+          workspaceSelect.addEventListener('change', () => loadGraph(workspaceSelect.value));
+          loadGraph(list[0].workspace);
+        } else {
+          loadGraph(list.length === 1 ? list[0].workspace : null);
+        }
+      })
+      .catch(() => loadGraph(null));
 
     search.addEventListener('input', draw);
     Object.values(toggles).forEach(toggle => toggle.addEventListener('change', draw));

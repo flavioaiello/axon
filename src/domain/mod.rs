@@ -1,6 +1,7 @@
 pub mod analyze;
 pub mod model;
 pub mod rust_syn;
+pub mod rustdoc;
 pub mod scanner;
 
 /// Convert PascalCase / camelCase to snake_case.

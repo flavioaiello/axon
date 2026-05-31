@@ -71,7 +71,10 @@ pub async fn run(registry: std::sync::Arc<CrateRegistry>) -> Result<()> {
     Ok(())
 }
 
-fn handle_request_with_registry(registry: &CrateRegistry, req: &JsonRpcRequest) -> JsonRpcResponse {
+pub(crate) fn handle_request_with_registry(
+    registry: &CrateRegistry,
+    req: &JsonRpcRequest,
+) -> JsonRpcResponse {
     if req.method != "tools/call" {
         let primary = registry.primary();
         let workspace_path = primary.workspace_key();

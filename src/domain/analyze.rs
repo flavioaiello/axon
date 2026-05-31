@@ -129,7 +129,6 @@ pub struct DiscoveredStruct {
     pub file_path: String,
     pub extends: Vec<String>,
     pub implements: Vec<String>,
-    pub decorators: Vec<String>,
 }
 
 /// A method discovered from an impl block.
@@ -145,7 +144,6 @@ pub struct DiscoveredMethod {
     pub file_path: String,
     pub extends: Vec<String>,
     pub implements: Vec<String>,
-    pub decorators: Vec<String>,
 }
 
 /// An enum discovered in the source code with its variants.
@@ -159,7 +157,37 @@ pub struct DiscoveredEnum {
     pub file_path: String,
     pub extends: Vec<String>,
     pub implements: Vec<String>,
-    pub decorators: Vec<String>,
+}
+
+/// A trait discovered in the source code.
+///
+/// In idiomatic Rust, a `trait` is how a bounded context expresses a DDD *port*:
+/// a repository, gateway, or domain-service contract that is depended upon
+/// abstractly. The concrete `struct`s that `impl` the trait are its adapters,
+/// linked back to it via `implements` AST edges.
+#[derive(Debug, Clone)]
+pub struct DiscoveredTrait {
+    pub name: String,
+    pub start_line: usize,
+    pub end_line: usize,
+    /// Method signatures the trait declares (owner is the trait name).
+    pub methods: Vec<DiscoveredMethod>,
+    /// Supertraits / bounds, e.g. `trait Foo: Bar` → `["Bar"]`.
+    pub supertraits: Vec<String>,
+    pub file_path: String,
+}
+
+/// A free (module-level) function discovered in the AST.
+///
+/// Distinct from [`DiscoveredMethod`], which is always attached to an `impl` or
+/// trait owner. Free functions are common in Rust for domain operations and
+/// factories, so they are surfaced as `function` symbols in the graph.
+#[derive(Debug, Clone)]
+pub struct DiscoveredFunction {
+    pub name: String,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub file_path: String,
 }
 
 /// A module declaration discovered in the AST.
@@ -170,7 +198,20 @@ pub struct DiscoveredModule {
     pub file_path: String,
     pub extends: Vec<String>,
     pub implements: Vec<String>,
-    pub decorators: Vec<String>,
+}
+
+/// A compiler directive / attribute discovered on a source item or field.
+///
+/// Captured for items of **any** visibility (and for struct fields / enum
+/// variants), independent of the public-API symbol scan, so directives like
+/// `#[allow(dead_code)]` on private items are still indexed. `owner` is the
+/// annotated symbol (`Owner::method`, `Owner.field`, or a bare name); `directive`
+/// is the normalized text (`allow(dead_code)`, `cfg(feature = "x")`, `Debug`).
+#[derive(Debug, Clone)]
+pub struct DiscoveredDirective {
+    pub owner: String,
+    pub directive: String,
+    pub line: usize,
 }
 
 /// Everything discovered in source files under a single bounded context's module path.
@@ -187,12 +228,13 @@ pub struct ContextScan {
 // ─── Inline Rust scanner (used by test suite only) ─────────────────────────
 
 #[cfg(test)]
-/// AST visitor that collects struct definitions, enums, modules, and impl methods.
+/// AST visitor that collects struct definitions, enums, modules, traits, and impl methods.
 struct StructMethodVisitor {
     structs: Vec<DiscoveredStruct>,
     enums: Vec<DiscoveredEnum>,
     methods: Vec<DiscoveredMethod>,
     modules: Vec<DiscoveredModule>,
+    traits: Vec<DiscoveredTrait>,
     file_path: String,
 }
 
@@ -220,7 +262,19 @@ impl<'ast> Visit<'ast> for StructMethodVisitor {
                     })
                 })
                 .collect(),
-            _ => vec![],
+            // Tuple structs / newtypes: keep positional inner types.
+            syn::Fields::Unnamed(unnamed) => unnamed
+                .unnamed
+                .iter()
+                .enumerate()
+                .map(|(i, f)| Field {
+                    name: i.to_string(),
+                    field_type: type_to_string(&f.ty),
+                    required: !is_option_type(&f.ty),
+                    description: String::new(),
+                })
+                .collect(),
+            syn::Fields::Unit => vec![],
         };
 
         self.structs.push(DiscoveredStruct {
@@ -231,7 +285,6 @@ impl<'ast> Visit<'ast> for StructMethodVisitor {
             file_path: self.file_path.clone(),
             extends: vec![],
             implements: vec![],
-            decorators: vec![],
         });
 
         syn::visit::visit_item_struct(self, node);
@@ -284,7 +337,6 @@ impl<'ast> Visit<'ast> for StructMethodVisitor {
             file_path: self.file_path.clone(),
             extends: vec![],
             implements: vec![],
-            decorators: vec![],
         });
 
         syn::visit::visit_item_enum(self, node);
@@ -301,9 +353,63 @@ impl<'ast> Visit<'ast> for StructMethodVisitor {
             file_path: self.file_path.clone(),
             extends: vec![],
             implements: vec![],
-            decorators: vec![],
         });
         syn::visit::visit_item_mod(self, node);
+    }
+
+    fn visit_item_trait(&mut self, node: &'ast syn::ItemTrait) {
+        if !is_public(&node.vis) || has_cfg_test(&node.attrs) {
+            return;
+        }
+        let name = node.ident.to_string();
+        let supertraits = node
+            .supertraits
+            .iter()
+            .filter_map(|bound| match bound {
+                syn::TypeParamBound::Trait(t) => Some(
+                    t.path
+                        .segments
+                        .iter()
+                        .map(|s| s.ident.to_string())
+                        .collect::<Vec<_>>()
+                        .join("::"),
+                ),
+                _ => None,
+            })
+            .collect();
+        let methods = node
+            .items
+            .iter()
+            .filter_map(|item| {
+                let syn::TraitItem::Fn(method) = item else {
+                    return None;
+                };
+                let return_type = match &method.sig.output {
+                    syn::ReturnType::Default => String::new(),
+                    syn::ReturnType::Type(_, ty) => type_to_string(ty),
+                };
+                Some(DiscoveredMethod {
+                    owner: name.clone(),
+                    name: method.sig.ident.to_string(),
+                    start_line: method.sig.span().start().line,
+                    end_line: method.sig.span().end().line,
+                    parameters: vec![],
+                    return_type,
+                    file_path: self.file_path.clone(),
+                    extends: vec![],
+                    implements: vec![],
+                })
+            })
+            .collect();
+        self.traits.push(DiscoveredTrait {
+            name,
+            start_line: node.span().start().line,
+            end_line: node.span().end().line,
+            methods,
+            supertraits,
+            file_path: self.file_path.clone(),
+        });
+        syn::visit::visit_item_trait(self, node);
     }
 
     fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
@@ -358,7 +464,6 @@ impl<'ast> Visit<'ast> for StructMethodVisitor {
                     file_path: self.file_path.clone(),
                     extends: vec![],
                     implements: vec![],
-                    decorators: vec![],
                 });
             }
         }
@@ -378,6 +483,7 @@ fn scan_file(file_path: &Path, source_code: &str) -> Result<ScanResult> {
         enums: vec![],
         methods: vec![],
         modules: vec![],
+        traits: vec![],
         file_path: file_path.to_string_lossy().to_string(),
     };
     visitor.visit_file(&syntax_tree);
@@ -387,42 +493,8 @@ fn scan_file(file_path: &Path, source_code: &str) -> Result<ScanResult> {
         visitor.enums,
         visitor.methods,
         visitor.modules,
+        visitor.traits,
     ))
-}
-
-/// Scan all supported source files under a directory and collect structs, enums, methods, and modules.
-fn scan_directory(dir: &Path) -> Result<ScanResult> {
-    let mut all_structs = Vec::new();
-    let mut all_enums = Vec::new();
-    let mut all_methods = Vec::new();
-    let mut all_modules = Vec::new();
-
-    if !dir.exists() {
-        return Ok((all_structs, all_enums, all_methods, all_modules));
-    }
-
-    for entry in ignore::WalkBuilder::new(dir).build() {
-        let entry =
-            entry.with_context(|| format!("Failed to walk source directory: {}", dir.display()))?;
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        let Some(scanner) = scanner_for_path(path) else {
-            continue;
-        };
-        let content = std::fs::read_to_string(path)
-            .with_context(|| format!("Failed to read source file: {}", path.display()))?;
-        let (structs, enums, methods, modules) = scanner
-            .scan_file(path, &content)
-            .with_context(|| format!("Failed to scan source file: {}", path.display()))?;
-        all_structs.extend(structs);
-        all_enums.extend(enums);
-        all_methods.extend(methods);
-        all_modules.extend(modules);
-    }
-
-    Ok((all_structs, all_enums, all_methods, all_modules))
 }
 
 // ─── Crate Discovery ──────────────────────────────────────────────────────
@@ -507,7 +579,28 @@ pub type ScanResult = (
     Vec<DiscoveredEnum>,
     Vec<DiscoveredMethod>,
     Vec<DiscoveredModule>,
+    Vec<DiscoveredTrait>,
 );
+
+/// Everything extracted from a single source file in **one** parse.
+///
+/// Produced by [`crate::domain::scanner::AstScanner::scan_source`]. Bundling
+/// symbols, imports, and calls lets the caller walk each file once and parse it
+/// once, instead of re-reading and re-parsing it for each extractor.
+#[derive(Debug, Clone, Default)]
+pub struct FileScan {
+    pub structs: Vec<DiscoveredStruct>,
+    pub enums: Vec<DiscoveredEnum>,
+    pub methods: Vec<DiscoveredMethod>,
+    pub modules: Vec<DiscoveredModule>,
+    pub traits: Vec<DiscoveredTrait>,
+    pub functions: Vec<DiscoveredFunction>,
+    pub imports: Vec<LiveDependency>,
+    pub calls: Vec<CallInfo>,
+    /// Compiler directives on items/fields of any visibility (see
+    /// [`DiscoveredDirective`]). Decoupled from the public-only symbol vectors.
+    pub directives: Vec<DiscoveredDirective>,
+}
 
 /// Classification of a discovered struct based on naming conventions and
 /// structural heuristics. Used when no enrichment model is available or when a
@@ -526,7 +619,7 @@ enum StructKind {
 /// Priority order:
 /// 1. Suffix-matched naming conventions (strongest signal)
 /// 2. Structural shape (fields vs methods vs both)
-fn classify_struct(name: &str, fields: &[Field], methods: &[DiscoveredMethod]) -> StructKind {
+fn classify_struct(name: &str, fields: &[Field], has_methods: bool) -> StructKind {
     let upper = name.to_uppercase();
 
     // ── Guard: ontology-definition structs are pure data models, not DDD roles ──
@@ -572,8 +665,6 @@ fn classify_struct(name: &str, fields: &[Field], methods: &[DiscoveredMethod]) -
     }
 
     // ── Structural heuristics ──
-    let struct_methods: Vec<_> = methods.iter().filter(|m| m.owner == name).collect();
-
     // Fields that carry domain data (not framework wiring)
     let has_data_fields = fields.iter().any(|f| {
         !f.field_type.starts_with("Arc<")
@@ -582,10 +673,10 @@ fn classify_struct(name: &str, fields: &[Field], methods: &[DiscoveredMethod]) -
             && !f.field_type.starts_with("&")
     });
 
-    if !has_data_fields && !struct_methods.is_empty() {
+    if !has_data_fields && has_methods {
         return StructKind::Service;
     }
-    if has_data_fields && !struct_methods.is_empty() {
+    if has_data_fields && has_methods {
         return StructKind::Entity;
     }
 
@@ -612,6 +703,74 @@ fn classify_enum(name: &str) -> StructKind {
 
     // Enums are natural value objects — closed set of named values
     StructKind::ValueObject
+}
+
+/// Infer an architectural layer for a bounded context from its module name,
+/// using the same naming-convention approach as [`classify_struct`].
+///
+/// Clean / Hexagonal / Onion architectures all share a conventional vocabulary
+/// for the rings (`domain`, `application`, `infrastructure`, presentation). When
+/// a context directory follows that vocabulary we can assign its layer with no
+/// hand-written policy. Names that match no convention return `None` so callers
+/// leave them unassigned rather than guessing.
+pub fn classify_layer(name: &str) -> Option<&'static str> {
+    match name.to_lowercase().as_str() {
+        "domain" | "core" | "model" | "models" | "entity" | "entities" | "domain_model" => {
+            Some("domain")
+        }
+        "application" | "app" | "usecase" | "usecases" | "use_case" | "use_cases" | "service"
+        | "services" | "handler" | "handlers" | "interactor" | "interactors" => Some("application"),
+        "infrastructure" | "infra" | "adapter" | "adapters" | "persistence" | "repository"
+        | "repositories" | "repo" | "repos" | "gateway" | "gateways" | "db" | "database"
+        | "store" | "stores" => Some("infrastructure"),
+        "api" | "web" | "http" | "rest" | "grpc" | "interface" | "interfaces" | "presentation"
+        | "ui" | "controller" | "controllers" => Some("presentation"),
+        _ => None,
+    }
+}
+
+/// The typed DDD role a `trait` (port) plays, inferred from its name.
+///
+/// A trait *is* the Rust expression of a port; this maps it onto the existing
+/// typed building blocks so a trait-defined repository/service shows up in the
+/// typed model (and thus in `reconstruct_model`/export), not just as a `trait`
+/// symbol. `None` keeps generic traits as ports in the symbol graph only.
+enum PortRole {
+    Repository,
+    Service(ServiceKind),
+    None,
+}
+
+fn classify_trait_port(name: &str) -> PortRole {
+    let upper = name.to_uppercase();
+    if upper.ends_with("REPOSITORY") || upper.ends_with("REPO") || upper.ends_with("STORE") {
+        PortRole::Repository
+    } else if upper.ends_with("GATEWAY") || upper.ends_with("CLIENT") {
+        // Gateways/clients are infrastructure-facing ports.
+        PortRole::Service(ServiceKind::Infrastructure)
+    } else if upper.ends_with("SERVICE")
+        || upper.ends_with("HANDLER")
+        || upper.ends_with("USECASE")
+        || upper.ends_with("INTERACTOR")
+        || upper.ends_with("PORT")
+    {
+        PortRole::Service(ServiceKind::Domain)
+    } else {
+        PortRole::None
+    }
+}
+
+/// Strip a repository-suffix to recover the aggregate a port manages
+/// (`OrderRepository` → `Order`). Falls back to the full name.
+fn aggregate_from_repo_name(name: &str) -> String {
+    for suffix in ["Repository", "Repo", "Store"] {
+        if let Some(stripped) = name.strip_suffix(suffix) {
+            if !stripped.is_empty() {
+                return stripped.to_string();
+            }
+        }
+    }
+    name.to_string()
 }
 
 // ─── Full Workspace Scan ───────────────────────────────────────────────────
@@ -726,10 +885,16 @@ pub fn scan_actual_model(
         let mut context_imports: Vec<(String, Vec<LiveDependency>)> = Vec::new();
 
         for (ctx_name, scan_dir, module_path) in &module_dirs {
-            let (structs, enums, methods, discovered_modules) = scan_directory(scan_dir)?;
-
-            // Extract file-level imports from this context's directory
+            // Single pass over the context's files: each file is read once and
+            // parsed once, yielding symbols, imports, and calls together.
+            let mut structs = Vec::new();
+            let mut enums = Vec::new();
+            let mut methods = Vec::new();
+            let mut discovered_modules = Vec::new();
+            let mut traits = Vec::new();
+            let mut functions = Vec::new();
             let mut ctx_deps = Vec::new();
+
             if scan_dir.exists() {
                 for entry in ignore::WalkBuilder::new(scan_dir).build() {
                     let entry = entry.with_context(|| {
@@ -746,38 +911,34 @@ pub fn scan_actual_model(
                         format!("Failed to read source file: {}", path.display())
                     })?;
 
-                    // Collect source file
                     let rel_path = path
                         .strip_prefix(workspace_root)
                         .unwrap_or(path)
                         .to_string_lossy()
                         .to_string();
+
+                    let scan = scanner.scan_source(path, &content).with_context(|| {
+                        format!("Failed to scan source file: {}", path.display())
+                    })?;
+
                     actual.source_files.push(SourceFile {
                         path: rel_path.clone(),
                         context: ctx_name.clone(),
                         language: "rust".to_string(),
                     });
 
-                    // Collect imports and import edges
-                    let deps = scanner
-                        .extract_live_dependencies(path, &content)
-                        .with_context(|| {
-                            format!("Failed to extract imports from: {}", path.display())
-                        })?;
-                    for dep in &deps {
+                    // Import edges
+                    for dep in &scan.imports {
                         actual.import_edges.push(ImportEdge {
                             from_file: rel_path.clone(),
                             to_module: dep.to_module.clone(),
                             context: ctx_name.clone(),
                         });
                     }
-                    ctx_deps.extend(deps);
+                    ctx_deps.extend(scan.imports);
 
-                    // Collect call edges
-                    let file_calls = scanner.extract_calls(path, &content).with_context(|| {
-                        format!("Failed to extract calls from: {}", path.display())
-                    })?;
-                    for ci in file_calls {
+                    // Call edges
+                    for ci in scan.calls {
                         actual.call_edges.push(CallEdge {
                             caller: ci.caller,
                             callee: ci.callee,
@@ -786,6 +947,28 @@ pub fn scan_actual_model(
                             context: ctx_name.clone(),
                         });
                     }
+
+                    // Directive edges (lints, cfg, derives) on items/fields of any
+                    // visibility — the sole source of `decorators` edges, carrying
+                    // the declaration location so a `to="dead_code"` query is
+                    // actionable.
+                    for d in scan.directives {
+                        actual.ast_edges.push(crate::domain::model::ASTEdge {
+                            from_node: d.owner,
+                            to_node: d.directive,
+                            edge_type: "decorators".into(),
+                            file_path: rel_path.clone(),
+                            line: d.line,
+                        });
+                    }
+
+                    // Symbols
+                    structs.extend(scan.structs);
+                    enums.extend(scan.enums);
+                    methods.extend(scan.methods);
+                    discovered_modules.extend(scan.modules);
+                    traits.extend(scan.traits);
+                    functions.extend(scan.functions);
                 }
             }
             context_imports.push((ctx_name.clone(), ctx_deps));
@@ -833,13 +1016,28 @@ pub fn scan_actual_model(
                 api_endpoints: desired_bc.map_or(vec![], |b| b.api_endpoints.clone()),
             };
 
+            // Index methods by their owning type once, so collecting a struct's
+            // methods is a hash lookup instead of a full scan per struct
+            // (was O(structs × methods); now O(structs + methods)).
+            let mut methods_by_owner: std::collections::HashMap<&str, Vec<&DiscoveredMethod>> =
+                std::collections::HashMap::new();
+            for m in &methods {
+                methods_by_owner
+                    .entry(m.owner.as_str())
+                    .or_default()
+                    .push(m);
+            }
+
             for discovered in &structs {
                 let name = &discovered.name;
 
-                // Collect public methods for this struct
-                let struct_methods: Vec<Method> = methods
+                // Collect public methods for this struct from the owner index.
+                let owned_methods: &[&DiscoveredMethod] = methods_by_owner
+                    .get(name.as_str())
+                    .map(|v| v.as_slice())
+                    .unwrap_or(&[]);
+                let struct_methods: Vec<Method> = owned_methods
                     .iter()
-                    .filter(|m| m.owner == *name)
                     .map(|m| Method {
                         name: m.name.clone(),
                         description: String::new(),
@@ -885,8 +1083,9 @@ pub fn scan_actual_model(
                 });
 
                 // Use desired classification when available, otherwise heuristic
-                let kind = desired_kind
-                    .unwrap_or_else(|| classify_struct(name, &discovered.fields, &methods));
+                let kind = desired_kind.unwrap_or_else(|| {
+                    classify_struct(name, &discovered.fields, !owned_methods.is_empty())
+                });
 
                 match kind {
                     StructKind::Entity => {
@@ -1164,16 +1363,140 @@ pub fn scan_actual_model(
                     visibility: "public".to_string(),
                 });
             }
+            // Traits are Rust's expression of DDD ports (repository / gateway /
+            // domain-service interfaces). Surface each trait as a first-class
+            // `trait` symbol and its declared operations as `method` symbols, so
+            // the graph carries the abstraction boundary, not just the adapters.
+            for t in &traits {
+                let rel_path = std::path::Path::new(&t.file_path)
+                    .strip_prefix(workspace_root)
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| t.file_path.clone());
+                actual.symbols.push(SymbolDef {
+                    name: t.name.clone(),
+                    kind: "trait".to_string(),
+                    context: ctx_name.clone(),
+                    file_path: rel_path.clone(),
+                    start_line: t.start_line,
+                    end_line: t.end_line,
+                    visibility: "public".to_string(),
+                });
+                for m in &t.methods {
+                    actual.symbols.push(SymbolDef {
+                        name: format!("{}::{}", m.owner, m.name),
+                        kind: "method".to_string(),
+                        context: ctx_name.clone(),
+                        file_path: rel_path.clone(),
+                        start_line: m.start_line,
+                        end_line: m.end_line,
+                        visibility: "public".to_string(),
+                    });
+                }
+                // Supertrait bounds become `implements` edges (port → supertrait),
+                // mirroring how adapter structs link to the traits they implement.
+                for sup in &t.supertraits {
+                    actual.ast_edges.push(crate::domain::model::ASTEdge {
+                        from_node: t.name.clone(),
+                        to_node: sup.clone(),
+                        edge_type: "implements".to_string(),
+                        file_path: rel_path.clone(),
+                        line: t.start_line,
+                    });
+                }
+
+                // Fold trait-defined ports into the typed building blocks so the
+                // reconstructed model sees them as repositories/services, reusing
+                // those vectors' existing persistence. Dedup by name so a port
+                // and a like-named struct adapter aren't double-listed.
+                let port_methods = || -> Vec<Method> {
+                    t.methods
+                        .iter()
+                        .map(|m| Method {
+                            name: m.name.clone(),
+                            description: String::new(),
+                            parameters: m.parameters.clone(),
+                            return_type: m.return_type.clone(),
+                            file_path: Some(rel_path.clone()),
+                            start_line: Some(m.start_line),
+                            end_line: Some(m.end_line),
+                        })
+                        .collect()
+                };
+                match classify_trait_port(&t.name) {
+                    PortRole::Repository => {
+                        if !bc
+                            .repositories
+                            .iter()
+                            .any(|r| r.name.eq_ignore_ascii_case(&t.name))
+                        {
+                            bc.repositories.push(Repository {
+                                name: t.name.clone(),
+                                aggregate: aggregate_from_repo_name(&t.name),
+                                methods: port_methods(),
+                                file_path: Some(rel_path.clone()),
+                                start_line: Some(t.start_line),
+                                end_line: Some(t.end_line),
+                            });
+                        }
+                    }
+                    PortRole::Service(kind) => {
+                        if !bc
+                            .services
+                            .iter()
+                            .any(|s| s.name.eq_ignore_ascii_case(&t.name))
+                        {
+                            bc.services.push(Service {
+                                name: t.name.clone(),
+                                description: String::new(),
+                                kind,
+                                methods: port_methods(),
+                                dependencies: vec![],
+                                file_path: Some(rel_path.clone()),
+                                start_line: Some(t.start_line),
+                                end_line: Some(t.end_line),
+                            });
+                        }
+                    }
+                    PortRole::None => {}
+                }
+            }
+
+            // Free functions are surfaced as `function` symbols (domain
+            // operations / factories that live outside any impl or trait).
+            for f in &functions {
+                let rel_path = std::path::Path::new(&f.file_path)
+                    .strip_prefix(workspace_root)
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| f.file_path.clone());
+                actual.symbols.push(SymbolDef {
+                    name: f.name.clone(),
+                    kind: "function".to_string(),
+                    context: ctx_name.clone(),
+                    file_path: rel_path,
+                    start_line: f.start_line,
+                    end_line: f.end_line,
+                    visibility: "public".to_string(),
+                });
+            }
 
             actual.bounded_contexts.push(bc);
 
-            // Harvest structural AST edges reported by the Rust scanner.
+            // Harvest structural AST edges (extends / implements) reported by the
+            // Rust scanner. Directive (`decorators`) edges are emitted per-file
+            // above from `scan.directives`, so they carry a location and cover
+            // items of any visibility — they are not re-derived here.
             for s in &structs {
+                let rel_path = std::path::Path::new(&s.file_path)
+                    .strip_prefix(workspace_root)
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| s.file_path.clone());
                 for ext in &s.extends {
                     actual.ast_edges.push(crate::domain::model::ASTEdge {
                         from_node: s.name.clone(),
                         to_node: ext.clone(),
                         edge_type: "extends".into(),
+                        file_path: rel_path.clone(),
+                        line: s.start_line,
                     });
                 }
                 for imp in &s.implements {
@@ -1181,22 +1504,23 @@ pub fn scan_actual_model(
                         from_node: s.name.clone(),
                         to_node: imp.clone(),
                         edge_type: "implements".into(),
-                    });
-                }
-                for dec in &s.decorators {
-                    actual.ast_edges.push(crate::domain::model::ASTEdge {
-                        from_node: s.name.clone(),
-                        to_node: dec.clone(),
-                        edge_type: "decorators".into(),
+                        file_path: rel_path.clone(),
+                        line: s.start_line,
                     });
                 }
             }
             for e in &enums {
+                let rel_path = std::path::Path::new(&e.file_path)
+                    .strip_prefix(workspace_root)
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| e.file_path.clone());
                 for ext in &e.extends {
                     actual.ast_edges.push(crate::domain::model::ASTEdge {
                         from_node: e.name.clone(),
                         to_node: ext.clone(),
                         edge_type: "extends".into(),
+                        file_path: rel_path.clone(),
+                        line: e.start_line,
                     });
                 }
                 for imp in &e.implements {
@@ -1204,27 +1528,27 @@ pub fn scan_actual_model(
                         from_node: e.name.clone(),
                         to_node: imp.clone(),
                         edge_type: "implements".into(),
-                    });
-                }
-                for dec in &e.decorators {
-                    actual.ast_edges.push(crate::domain::model::ASTEdge {
-                        from_node: e.name.clone(),
-                        to_node: dec.clone(),
-                        edge_type: "decorators".into(),
+                        file_path: rel_path.clone(),
+                        line: e.start_line,
                     });
                 }
             }
         }
 
         // ── Infer context dependencies from collected imports ──────────────
-        let all_ctx_names: Vec<String> = actual
+        // Lowercased context name → canonical name, so resolving an import's
+        // first segment is an O(1) lookup instead of two linear scans per import
+        // (was O(imports × contexts); now O(imports)).
+        let ctx_by_lower: std::collections::HashMap<String, String> = actual
             .bounded_contexts
             .iter()
-            .map(|bc| bc.name.clone())
+            .map(|bc| (bc.name.to_ascii_lowercase(), bc.name.clone()))
             .collect();
 
         for (ctx_name, imports) in &context_imports {
+            let ctx_lower = ctx_name.to_ascii_lowercase();
             let mut inferred_deps: Vec<String> = Vec::new();
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
             for dep in imports {
                 // Extract the first meaningful module segment from the Rust import path.
                 let raw = &dep.to_module;
@@ -1239,23 +1563,19 @@ pub fn scan_actual_model(
                     raw.split("::").next().unwrap_or(raw)
                 };
 
-                // Map to a known context name (skip self-references)
-                if !first_segment.is_empty()
-                    && !first_segment.eq_ignore_ascii_case(ctx_name)
-                    && all_ctx_names
-                        .iter()
-                        .any(|c| c.eq_ignore_ascii_case(first_segment))
-                    && !inferred_deps
-                        .iter()
-                        .any(|d| d.eq_ignore_ascii_case(first_segment))
-                {
-                    // Use the canonical context name
-                    if let Some(canonical) = all_ctx_names
-                        .iter()
-                        .find(|c| c.eq_ignore_ascii_case(first_segment))
-                    {
-                        inferred_deps.push(canonical.clone());
-                    }
+                if first_segment.is_empty() {
+                    continue;
+                }
+                let seg_lower = first_segment.to_ascii_lowercase();
+                if seg_lower == ctx_lower {
+                    continue; // skip self-references
+                }
+                // Map to a known context name, deduping via `seen`.
+                let Some(canonical) = ctx_by_lower.get(&seg_lower) else {
+                    continue;
+                };
+                if seen.insert(seg_lower) {
+                    inferred_deps.push(canonical.clone());
                 }
             }
 
@@ -1412,7 +1732,7 @@ mod tests {
                 pub age: u32,
             }
         "#;
-        let (structs, _, _, _) = scan_file(Path::new("test.rs"), code).unwrap();
+        let (structs, _, _, _, _) = scan_file(Path::new("test.rs"), code).unwrap();
         assert_eq!(structs.len(), 1);
         assert_eq!(structs[0].name, "User");
         assert_eq!(structs[0].fields.len(), 3);
@@ -1431,7 +1751,7 @@ mod tests {
                 fn private_helper(&self) {} // should be ignored
             }
         "#;
-        let (structs, _, methods, _) = scan_file(Path::new("test.rs"), code).unwrap();
+        let (structs, _, methods, _, _) = scan_file(Path::new("test.rs"), code).unwrap();
         assert_eq!(structs.len(), 1);
         assert_eq!(methods.len(), 2); // only public methods
         assert_eq!(methods[0].owner, "Store");
@@ -1447,7 +1767,7 @@ mod tests {
             struct PrivateStruct { x: i32 }
             pub struct PublicStruct { pub y: i32 }
         "#;
-        let (structs, _, _, _) = scan_file(Path::new("test.rs"), code).unwrap();
+        let (structs, _, _, _, _) = scan_file(Path::new("test.rs"), code).unwrap();
         assert_eq!(structs.len(), 1);
         assert_eq!(structs[0].name, "PublicStruct");
     }
@@ -1465,7 +1785,7 @@ mod tests {
                 }
             }
         "#;
-        let (_, _, methods, _) = scan_file(Path::new("test.rs"), code).unwrap();
+        let (_, _, methods, _, _) = scan_file(Path::new("test.rs"), code).unwrap();
         assert_eq!(methods.len(), 1); // only inherent impl
         assert_eq!(methods[0].name, "bar");
     }
@@ -1474,28 +1794,31 @@ mod tests {
     fn test_classify_struct_naming_conventions() {
         // Repository suffix
         assert_eq!(
-            classify_struct("UserRepository", &[], &[]),
+            classify_struct("UserRepository", &[], false),
             StructKind::Repository,
         );
         assert_eq!(
-            classify_struct("OrderRepo", &[], &[]),
+            classify_struct("OrderRepo", &[], false),
             StructKind::Repository,
         );
 
         // Service suffix
         assert_eq!(
-            classify_struct("PaymentService", &[], &[]),
+            classify_struct("PaymentService", &[], false),
             StructKind::Service,
         );
         assert_eq!(
-            classify_struct("AuthHandler", &[], &[]),
+            classify_struct("AuthHandler", &[], false),
             StructKind::Service,
         );
 
         // Event suffix
-        assert_eq!(classify_struct("OrderCreated", &[], &[]), StructKind::Event,);
         assert_eq!(
-            classify_struct("UserDeletedEvent", &[], &[]),
+            classify_struct("OrderCreated", &[], false),
+            StructKind::Event,
+        );
+        assert_eq!(
+            classify_struct("UserDeletedEvent", &[], false),
             StructKind::Event,
         );
     }
@@ -1524,26 +1847,41 @@ mod tests {
             end_line: 0,
             extends: vec![],
             implements: vec![],
-            decorators: vec![],
         }];
 
         // Data fields + methods → Entity
         assert_eq!(
-            classify_struct("Foo", &data_fields, &methods),
+            classify_struct("Foo", &data_fields, true),
             StructKind::Entity,
         );
 
         // Data fields, no methods → ValueObject
         assert_eq!(
-            classify_struct("Foo", &data_fields, &[]),
+            classify_struct("Foo", &data_fields, false),
             StructKind::ValueObject,
         );
 
         // Only dependency fields + methods → Service
         assert_eq!(
-            classify_struct("Foo", &dep_fields, &methods),
+            classify_struct("Foo", &dep_fields, true),
             StructKind::Service,
         );
+    }
+
+    #[test]
+    fn test_classify_layer_naming_conventions() {
+        assert_eq!(classify_layer("domain"), Some("domain"));
+        assert_eq!(classify_layer("Core"), Some("domain"));
+        assert_eq!(classify_layer("application"), Some("application"));
+        assert_eq!(classify_layer("services"), Some("application"));
+        assert_eq!(classify_layer("infrastructure"), Some("infrastructure"));
+        assert_eq!(classify_layer("adapters"), Some("infrastructure"));
+        assert_eq!(classify_layer("store"), Some("infrastructure"));
+        assert_eq!(classify_layer("api"), Some("presentation"));
+        assert_eq!(classify_layer("controllers"), Some("presentation"));
+        // Unconventional names stay unassigned rather than guessing.
+        assert_eq!(classify_layer("billing"), None);
+        assert_eq!(classify_layer("reasoning"), None);
     }
 
     #[test]
@@ -1601,6 +1939,164 @@ impl InvoiceRepository {
             bc.repositories
                 .iter()
                 .any(|r| r.name == "InvoiceRepository")
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_scan_actual_model_captures_traits_as_ports_and_newtypes() {
+        use std::env::temp_dir;
+        use std::fs;
+
+        let tmp = temp_dir().join(format!("axon_traits_test_{}", std::process::id()));
+        let src = tmp.join("src").join("billing");
+        fs::create_dir_all(&src).unwrap();
+
+        fs::write(
+            src.join("ports.rs"),
+            r#"
+pub struct InvoiceId(pub u64);
+
+pub trait InvoiceStore: Send + Sync {
+    fn find(&self, id: InvoiceId) -> Option<String>;
+    fn save(&self, invoice: String);
+}
+
+pub struct PgInvoiceAdapter {
+    pub url: String,
+}
+
+impl InvoiceStore for PgInvoiceAdapter {
+    fn find(&self, id: InvoiceId) -> Option<String> { todo!() }
+    fn save(&self, invoice: String) { todo!() }
+}
+"#,
+        )
+        .unwrap();
+
+        let actual = scan_actual_model(&tmp, None).unwrap();
+
+        // The trait is a first-class `trait` symbol — the port.
+        assert!(
+            actual
+                .symbols
+                .iter()
+                .any(|s| s.kind == "trait" && s.name == "InvoiceStore"),
+            "trait port should be a `trait` symbol, got {:?}",
+            actual
+                .symbols
+                .iter()
+                .map(|s| (s.kind.clone(), s.name.clone()))
+                .collect::<Vec<_>>()
+        );
+        // Its declared operations are `method` symbols (port operations).
+        assert!(
+            actual
+                .symbols
+                .iter()
+                .any(|s| s.kind == "method" && s.name == "InvoiceStore::find")
+        );
+
+        // The adapter struct links to the port via an `implements` edge.
+        assert!(
+            actual.ast_edges.iter().any(|e| e.edge_type == "implements"
+                && e.from_node == "PgInvoiceAdapter"
+                && e.to_node == "InvoiceStore"),
+            "adapter should implement the port, edges: {:?}",
+            actual.ast_edges
+        );
+
+        // Supertrait bounds are captured as `implements` edges from the port.
+        assert!(
+            actual.ast_edges.iter().any(|e| e.edge_type == "implements"
+                && e.from_node == "InvoiceStore"
+                && e.to_node == "Send"),
+            "supertrait bound should be an implements edge, edges: {:?}",
+            actual.ast_edges
+        );
+
+        // Newtype keeps its inner type instead of flattening to zero fields.
+        let id_vo = actual.bounded_contexts[0]
+            .value_objects
+            .iter()
+            .find(|v| v.name == "InvoiceId")
+            .expect("InvoiceId newtype should be a value object with its inner field");
+        assert_eq!(id_vo.fields.len(), 1);
+        assert_eq!(id_vo.fields[0].name, "0");
+        assert!(id_vo.fields[0].field_type.contains("u64"));
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_scan_actual_model_folds_ports_and_free_functions() {
+        use std::env::temp_dir;
+        use std::fs;
+
+        let tmp = temp_dir().join(format!("axon_ports_fold_test_{}", std::process::id()));
+        let src = tmp.join("src").join("billing");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(
+            src.join("lib.rs"),
+            r#"
+pub trait OrderRepository {
+    fn find(&self, id: u64) -> Option<String>;
+}
+
+pub trait PaymentService {
+    fn charge(&self, amount: u64);
+}
+
+pub trait StripeGateway {
+    fn call(&self);
+}
+
+pub fn compute_total(items: &[u64]) -> u64 { todo!() }
+"#,
+        )
+        .unwrap();
+
+        let actual = scan_actual_model(&tmp, None).unwrap();
+        let bc = &actual.bounded_contexts[0];
+
+        // Repository-named trait → typed Repository (port), aggregate inferred.
+        let repo = bc
+            .repositories
+            .iter()
+            .find(|r| r.name == "OrderRepository")
+            .expect("trait repository should fold into typed repositories");
+        assert_eq!(repo.aggregate, "Order");
+        assert_eq!(repo.methods.len(), 1);
+
+        // Service-named trait → typed domain Service.
+        assert!(bc.services.iter().any(|s| s.name == "PaymentService"));
+        // Gateway → infrastructure-facing service.
+        assert!(bc.services.iter().any(|s| {
+            s.name == "StripeGateway" && matches!(s.kind, ServiceKind::Infrastructure)
+        }));
+
+        // Free function → `function` symbol.
+        assert!(
+            actual
+                .symbols
+                .iter()
+                .any(|s| s.kind == "function" && s.name == "compute_total"),
+            "free function should be a `function` symbol, got {:?}",
+            actual
+                .symbols
+                .iter()
+                .filter(|s| s.kind == "function")
+                .map(|s| s.name.clone())
+                .collect::<Vec<_>>()
+        );
+
+        // Ports remain `trait` symbols in the graph as well.
+        assert!(
+            actual
+                .symbols
+                .iter()
+                .any(|s| s.kind == "trait" && s.name == "OrderRepository")
         );
 
         let _ = fs::remove_dir_all(&tmp);

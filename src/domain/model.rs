@@ -4,11 +4,23 @@ use serde::{Deserialize, Serialize};
 // ─── AST Edge ──────────────────────────────────────────────────────────────
 
 /// A structural dependency extracted from source AST (extends, implements, decorators).
+///
+/// For `decorators` edges (compiler directives, lints, derives) `to_node` is the
+/// directive text (e.g. `allow(dead_code)`) and `from_node` is the annotated
+/// symbol — `Owner::method`, `Owner.field`, or a bare type/fn/module name. The
+/// `file_path`/`line` locate the declaration so a single query can list, say,
+/// every `dead_code` flag with a jump target.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ASTEdge {
     pub from_node: String,
     pub to_node: String,
     pub edge_type: String,
+    /// Relative path of the file where the edge is declared.
+    #[serde(default)]
+    pub file_path: String,
+    /// 1-based line of the declaration site (0 when unknown).
+    #[serde(default)]
+    pub line: usize,
 }
 
 /// A source file discovered in the workspace.
@@ -23,11 +35,23 @@ pub struct SourceFile {
 }
 
 /// A Rust symbol discovered in the source code.
+///
+/// Symbols are the model's Rust-aligned node vocabulary. The mapping from Rust
+/// constructs to DDD concepts is:
+///
+/// - `struct` / `enum` → tactical building blocks (entity, value object,
+///   aggregate member, event), refined by `classify_struct`/`classify_enum`.
+/// - `trait` → a **port**: a repository, gateway, or domain-service interface.
+///   The structs that `impl` it are its adapters, linked by `implements`
+///   [`ASTEdge`]s. Capturing traits is what lets the graph represent the
+///   ports-and-adapters boundary, not just concrete types.
+/// - `method` → an operation on a struct (inherent impl) or a trait (port op),
+///   named `Owner::method`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SymbolDef {
     /// Canonical name of the symbol (e.g. "Store", "DomainModel")
     pub name: String,
-    /// Kind: struct, enum, function, method, module
+    /// Kind: `struct`, `enum`, `trait`, `method`, `module`, `function`
     pub kind: String,
     /// Owning bounded context
     pub context: String,

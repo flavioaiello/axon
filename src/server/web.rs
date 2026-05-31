@@ -33,6 +33,168 @@ async fn bind_localhost(port: u16) -> Result<TcpListener> {
         .with_context(|| format!("bind web server on 127.0.0.1:{port}"))
 }
 
+/// Multi-workspace web graph for the daemon: one server serving every registered
+/// workspace, selected via `?workspace=<canonical-root>`.
+pub async fn run_multi(registries: super::WorkspaceRegistries, preferred_port: u16) -> Result<()> {
+    let listener = bind_localhost(preferred_port).await?;
+    let addr = listener.local_addr()?;
+    eprintln!(
+        "Axon web graph (all workspaces) available at http://{}",
+        addr
+    );
+    info!(
+        "Axon multi-workspace web graph available at http://{}",
+        addr
+    );
+
+    loop {
+        let (stream, _) = listener.accept().await?;
+        let registries = registries.clone();
+        tokio::spawn(async move {
+            if let Err(e) = handle_connection_multi(stream, registries).await {
+                warn!("web request failed: {e:#}");
+            }
+        });
+    }
+}
+
+async fn handle_connection_multi(
+    mut stream: TcpStream,
+    registries: super::WorkspaceRegistries,
+) -> Result<()> {
+    let mut buffer = [0_u8; 8192];
+    let read = stream.read(&mut buffer).await?;
+    if read == 0 {
+        return Ok(());
+    }
+
+    let request = String::from_utf8_lossy(&buffer[..read]);
+    let target = request
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .unwrap_or("/");
+    let (path, query) = target.split_once('?').unwrap_or((target, ""));
+
+    match path {
+        "/" | "/index.html" => {
+            respond(&mut stream, "200 OK", "text/html; charset=utf-8", WEB_HTML).await
+        }
+        "/api/workspaces" => {
+            let map = registries.lock().await;
+            let mut items: Vec<Value> = map
+                .iter()
+                .map(|(key, reg)| {
+                    json!({
+                        "workspace": key,
+                        "name": std::path::Path::new(key)
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_else(|| key.clone()),
+                        "crates": reg.crates().len(),
+                    })
+                })
+                .collect();
+            items.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+            let body = serde_json::to_string_pretty(&json!({ "workspaces": items }))?;
+            respond(&mut stream, "200 OK", "application/json", &body).await
+        }
+        "/api/graph" => match select_registry(&registries, query).await {
+            Some(reg) => {
+                let body = serde_json::to_string_pretty(&build_graph_json(&reg))?;
+                respond(&mut stream, "200 OK", "application/json", &body).await
+            }
+            None => {
+                respond(
+                    &mut stream,
+                    "200 OK",
+                    "application/json",
+                    r#"{"crates":[],"nodes":[],"edges":[]}"#,
+                )
+                .await
+            }
+        },
+        "/api/health" => match select_registry(&registries, query).await {
+            Some(reg) => {
+                let body = serde_json::to_string_pretty(&build_health_json(&reg))?;
+                respond(&mut stream, "200 OK", "application/json", &body).await
+            }
+            None => respond(&mut stream, "200 OK", "application/json", "{}").await,
+        },
+        _ => {
+            respond(
+                &mut stream,
+                "404 Not Found",
+                "text/plain; charset=utf-8",
+                "not found",
+            )
+            .await
+        }
+    }
+}
+
+/// Resolve the registry for a request: the `workspace` query param if it names a
+/// registered workspace, else the first one (so a single-workspace daemon Just
+/// Works without a selection).
+async fn select_registry(
+    registries: &super::WorkspaceRegistries,
+    query: &str,
+) -> Option<Arc<CrateRegistry>> {
+    let map = registries.lock().await;
+    if let Some(reg) = query_param(query, "workspace").and_then(|ws| map.get(&ws)) {
+        return Some(Arc::clone(reg));
+    }
+    map.values().next().map(Arc::clone)
+}
+
+/// Extract and percent-decode a query-string parameter.
+fn query_param(query: &str, key: &str) -> Option<String> {
+    query.split('&').find_map(|pair| {
+        let (k, v) = pair.split_once('=')?;
+        (k == key).then(|| percent_decode(v))
+    })
+}
+
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                match (hex_nibble(bytes[i + 1]), hex_nibble(bytes[i + 2])) {
+                    (Some(hi), Some(lo)) => {
+                        out.push(hi * 16 + lo);
+                        i += 3;
+                    }
+                    _ => {
+                        out.push(bytes[i]);
+                        i += 1;
+                    }
+                }
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
 async fn handle_connection(mut stream: TcpStream, registry: Arc<CrateRegistry>) -> Result<()> {
     let mut buffer = [0_u8; 8192];
     let read = stream.read(&mut buffer).await?;

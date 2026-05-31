@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "axon": {
+      "command": "/opt/homebrew/bin/axon",
+      "args": ["serve"]
+    }
+  }
+}

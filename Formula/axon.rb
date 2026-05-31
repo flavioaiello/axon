@@ -16,15 +16,29 @@ class Axon < Formula
   end
 
   def post_install
-    # Ensure the data directory exists
+    # Ensure the data and log directories exist
     (var/"axon").mkpath
+    (var/"log").mkpath
+  end
+
+  service do
+    run [opt_bin/"axon", "daemon"]
+    keep_alive true
+    log_path var/"log/axon.log"
+    error_log_path var/"log/axon.log"
   end
 
   def caveats
     <<~EOS
-      Axon stores domain models per-crate in <crate_root>/.axon/store.db (SQLite).
+      Axon keeps domain models in memory. For one warm, shared brain across every
+      VS Code / VSCodium window, run the daemon:
 
-      To use with VS Code / GitHub Copilot, add to .vscode/mcp.json:
+        brew services start axon
+
+      It listens on ~/.axon/daemon.sock and holds each workspace's model
+      separately in memory. Every editor still launches `axon serve` (stdio),
+      which transparently bridges to the daemon — and falls back to a standalone
+      in-process server if the daemon isn't running. So .mcp.json is unchanged:
 
         {
           "servers": {
@@ -40,9 +54,9 @@ class Axon < Formula
 
         axon export model.json --workspace /path/to/project --state actual
 
-      To list all stored projects:
+      To list all crates in a workspace:
 
-        axon list
+        axon list --workspace /path/to/project
     EOS
   end
 
