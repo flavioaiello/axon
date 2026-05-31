@@ -25,9 +25,15 @@ enum Commands {
         #[arg(short, long)]
         workspace: Option<String>,
 
-        /// Local web graph port
+        /// Local web graph port (only used with --standalone)
         #[arg(long, default_value_t = server::web::DEFAULT_WEB_PORT)]
         web_port: u16,
+
+        /// Run an in-process server instead of bridging to the shared daemon.
+        /// By default `serve` is daemon-only: it bridges to the daemon and never
+        /// runs a standalone model (avoids split-brain and stale fallbacks).
+        #[arg(long)]
+        standalone: bool,
     },
 
     /// Start only the local web graph UI and live Rust indexer
@@ -112,13 +118,21 @@ async fn main() -> Result<()> {
     };
 
     match cli.command {
-        // Default: serve from cwd (bridges to the daemon if one is running).
-        None => serve_or_bridge(resolve_workspace(None), server::web::DEFAULT_WEB_PORT).await?,
+        // Default: serve from cwd, bridging to the shared daemon (daemon-only).
+        None => serve_via_daemon(resolve_workspace(None)).await?,
 
         Some(Commands::Serve {
             workspace,
             web_port,
-        }) => serve_or_bridge(resolve_workspace(workspace), web_port).await?,
+            standalone,
+        }) => {
+            let workspace = resolve_workspace(workspace);
+            if standalone {
+                run_standalone(workspace, web_port).await?;
+            } else {
+                serve_via_daemon(workspace).await?;
+            }
+        }
 
         Some(Commands::Daemon { socket, web_port }) => {
             let socket = socket
@@ -287,18 +301,33 @@ fn daemon_socket_path() -> std::path::PathBuf {
         .join("daemon.sock")
 }
 
-/// Serve an MCP session: bridge to the shared daemon if one is running, else run
-/// the standalone in-process server (which also hosts the local web graph).
-async fn serve_or_bridge(workspace: String, web_port: u16) -> Result<()> {
+/// Daemon-only MCP serve: bridge every request to the shared daemon and never
+/// run an in-process model. This guarantees a single shared brain and avoids the
+/// stale standalone fallback that a momentary daemon outage could otherwise leave
+/// behind. If the daemon closes the session (e.g. it restarts), we return so the
+/// editor respawns us against the fresh daemon. If no daemon is reachable, we
+/// retry briefly to ride out a restart window, then error with guidance rather
+/// than silently degrading to standalone.
+async fn serve_via_daemon(workspace: String) -> Result<()> {
     let socket = daemon_socket_path();
-    match server::bridge::try_bridge(&socket, &workspace).await {
-        Ok(true) => Ok(()),
-        Ok(false) => run_standalone(workspace, web_port).await,
-        Err(e) => {
-            tracing::warn!("daemon bridge failed ({e:#}); running standalone");
-            run_standalone(workspace, web_port).await
+    // ~10s of 200ms retries to ride out a daemon restart before giving up.
+    for _ in 0..50 {
+        match server::bridge::try_bridge(&socket, &workspace).await {
+            // The bridge ran until the editor or the daemon closed the session.
+            Ok(true) => return Ok(()),
+            // No daemon listening yet — wait and retry.
+            Ok(false) => tokio::time::sleep(std::time::Duration::from_millis(200)).await,
+            Err(e) => {
+                tracing::warn!("daemon bridge error ({e:#}); retrying");
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
         }
     }
+    anyhow::bail!(
+        "no axon daemon reachable at {} — start it with `brew services start axon`, \
+         or run `axon serve --standalone` for an in-process server",
+        socket.display()
+    )
 }
 
 /// The original single-workspace in-process server: builds a registry, starts a

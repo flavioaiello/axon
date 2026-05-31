@@ -39,6 +39,14 @@ pub async fn run(socket_path: &Path, web_port: u16) -> Result<()> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create socket directory {}", parent.display()))?;
     }
+    // Refuse to start a second daemon over a live one: a single shared brain
+    // owns the socket. (Removing the socket below would otherwise orphan it.)
+    if tokio::net::UnixStream::connect(socket_path).await.is_ok() {
+        anyhow::bail!(
+            "an axon daemon is already listening on {}",
+            socket_path.display()
+        );
+    }
     // A stale socket file from a previous run would block bind().
     let _ = std::fs::remove_file(socket_path);
 
