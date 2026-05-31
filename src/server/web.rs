@@ -80,6 +80,15 @@ async fn handle_connection_multi(
         "/" | "/index.html" => {
             respond(&mut stream, "200 OK", "text/html; charset=utf-8", WEB_HTML).await
         }
+        "/cytoscape.bundle.js" => {
+            respond(
+                &mut stream,
+                "200 OK",
+                "application/javascript; charset=utf-8",
+                WEB_CYTOSCAPE,
+            )
+            .await
+        }
         "/api/workspaces" => {
             let map = registries.lock().await;
             let mut items: Vec<Value> = map
@@ -213,6 +222,15 @@ async fn handle_connection(mut stream: TcpStream, registry: Arc<CrateRegistry>) 
     match path {
         "/" | "/index.html" => {
             respond(&mut stream, "200 OK", "text/html; charset=utf-8", WEB_HTML).await
+        }
+        "/cytoscape.bundle.js" => {
+            respond(
+                &mut stream,
+                "200 OK",
+                "application/javascript; charset=utf-8",
+                WEB_CYTOSCAPE,
+            )
+            .await
         }
         "/api/graph" => {
             let body = serde_json::to_string_pretty(&build_graph_json(&registry))?;
@@ -908,6 +926,7 @@ impl GraphTotals {
 }
 
 const WEB_HTML: &str = include_str!("web.html");
+const WEB_CYTOSCAPE: &str = include_str!("cytoscape.bundle.js");
 
 #[cfg(test)]
 mod tests {
@@ -1038,8 +1057,10 @@ mod tests {
     fn web_page_contains_graph_bootstrap() {
         assert!(WEB_HTML.contains("/api/graph"));
         assert!(WEB_HTML.contains("Live Rust architecture overview"));
-        assert!(WEB_HTML.contains("enableDrag"));
+        assert!(WEB_HTML.contains("cytoscape"));
+        assert!(WEB_HTML.contains("/cytoscape.bundle.js"));
         assert!(WEB_HTML.contains("Module / submodule"));
         assert!(!WEB_HTML.contains("Source file"));
+        assert!(WEB_CYTOSCAPE.contains("cytoscape"));
     }
 }

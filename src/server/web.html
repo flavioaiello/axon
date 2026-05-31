@@ -255,15 +255,12 @@
       overflow: hidden;
     }
 
-    #graph {
+    #cy {
       width: 100%;
       height: 100%;
       display: block;
-      cursor: grab;
-      touch-action: none;
+      background: transparent;
     }
-
-    #graph.panning { cursor: grabbing; }
 
     .hud {
       position: absolute;
@@ -462,7 +459,7 @@
     </aside>
 
     <main class="stage">
-      <svg id="graph" role="img" aria-label="Rust architecture overview"></svg>
+      <div id="cy" role="img" aria-label="Rust architecture overview"></div>
       <div class="hud">
         <span id="visible-count">Loading</span>
         <span id="hover-readout">Ready</span>
@@ -475,65 +472,60 @@
     </aside>
   </div>
 
+  <script src="/cytoscape.bundle.js"></script>
   <script>
-    const namespace = 'http://www.w3.org/2000/svg';
-    const colors = { crate: '#46b9a7', module: '#70b8d6', struct: '#e6b655' };
-    const svg = document.getElementById('graph');
+    // Axon architecture map — Cytoscape.js compound graph.
+    // Bounded contexts (crates) and modules become compound containers; structs
+    // nest inside; imports/calls are the drawn edges. Data comes from /api/graph.
     const details = document.getElementById('details');
-    const stats = document.getElementById('stats');
-    const crates = document.getElementById('crates');
+    const statsEl = document.getElementById('stats');
+    const cratesEl = document.getElementById('crates');
     const search = document.getElementById('search');
     const visibleCount = document.getElementById('visible-count');
     const hoverReadout = document.getElementById('hover-readout');
     const fitButton = document.getElementById('fit');
+    const subtitle = document.getElementById('subtitle');
     const toggles = {
       structs: document.getElementById('toggle-structs'),
       imports: document.getElementById('toggle-imports'),
       calls: document.getElementById('toggle-calls'),
     };
-
-    const state = {
-      data: null,
-      selectedId: null,
-      transform: { x: 0, y: 0, scale: 1 },
-      manualPositions: new Map(),
-      panning: false,
-      panStart: null,
-      lastLayout: null,
-    };
-
     const workspaceField = document.getElementById('workspace-field');
     const workspaceSelect = document.getElementById('workspace');
 
+    const C = {
+      crate: '#46b9a7', module: '#70b8d6', struct: '#e6b655',
+      imports: '#6fb7d8', calls: '#d96a4f', focus: '#f0c35a',
+      text: '#f4efe2', muted: '#aeb5ad', canvas: '#101211',
+    };
+
+    if (window.cytoscapeFcose) cytoscape.use(window.cytoscapeFcose);
+
+    const state = { data: null, cy: null, selectedId: null };
+
     function loadGraph(workspace) {
-      const url = workspace
-        ? '/api/graph?workspace=' + encodeURIComponent(workspace)
-        : '/api/graph';
-      fetch(url)
-        .then(response => response.json())
-        .then(render)
-        .catch(error => {
-          details.textContent = String(error);
-          hoverReadout.textContent = 'Load failed';
-        });
+      const url = workspace ? '/api/graph?workspace=' + encodeURIComponent(workspace) : '/api/graph';
+      fetch(url).then(r => r.json()).then(render).catch(err => {
+        details.textContent = String(err);
+        hoverReadout.textContent = 'Load failed';
+      });
     }
 
-    // When served by the daemon, /api/workspaces lists every loaded workspace
-    // and a selector switches between them. We always show the selector when at
-    // least one workspace is loaded, even for a single workspace. The standalone
-    // server has no such endpoint, so the fetch rejects and we load its single
-    // graph without a selector.
+    // When served by the daemon, /api/workspaces lists every loaded workspace and a
+    // selector switches between them. We always show the selector when at least one
+    // workspace is loaded. The standalone server has no such endpoint, so the fetch
+    // rejects and we load its single graph without a selector.
     fetch('/api/workspaces')
-      .then(response => (response.ok ? response.json() : Promise.reject()))
+      .then(r => (r.ok ? r.json() : Promise.reject()))
       .then(data => {
         const list = (data && data.workspaces) || [];
         if (list.length >= 1) {
           workspaceSelect.innerHTML = '';
           list.forEach(ws => {
-            const option = document.createElement('option');
-            option.value = ws.workspace;
-            option.textContent = ws.name + ' (' + ws.crates + (ws.crates === 1 ? ' crate)' : ' crates)');
-            workspaceSelect.appendChild(option);
+            const o = document.createElement('option');
+            o.value = ws.workspace;
+            o.textContent = ws.name + ' (' + ws.crates + (ws.crates === 1 ? ' crate)' : ' crates)');
+            workspaceSelect.appendChild(o);
           });
           workspaceField.style.display = '';
           workspaceSelect.addEventListener('change', () => loadGraph(workspaceSelect.value));
@@ -544,63 +536,21 @@
       })
       .catch(() => loadGraph(null));
 
-    search.addEventListener('input', draw);
-    Object.values(toggles).forEach(toggle => toggle.addEventListener('change', draw));
-    fitButton.addEventListener('click', () => {
-      state.transform = { x: 0, y: 0, scale: 1 };
-      applyTransform();
-    });
-
-    window.addEventListener('resize', debounce(draw, 80));
-
-    svg.addEventListener('wheel', event => {
-      event.preventDefault();
-      const scaleFactor = Math.exp(-event.deltaY * 0.0012);
-      zoomAt(event.clientX, event.clientY, scaleFactor);
-    }, { passive: false });
-
-    svg.addEventListener('pointerdown', event => {
-      if (event.target.closest && event.target.closest('.node')) return;
-      state.panning = true;
-      state.panStart = {
-        pointerX: event.clientX,
-        pointerY: event.clientY,
-        originX: state.transform.x,
-        originY: state.transform.y,
-      };
-      svg.classList.add('panning');
-      svg.setPointerCapture(event.pointerId);
-    });
-
-    svg.addEventListener('pointermove', event => {
-      if (!state.panning || !state.panStart) return;
-      state.transform.x = state.panStart.originX + event.clientX - state.panStart.pointerX;
-      state.transform.y = state.panStart.originY + event.clientY - state.panStart.pointerY;
-      applyTransform();
-    });
-
-    svg.addEventListener('pointerup', finishPan);
-    svg.addEventListener('pointercancel', finishPan);
-
     function render(data) {
       state.data = data;
-      document.getElementById('subtitle').textContent = `${data.nodes.length} nodes / ${data.edges.length} edges`;
+      subtitle.textContent = data.nodes.length + ' nodes / ' + data.edges.length + ' edges';
       renderStats(data.stats || {});
       renderCrates(data.crates || []);
       draw();
     }
 
     function renderStats(summary) {
-      const selectedStats = [
-        ['crates', 'Crates'],
-        ['modules', 'Modules'],
-        ['structs', 'Structs'],
-        ['imports', 'Imports'],
-        ['calls', 'Calls'],
-        ['methods', 'Methods'],
+      const rows = [
+        ['crates', 'Crates'], ['modules', 'Modules'], ['structs', 'Structs'],
+        ['imports', 'Imports'], ['calls', 'Calls'], ['methods', 'Methods'],
       ];
-      clearElement(stats);
-      for (const [key, label] of selectedStats) {
+      clearElement(statsEl);
+      for (const [key, label] of rows) {
         const card = document.createElement('div');
         card.className = 'stat';
         const value = document.createElement('strong');
@@ -608,84 +558,22 @@
         const caption = document.createElement('span');
         caption.textContent = label;
         card.append(value, caption);
-        stats.appendChild(card);
+        statsEl.appendChild(card);
       }
     }
 
-    function renderCrates(crateRows) {
-      clearElement(crates);
-      if (crateRows.length === 0) {
-        crates.textContent = 'No crates indexed.';
-        return;
-      }
-      for (const crateRow of crateRows) {
+    function renderCrates(rows) {
+      clearElement(cratesEl);
+      if (!rows.length) { cratesEl.textContent = 'No crates indexed.'; return; }
+      for (const row of rows) {
         const card = document.createElement('div');
         card.className = 'crate-card';
         const name = document.createElement('strong');
-        name.textContent = crateRow.name;
+        name.textContent = row.name;
         const meta = document.createElement('span');
-        const moduleCount = crateRow.stats?.modules ?? 0;
-        const structCount = crateRow.stats?.structs ?? 0;
-        meta.textContent = `${moduleCount} modules / ${structCount} structs`;
+        meta.textContent = (row.stats?.modules ?? 0) + ' modules / ' + (row.stats?.structs ?? 0) + ' structs';
         card.append(name, meta);
-        crates.appendChild(card);
-      }
-    }
-
-    function draw() {
-      if (!state.data) return;
-      const bounds = svg.getBoundingClientRect();
-      const width = Math.max(760, Math.floor(bounds.width || 1000));
-      const height = Math.max(560, Math.floor(bounds.height || 720));
-      svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
-      clearElement(svg);
-
-      const options = currentOptions();
-      const graphView = buildGraphView(state.data, options);
-      const layout = createLayout(graphView.nodes, graphView.edges, width, height);
-      state.lastLayout = layout;
-
-      visibleCount.textContent = `${layout.nodes.length} visible nodes / ${graphView.edges.length} visible edges`;
-
-      const viewport = svgElement('g', { id: 'viewport' });
-      const bands = svgElement('g', { class: 'bands' });
-      const edgeLayer = svgElement('g', { class: 'edges' });
-      const nodeLayer = svgElement('g', { class: 'nodes' });
-
-      renderDepthBands(bands, layout.maxDepth, width, height, layout.columnGap);
-      const nodeById = new Map(layout.nodes.map(node => [node.id, node]));
-      const edgeViews = [];
-
-      for (const edge of graphView.edges) {
-        const from = nodeById.get(edge.from);
-        const to = nodeById.get(edge.to);
-        if (!from || !to) continue;
-        const path = svgElement('path', {
-          class: edgeClass(edge),
-          d: edgePath(edge, from, to),
-          'stroke-width': edgeWidth(edge),
-        });
-        const title = svgElement('title');
-        title.textContent = `${edge.label}${edge.count ? ` (${edge.count})` : ''}`;
-        path.appendChild(title);
-        edgeLayer.appendChild(path);
-        edgeViews.push({ edge, path });
-      }
-
-      for (const node of layout.nodes) {
-        const group = renderNode(node, nodeById, edgeViews, graphView.edges);
-        nodeLayer.appendChild(group);
-      }
-
-      viewport.append(bands, edgeLayer, nodeLayer);
-      svg.appendChild(viewport);
-      applyTransform();
-
-      const selectedNode = state.selectedId ? nodeById.get(state.selectedId) : null;
-      if (selectedNode) {
-        showDetails(selectedNode, graphView.edges, nodeById);
-      } else {
-        showEmptyDetails(graphView);
+        cratesEl.appendChild(card);
       }
     }
 
@@ -694,481 +582,234 @@
         showStructs: toggles.structs.checked,
         showImports: toggles.imports.checked,
         showCalls: toggles.calls.checked,
-        query: search.value.trim().toLowerCase(),
       };
     }
 
-    function buildGraphView(data, options) {
-      const baseNodes = data.nodes.filter(node => {
-        if (node.kind === 'workspace') return false;
-        if (options.showStructs || node.kind !== 'struct') return true;
-        return Boolean(options.query && matchesQuery(node, options.query));
-      });
-      const visibleIds = new Set(baseNodes.map(node => node.id));
-      let baseEdges = data.edges.filter(edge => visibleIds.has(edge.from) && visibleIds.has(edge.to));
-      if (!options.showImports) baseEdges = baseEdges.filter(edge => edge.label !== 'imports');
-      if (!options.showCalls) baseEdges = baseEdges.filter(edge => edge.label !== 'calls');
-
-      const matchedIds = new Set();
-      if (options.query) {
-        for (const node of baseNodes) {
-          if (matchesQuery(node, options.query)) matchedIds.add(node.id);
-        }
+    // Map /api/graph nodes+edges to Cytoscape elements. Containment edges
+    // (contains/declares) become parent relationships (compound nesting); the
+    // workspace node and hidden structs are dropped, walking parents up past them.
+    function buildElements(data, options) {
+      const parentOf = new Map();
+      for (const e of data.edges) {
+        if (e.label === 'contains' || e.label === 'declares') parentOf.set(e.to, e.from);
       }
-
-      const activeIds = new Set(matchedIds);
-      if (matchedIds.size > 0) {
-        for (const edge of baseEdges) {
-          if (matchedIds.has(edge.from) || matchedIds.has(edge.to)) {
-            activeIds.add(edge.from);
-            activeIds.add(edge.to);
-          }
-        }
+      const visible = new Set();
+      for (const n of data.nodes) {
+        if (n.kind === 'workspace') continue;
+        if (n.kind === 'struct' && !options.showStructs) continue;
+        visible.add(n.id);
       }
-
-      const nodes = baseNodes.map(node => ({
-        ...node,
-        matched: matchedIds.has(node.id),
-        dimmed: matchedIds.size > 0 && !activeIds.has(node.id),
-      }));
-      const edges = baseEdges.map(edge => ({
-        ...edge,
-        dimmed: matchedIds.size > 0 && !(activeIds.has(edge.from) && activeIds.has(edge.to)),
-      }));
-      return { nodes, edges };
+      function resolveParent(id) {
+        let p = parentOf.get(id);
+        while (p && !visible.has(p)) p = parentOf.get(p);
+        return p && visible.has(p) ? p : undefined;
+      }
+      const els = [];
+      for (const n of data.nodes) {
+        if (!visible.has(n.id)) continue;
+        els.push({ data: {
+          id: n.id, label: n.label, kind: n.kind, parent: resolveParent(n.id),
+          method_count: n.method_count, visibility: n.visibility,
+          file_path: n.file_path, path: n.path,
+          start_line: n.start_line, end_line: n.end_line,
+          semantic_labels: n.semantic_labels || [], pattern_labels: n.pattern_labels || [],
+        }});
+      }
+      for (const e of data.edges) {
+        if (e.label === 'contains' || e.label === 'declares') continue;
+        if (e.label === 'imports' && !options.showImports) continue;
+        if (e.label === 'calls' && !options.showCalls) continue;
+        if (!visible.has(e.from) || !visible.has(e.to)) continue;
+        els.push({ data: {
+          id: 'e:' + e.from + '|' + e.to + '|' + e.label,
+          source: e.from, target: e.to, kind: e.label,
+          count: Math.min(e.count || 1, 20),
+        }});
+      }
+      return els;
     }
 
-    function matchesQuery(node, query) {
-      const haystack = [node.label, node.kind, node.path, node.file_path, node.visibility]
-        .filter(Boolean)
-        .join(' ')
-        .toLowerCase();
-      return haystack.includes(query);
-    }
-
-    function createLayout(nodes, edges, width, height) {
-      const nodeById = new Map(nodes.map(node => [node.id, { ...node, raw: node }]));
-      const childrenByParent = new Map();
-      const parentByChild = new Map();
-      for (const edge of edges) {
-        if (!['contains', 'declares'].includes(edge.label)) continue;
-        if (!nodeById.has(edge.from) || !nodeById.has(edge.to)) continue;
-        if (!childrenByParent.has(edge.from)) childrenByParent.set(edge.from, []);
-        childrenByParent.get(edge.from).push(edge.to);
-        parentByChild.set(edge.to, edge.from);
-      }
-
-      for (const childIds of childrenByParent.values()) {
-        childIds.sort((leftId, rightId) => compareNodes(nodeById.get(leftId), nodeById.get(rightId)));
-      }
-
-      const root = nodes.find(node => node.kind === 'workspace') || nodes.find(node => !parentByChild.has(node.id)) || nodes[0];
-      const weights = new Map();
-      const depths = new Map();
-
-      function measure(nodeId) {
-        if (weights.has(nodeId)) return weights.get(nodeId);
-        const childIds = (childrenByParent.get(nodeId) || []).filter(childId => nodeById.has(childId));
-        if (childIds.length === 0) {
-          weights.set(nodeId, 1);
-          return 1;
-        }
-        const weight = Math.max(1, childIds.reduce((total, childId) => total + measure(childId), 0));
-        weights.set(nodeId, weight);
-        return weight;
-      }
-
-      if (root) measure(root.id);
-
-      function assignDepth(nodeId, depth) {
-        const previous = depths.get(nodeId);
-        if (previous !== undefined && previous <= depth) return;
-        depths.set(nodeId, depth);
-        for (const childId of childrenByParent.get(nodeId) || []) assignDepth(childId, depth + 1);
-      }
-
-      if (root) assignDepth(root.id, 0);
-      let maxDepth = Math.max(1, ...Array.from(depths.values()));
-      for (const node of nodeById.values()) {
-        if (!depths.has(node.id)) {
-          const fallbackDepth = fallbackDepthFor(node.kind);
-          depths.set(node.id, fallbackDepth);
-          maxDepth = Math.max(maxDepth, fallbackDepth);
-        }
-      }
-
-      const leftPadding = 78;
-      const rightPadding = 108;
-      const topPadding = 56;
-      const bottomPadding = 68;
-      const columnGap = Math.max(116, Math.min(210, (width - leftPadding - rightPadding) / Math.max(1, maxDepth)));
-      const positionedIds = new Set();
-
-      function placeTree(nodeId, depth, top, bottom) {
-        const node = nodeById.get(nodeId);
-        if (!node) return;
-        const manual = state.manualPositions.get(node.id);
-        node.x = manual?.x ?? Math.min(width - rightPadding, leftPadding + depth * columnGap);
-        node.y = manual?.y ?? (top + bottom) / 2;
-        node.depth = depth;
-        positionedIds.add(node.id);
-
-        const childIds = (childrenByParent.get(nodeId) || []).filter(childId => nodeById.has(childId));
-        if (childIds.length === 0) return;
-        const totalWeight = childIds.reduce((total, childId) => total + (weights.get(childId) || 1), 0);
-        let cursor = top;
-        for (const childId of childIds) {
-          const share = Math.max(34, (bottom - top) * ((weights.get(childId) || 1) / Math.max(1, totalWeight)));
-          placeTree(childId, depth + 1, cursor, Math.min(bottom, cursor + share));
-          cursor += share;
-        }
-      }
-
-      if (root) placeTree(root.id, 0, topPadding, height - bottomPadding);
-
-      const unplaced = Array.from(nodeById.values()).filter(node => !positionedIds.has(node.id));
-      for (const [index, node] of unplaced.entries()) {
-        const fallbackDepth = depths.get(node.id) || fallbackDepthFor(node.kind);
-        const manual = state.manualPositions.get(node.id);
-        node.x = manual?.x ?? Math.min(width - rightPadding, leftPadding + fallbackDepth * columnGap);
-        node.y = manual?.y ?? topPadding + 34 + index * 38;
-        node.depth = fallbackDepth;
-      }
-
-      relaxOverlaps(Array.from(nodeById.values()), height, topPadding, bottomPadding);
-      return { nodes: Array.from(nodeById.values()), maxDepth, columnGap };
-    }
-
-    function compareNodes(left, right) {
-      const order = { workspace: 0, crate: 1, module: 2, struct: 3 };
-      const orderDiff = (order[left?.kind] ?? 9) - (order[right?.kind] ?? 9);
-      if (orderDiff !== 0) return orderDiff;
-      return String(left?.label || '').localeCompare(String(right?.label || ''));
-    }
-
-    function fallbackDepthFor(kind) {
-      if (kind === 'workspace') return 0;
-      if (kind === 'crate') return 1;
-      if (kind === 'module') return 2;
-      return 3;
-    }
-
-    function relaxOverlaps(nodes, height, topPadding, bottomPadding) {
-      const byColumn = new Map();
-      for (const node of nodes) {
-        const key = Math.round(node.x / 24);
-        if (!byColumn.has(key)) byColumn.set(key, []);
-        byColumn.get(key).push(node);
-      }
-      for (const columnNodes of byColumn.values()) {
-        columnNodes.sort((left, right) => left.y - right.y);
-        let cursor = topPadding;
-        for (const node of columnNodes) {
-          const gap = radiusFor(node) * 2 + 18;
-          node.y = Math.max(node.y, cursor + gap / 2);
-          cursor = node.y + gap / 2;
-        }
-        const overflow = cursor - (height - bottomPadding);
-        if (overflow > 0) {
-          for (const node of columnNodes) node.y -= overflow / 2;
-        }
-      }
-    }
-
-    function renderDepthBands(layer, maxDepth, width, height, columnGap) {
-      for (let depth = 0; depth <= maxDepth; depth += 1) {
-        if (depth % 2 !== 0) continue;
-        const band = svgElement('rect', {
-          class: 'depth-band',
-          x: Math.max(0, 78 + depth * columnGap - columnGap / 2),
-          y: 28,
-          width: Math.max(80, columnGap),
-          height: Math.max(0, height - 84),
-          rx: 8,
-        });
-        layer.appendChild(band);
-      }
-    }
-
-    function renderNode(node, nodeById, edgeViews, edges) {
-      const group = svgElement('g', {
-        class: nodeClass(node),
-        transform: `translate(${node.x}, ${node.y})`,
-        tabindex: '0',
-        role: 'button',
-        'aria-label': `${node.kind}: ${node.label}`,
-      });
-
-      const halo = svgElement('circle', { class: 'halo', r: radiusFor(node) + 7 });
-      const circle = svgElement('circle', { r: radiusFor(node), fill: colors[node.kind] || '#aeb5ad' });
-      const title = svgElement('title');
-      title.textContent = `${node.kind}: ${node.label}`;
-      const label = svgElement('text', { x: radiusFor(node) + 9, y: 4 });
-      label.textContent = shortLabel(node.label, node.kind === 'struct' ? 23 : 28);
-
-      group.append(title, halo, circle, label);
-
-      group.addEventListener('mouseenter', () => {
-        hoverReadout.textContent = `${node.kind} / ${node.label}`;
-      });
-      group.addEventListener('mouseleave', () => {
-        hoverReadout.textContent = 'Ready';
-      });
-      group.addEventListener('click', () => {
-        if (node.wasDragged) {
-          node.wasDragged = false;
-          return;
-        }
-        state.selectedId = node.id;
-        showDetails(node, edges, nodeById);
-        markSelection();
-      });
-      group.addEventListener('keydown', event => {
-        if (event.key !== 'Enter' && event.key !== ' ') return;
-        event.preventDefault();
-        state.selectedId = node.id;
-        showDetails(node, edges, nodeById);
-        markSelection();
-      });
-
-      enableDrag(group, node, edgeViews);
-      return group;
-    }
-
-    function nodeClass(node) {
+    function cyStyle() {
       return [
-        'node',
-        node.kind,
-        node.dimmed ? 'dimmed' : '',
-        node.matched ? 'matched' : '',
-        state.selectedId === node.id ? 'selected' : '',
-      ].filter(Boolean).join(' ');
+        { selector: 'node', style: {
+          'label': 'data(label)', 'color': C.text, 'font-size': 11, 'font-weight': 600,
+          'text-valign': 'center', 'text-halign': 'center', 'min-zoomed-font-size': 7,
+        }},
+        { selector: 'node[kind="struct"]', style: {
+          'shape': 'round-rectangle', 'background-color': C.struct, 'background-opacity': 0.92,
+          'color': C.canvas, 'font-weight': 700, 'width': 'label', 'height': 'label',
+          'padding': '6px', 'text-max-width': 150,
+        }},
+        { selector: 'node[kind="module"]', style: {
+          'shape': 'round-rectangle', 'background-color': C.module, 'background-opacity': 0.85,
+          'color': C.canvas, 'width': 'label', 'height': 'label', 'padding': '6px',
+        }},
+        { selector: 'node:parent', style: {
+          'shape': 'round-rectangle', 'background-color': C.module, 'background-opacity': 0.06,
+          'border-width': 1, 'border-color': C.module, 'border-opacity': 0.55,
+          'padding': 16, 'text-valign': 'top', 'text-halign': 'center',
+          'font-size': 12, 'font-weight': 800, 'color': C.muted, 'text-margin-y': 4,
+        }},
+        { selector: 'node:parent[kind="crate"]', style: {
+          'background-color': C.crate, 'border-color': C.crate, 'border-width': 1.5,
+          'background-opacity': 0.05, 'font-size': 13, 'color': C.crate,
+        }},
+        { selector: 'edge', style: {
+          'curve-style': 'bezier', 'width': 'mapData(count, 1, 20, 1, 4.5)',
+          'line-opacity': 0.5, 'target-arrow-shape': 'triangle', 'arrow-scale': 0.85,
+        }},
+        { selector: 'edge[kind="imports"]', style: {
+          'line-color': C.imports, 'target-arrow-color': C.imports, 'line-style': 'dashed',
+        }},
+        { selector: 'edge[kind="calls"]', style: {
+          'line-color': C.calls, 'target-arrow-color': C.calls,
+        }},
+        { selector: '.dim', style: { 'opacity': 0.12 }},
+        { selector: 'node.hl', style: { 'border-width': 2.5, 'border-color': C.focus, 'border-opacity': 1 }},
+        { selector: 'node:selected', style: { 'border-width': 3, 'border-color': C.focus, 'border-opacity': 1 }},
+        { selector: 'edge.hl', style: { 'line-opacity': 0.95, 'width': 3, 'line-color': C.focus, 'target-arrow-color': C.focus }},
+      ];
     }
 
-    function edgeClass(edge) {
-      return [
-        'edge',
-        edge.label,
-        edge.dimmed ? 'dimmed' : '',
-        state.selectedId && (edge.from === state.selectedId || edge.to === state.selectedId) ? 'selected' : '',
-      ].filter(Boolean).join(' ');
-    }
-
-    function radiusFor(node) {
-      if (node.kind === 'workspace') return 20;
-      if (node.kind === 'crate') return 18;
-      if (node.kind === 'module') return Math.min(15, 10 + Math.log2((node.file_count || 0) + 1));
-      return Math.min(13, 8 + Math.log2((node.method_count || 0) + 1));
-    }
-
-    function edgeWidth(edge) {
-      return Math.min(6, edge.label === 'contains' || edge.label === 'declares' ? 1.15 : 1.4 + Math.log2(edge.count || 1));
-    }
-
-    function edgePath(edge, from, to) {
-      const horizontal = Math.max(44, Math.abs(to.x - from.x) * 0.42);
-      if (edge.label === 'contains' || edge.label === 'declares') {
-        return `M ${from.x} ${from.y} C ${from.x + horizontal} ${from.y}, ${to.x - horizontal} ${to.y}, ${to.x} ${to.y}`;
+    function layoutOptions() {
+      if (window.cytoscapeFcose) {
+        return { name: 'fcose', quality: 'default', animate: false, randomize: true,
+          packComponents: true, nodeSeparation: 80, idealEdgeLength: 80,
+          nodeRepulsion: 5500, gravity: 0.3, gravityCompound: 1.0,
+          nestingFactor: 0.12, tile: true, padding: 26 };
       }
-      const bend = edge.label === 'calls' ? 38 : -32;
-      const midpointX = (from.x + to.x) / 2;
-      const midpointY = (from.y + to.y) / 2 + bend;
-      return `M ${from.x} ${from.y} Q ${midpointX} ${midpointY}, ${to.x} ${to.y}`;
+      return { name: 'cose', animate: false, padding: 26, nodeOverlap: 14, idealEdgeLength: 80 };
     }
 
-    function enableDrag(group, node, edgeViews) {
-      let dragging = false;
-      let offsetX = 0;
-      let offsetY = 0;
-      let moved = false;
+    function draw() {
+      if (!state.data) return;
+      const els = buildElements(state.data, currentOptions());
+      const edgeCount = els.filter(e => e.data.source).length;
+      const nodeCount = els.length - edgeCount;
+      visibleCount.textContent = nodeCount + ' nodes / ' + edgeCount + ' edges';
 
-      group.addEventListener('pointerdown', event => {
-        const point = svgPoint(event);
-        dragging = true;
-        moved = false;
-        offsetX = point.x - node.x;
-        offsetY = point.y - node.y;
-        group.classList.add('dragging');
-        group.setPointerCapture(event.pointerId);
-        event.stopPropagation();
-        event.preventDefault();
+      if (state.cy) { state.cy.destroy(); state.cy = null; }
+      const cy = cytoscape({
+        container: document.getElementById('cy'),
+        elements: els,
+        style: cyStyle(),
+        layout: layoutOptions(),
+        wheelSensitivity: 0.2, minZoom: 0.08, maxZoom: 3,
       });
+      state.cy = cy;
 
-      group.addEventListener('pointermove', event => {
-        if (!dragging) return;
-        const point = svgPoint(event);
-        node.x = point.x - offsetX;
-        node.y = point.y - offsetY;
-        moved = true;
-        state.manualPositions.set(node.id, { x: node.x, y: node.y });
-        updateNodeView(group, node, edgeViews);
+      cy.on('tap', 'node', evt => selectNode(evt.target));
+      cy.on('tap', evt => { if (evt.target === cy) clearSelection(); });
+      cy.on('mouseover', 'node', evt => { hoverReadout.textContent = evt.target.data('label'); });
+      cy.on('mouseout', 'node', () => { hoverReadout.textContent = 'Ready'; });
+
+      if (state.selectedId && cy.getElementById(state.selectedId).nonempty()) {
+        selectNode(cy.getElementById(state.selectedId));
+      } else {
+        showEmptyDetails();
+      }
+      applySearch();
+    }
+
+    function selectNode(node) {
+      state.selectedId = node.id();
+      const cy = state.cy;
+      cy.elements().removeClass('hl').unselect();
+      node.select();
+      node.closedNeighborhood().addClass('hl');
+      showDetails(node);
+    }
+
+    function clearSelection() {
+      state.selectedId = null;
+      if (state.cy) state.cy.elements().removeClass('hl').unselect();
+      showEmptyDetails();
+    }
+
+    function applySearch() {
+      const cy = state.cy; if (!cy) return;
+      const q = search.value.trim().toLowerCase();
+      cy.elements().removeClass('dim');
+      if (!q) return;
+      const match = cy.nodes().filter(n => {
+        const d = n.data();
+        return [d.label, d.kind, d.path, d.file_path, d.visibility]
+          .filter(Boolean).join(' ').toLowerCase().includes(q);
       });
-
-      group.addEventListener('pointerup', event => finishDrag(group, node, event, moved));
-      group.addEventListener('pointercancel', event => finishDrag(group, node, event, moved));
+      if (match.empty()) return;
+      const keep = match.closedNeighborhood();
+      cy.elements().difference(keep).addClass('dim');
     }
 
-    function finishDrag(group, node, event, moved) {
-      group.classList.remove('dragging');
-      if (group.hasPointerCapture(event.pointerId)) group.releasePointerCapture(event.pointerId);
-      node.wasDragged = moved;
+    function showEmptyDetails() {
+      clearElement(details);
+      details.textContent = 'Select a node.';
     }
 
-    function updateNodeView(group, node, edgeViews) {
-      group.setAttribute('transform', `translate(${node.x}, ${node.y})`);
-      for (const { edge, path } of edgeViews) {
-        if (edge.from !== node.id && edge.to !== node.id) continue;
-        const peerId = edge.from === node.id ? edge.to : edge.from;
-        const peer = state.lastLayout?.nodes.find(candidate => candidate.id === peerId);
-        if (!peer) continue;
-        const from = edge.from === node.id ? node : peer;
-        const to = edge.to === node.id ? node : peer;
-        path.setAttribute('d', edgePath(edge, from, to));
-      }
-    }
-
-    function svgPoint(event) {
-      const point = svg.createSVGPoint();
-      point.x = event.clientX;
-      point.y = event.clientY;
-      const viewport = document.getElementById('viewport');
-      const matrix = viewport?.getScreenCTM() || svg.getScreenCTM();
-      return point.matrixTransform(matrix.inverse());
-    }
-
-    function finishPan(event) {
-      if (!state.panning) return;
-      state.panning = false;
-      state.panStart = null;
-      svg.classList.remove('panning');
-      if (svg.hasPointerCapture(event.pointerId)) svg.releasePointerCapture(event.pointerId);
-    }
-
-    function zoomAt(clientX, clientY, scaleFactor) {
-      const bounds = svg.getBoundingClientRect();
-      const pointerX = clientX - bounds.left;
-      const pointerY = clientY - bounds.top;
-      const nextScale = clamp(state.transform.scale * scaleFactor, 0.45, 2.8);
-      const ratio = nextScale / state.transform.scale;
-      state.transform.x = pointerX - (pointerX - state.transform.x) * ratio;
-      state.transform.y = pointerY - (pointerY - state.transform.y) * ratio;
-      state.transform.scale = nextScale;
-      applyTransform();
-    }
-
-    function applyTransform() {
-      const viewport = document.getElementById('viewport');
-      if (!viewport) return;
-      viewport.setAttribute('transform', `translate(${state.transform.x}, ${state.transform.y}) scale(${state.transform.scale})`);
-    }
-
-    function markSelection() {
-      for (const group of svg.querySelectorAll('.node')) {
-        group.classList.toggle('selected', group.getAttribute('aria-label') === selectedAriaLabel());
-      }
-      for (const path of svg.querySelectorAll('.edge')) path.classList.remove('selected');
-      draw();
-    }
-
-    function selectedAriaLabel() {
-      const node = state.lastLayout?.nodes.find(candidate => candidate.id === state.selectedId);
-      return node ? `${node.kind}: ${node.label}` : '';
-    }
-
-    function showEmptyDetails(graphView) {
+    function showDetails(node) {
+      const d = node.data();
       clearElement(details);
       const card = document.createElement('div');
       card.className = 'details-card';
-      const title = document.createElement('h3');
-      title.textContent = 'Architecture map';
-      const pills = document.createElement('div');
-      pills.className = 'pill-row';
-      pills.append(pill(`${graphView.nodes.length} nodes`), pill(`${graphView.edges.length} edges`));
-      card.append(title, pills);
-      details.appendChild(card);
-    }
+      const title = document.createElement('div');
+      title.className = 'details-title';
+      const strong = document.createElement('strong');
+      strong.textContent = d.label;
+      title.append(strong, pill(d.kind));
+      card.appendChild(title);
 
-    function showDetails(node, edges, nodeById) {
-      clearElement(details);
-
-      const card = document.createElement('div');
-      card.className = 'details-card';
-      const titleRow = document.createElement('div');
-      titleRow.className = 'details-title';
-      const title = document.createElement('h3');
-      title.textContent = node.label;
-      titleRow.append(title, pill(node.kind));
-      card.appendChild(titleRow);
-
-      const labels = [...(node.semantic_labels || []).map(label => label.label), ...(node.pattern_labels || [])];
-      if (labels.length > 0) {
-        const pills = document.createElement('div');
-        pills.className = 'pill-row';
-        labels.slice(0, 8).forEach(label => pills.appendChild(pill(label)));
-        card.appendChild(pills);
+      const labels = []
+        .concat(d.semantic_labels || [], d.pattern_labels || [])
+        .map(l => (typeof l === 'string' ? l : (l && (l.label || l.name)) || ''))
+        .filter(Boolean);
+      if (labels.length) {
+        const row = document.createElement('div');
+        row.className = 'pill-row';
+        labels.slice(0, 10).forEach(l => row.appendChild(pill(l)));
+        card.appendChild(row);
       }
 
-      const rows = [
-        ['path', node.path || node.file_path],
-        ['visibility', node.visibility],
-        ['methods', node.method_count],
-        ['files', node.file_count],
-        ['line', lineRange(node)],
-      ].filter(([, value]) => value !== undefined && value !== null && value !== '');
-      card.appendChild(keyValues(rows));
+      const kv = document.createElement('div');
+      kv.className = 'kv';
+      const add = (k, v) => {
+        if (v === undefined || v === null || v === '') return;
+        const wrap = document.createElement('div');
+        const dt = document.createElement('dt'); dt.textContent = k;
+        const dd = document.createElement('dd'); dd.textContent = v;
+        wrap.append(dt, dd); kv.appendChild(wrap);
+      };
+      add('File', d.file_path || d.path);
+      if (d.start_line) add('Lines', d.start_line === d.end_line ? String(d.start_line) : (d.start_line || '?') + '-' + (d.end_line || '?'));
+      add('Visibility', d.visibility);
+      if (d.method_count) add('Methods', d.method_count);
+      card.appendChild(kv);
       details.appendChild(card);
 
-      const related = edges
-        .filter(edge => edge.from === node.id || edge.to === node.id)
-        .slice(0, 18);
-      const relationCard = document.createElement('div');
-      relationCard.className = 'details-card';
-      const relationTitle = document.createElement('h3');
-      relationTitle.textContent = 'Relations';
-      relationCard.appendChild(relationTitle);
+      appendNeighbors('Outgoing', node.outgoers('node'));
+      appendNeighbors('Incoming', node.incomers('node'));
+    }
+
+    function appendNeighbors(title, nodes) {
+      const uniq = [];
+      const seen = new Set();
+      nodes.forEach(n => { if (!seen.has(n.id())) { seen.add(n.id()); uniq.push(n); } });
+      if (!uniq.length) return;
+      const card = document.createElement('div');
+      card.className = 'details-card';
+      const h = document.createElement('strong');
+      h.textContent = title + ' (' + uniq.length + ')';
+      card.appendChild(h);
       const list = document.createElement('div');
       list.className = 'neighbor-list';
-      if (related.length === 0) {
-        list.textContent = 'No visible relations.';
-      } else {
-        for (const edge of related) {
-          const peerId = edge.from === node.id ? edge.to : edge.from;
-          const peer = nodeById.get(peerId);
-          if (!peer) continue;
-          const button = document.createElement('button');
-          button.type = 'button';
-          button.textContent = `${edge.label} ${edge.from === node.id ? 'to' : 'from'} ${peer.label}`;
-          button.addEventListener('click', () => {
-            state.selectedId = peer.id;
-            showDetails(peer, edges, nodeById);
-            draw();
-          });
-          list.appendChild(button);
-        }
-      }
-      relationCard.appendChild(list);
-      details.appendChild(relationCard);
-    }
-
-    function keyValues(rows) {
-      const list = document.createElement('dl');
-      list.className = 'kv';
-      for (const [key, value] of rows) {
-        const row = document.createElement('div');
-        const term = document.createElement('dt');
-        term.textContent = key;
-        const definition = document.createElement('dd');
-        definition.textContent = String(value);
-        row.append(term, definition);
-        list.appendChild(row);
-      }
-      return list;
-    }
-
-    function lineRange(node) {
-      if (!node.start_line && !node.end_line) return '';
-      if (node.start_line === node.end_line) return node.start_line;
-      return `${node.start_line || '?'}-${node.end_line || '?'}`;
+      uniq.slice(0, 24).forEach(n => {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.textContent = n.data('label');
+        b.addEventListener('click', () => { state.cy.center(n); selectNode(n); });
+        list.appendChild(b);
+      });
+      card.appendChild(list);
+      details.appendChild(card);
     }
 
     function pill(text) {
@@ -1178,33 +819,15 @@
       return item;
     }
 
-    function svgElement(tagName, attributes = {}) {
-      const element = document.createElementNS(namespace, tagName);
-      for (const [key, value] of Object.entries(attributes)) {
-        element.setAttribute(key, value);
-      }
-      return element;
-    }
+    search.addEventListener('input', debounce(applySearch, 120));
+    Object.values(toggles).forEach(t => t.addEventListener('change', draw));
+    fitButton.addEventListener('click', () => { if (state.cy) state.cy.fit(undefined, 30); });
+    window.addEventListener('resize', debounce(() => { if (state.cy) state.cy.resize(); }, 150));
 
-    function clearElement(element) {
-      while (element.firstChild) element.removeChild(element.firstChild);
-    }
-
-    function shortLabel(value, maxLength) {
-      const text = String(value || '');
-      return text.length > maxLength ? `${text.slice(0, maxLength - 1)}...` : text;
-    }
-
-    function clamp(value, min, max) {
-      return Math.max(min, Math.min(max, value));
-    }
-
-    function debounce(callback, delay) {
-      let handle = 0;
-      return () => {
-        window.clearTimeout(handle);
-        handle = window.setTimeout(callback, delay);
-      };
+    function clearElement(el) { while (el.firstChild) el.removeChild(el.firstChild); }
+    function debounce(fn, delay) {
+      let h = 0;
+      return (...args) => { window.clearTimeout(h); h = window.setTimeout(() => fn(...args), delay); };
     }
   </script>
 </body>
