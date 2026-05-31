@@ -52,15 +52,20 @@
     .topbar {
       position: relative;
       z-index: 3;
-      display: grid;
-      grid-template-columns: minmax(220px, 1fr) minmax(280px, 520px) auto;
-      gap: 16px;
+      display: flex;
+      flex-wrap: wrap;
       align-items: center;
+      gap: 12px 16px;
       padding: 14px 18px;
       border-bottom: 1px solid rgba(244, 239, 226, 0.12);
       background: rgba(16, 18, 17, 0.92);
       backdrop-filter: blur(18px);
     }
+
+    .topbar > .brand { flex: 0 1 auto; }
+    .topbar > #workspace-field { flex: 0 0 auto; }
+    .topbar > label.search:not(#workspace-field) { flex: 1 1 240px; }
+    .topbar > .toolbar { flex: 0 0 auto; margin-left: auto; }
 
     .brand {
       min-width: 0;
@@ -122,6 +127,24 @@
       color: var(--text);
       background: transparent;
     }
+
+    .search select {
+      min-width: 0;
+      border: 0;
+      outline: 0;
+      color: var(--text);
+      font: inherit;
+      cursor: pointer;
+      appearance: none;
+      -webkit-appearance: none;
+      padding-right: 18px;
+      background-color: transparent;
+      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath fill='%23a8a29a' d='M0 0l5 6 5-6z'/%3E%3C/svg%3E");
+      background-repeat: no-repeat;
+      background-position: right 2px center;
+    }
+
+    .search select option { color: var(--text); background: #1b1d1a; }
 
     .toolbar {
       display: flex;
@@ -376,12 +399,13 @@
 
     @media (max-width: 1080px) {
       body { height: auto; overflow: auto; }
-      .topbar { grid-template-columns: auto minmax(0, 1fr); gap: 8px 10px; padding: 8px 10px; }
+      .topbar { gap: 8px 10px; padding: 8px 10px; }
       .brand { align-items: center; gap: 8px; }
       h1 { font-size: 22px; }
       #subtitle { display: none; }
       .search { padding: 7px 10px; }
-      .toolbar { grid-column: 1 / -1; gap: 6px; justify-content: flex-start; overflow-x: auto; padding-bottom: 2px; }
+      .toolbar { gap: 6px; justify-content: flex-start; overflow-x: auto; padding-bottom: 2px; }
+      .topbar > .toolbar { flex: 1 0 100%; margin-left: 0; }
       .toggle,
       button { flex: 0 0 auto; min-height: 31px; padding: 5px 8px; }
       .workspace { grid-template-columns: 1fr; grid-template-rows: minmax(320px, calc(100vh - 112px)) auto auto; }
@@ -495,13 +519,15 @@
     }
 
     // When served by the daemon, /api/workspaces lists every loaded workspace
-    // and a selector switches between them. The standalone server has no such
-    // endpoint, so we hide the selector and load its single graph.
+    // and a selector switches between them. We always show the selector when at
+    // least one workspace is loaded, even for a single workspace. The standalone
+    // server has no such endpoint, so the fetch rejects and we load its single
+    // graph without a selector.
     fetch('/api/workspaces')
       .then(response => (response.ok ? response.json() : Promise.reject()))
       .then(data => {
         const list = (data && data.workspaces) || [];
-        if (list.length > 1) {
+        if (list.length >= 1) {
           workspaceSelect.innerHTML = '';
           list.forEach(ws => {
             const option = document.createElement('option');
@@ -513,7 +539,7 @@
           workspaceSelect.addEventListener('change', () => loadGraph(workspaceSelect.value));
           loadGraph(list[0].workspace);
         } else {
-          loadGraph(list.length === 1 ? list[0].workspace : null);
+          loadGraph(null);
         }
       })
       .catch(() => loadGraph(null));
