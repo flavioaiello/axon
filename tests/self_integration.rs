@@ -120,7 +120,7 @@ fn self_scan_persist_show_roundtrip() {
         .expect("save_actual must succeed");
 
     // ── Step 3: Show actual model via MCP tool ─────────────────────────
-    let show_result = call_tool(&store, &ws, "architecture", &json!({}));
+    let show_result = call_tool(&store, &ws, "rust_status", &json!({"detail": "full"}));
     let show_json = unwrap_tool_text(&show_result);
     assert!(
         show_json["current"].is_object(),
@@ -174,7 +174,7 @@ fn self_mutate_and_enrich_desired_model() {
     let result = call_write_tool(
         &ws,
         &store,
-        "define",
+        "rust_annotations",
         &json!({
             "kind": "bounded_context",
             "name": "Reasoning",
@@ -193,7 +193,7 @@ fn self_mutate_and_enrich_desired_model() {
     let result = call_write_tool(
         &ws,
         &store,
-        "define",
+        "rust_annotations",
         &json!({
             "kind": "entity",
             "context": "Reasoning",
@@ -218,7 +218,7 @@ fn self_mutate_and_enrich_desired_model() {
     let result = call_write_tool(
         &ws,
         &store,
-        "define",
+        "rust_annotations",
         &json!({
             "kind": "value_object",
             "context": "Reasoning",
@@ -238,7 +238,7 @@ fn self_mutate_and_enrich_desired_model() {
     let result = call_write_tool(
         &ws,
         &store,
-        "define",
+        "rust_annotations",
         &json!({
             "kind": "service",
             "context": "Reasoning",
@@ -256,7 +256,7 @@ fn self_mutate_and_enrich_desired_model() {
     let result = call_write_tool(
         &ws,
         &store,
-        "define",
+        "rust_annotations",
         &json!({
             "kind": "event",
             "context": "Reasoning",
@@ -273,7 +273,7 @@ fn self_mutate_and_enrich_desired_model() {
     unwrap_tool_text(&result);
 
     // ── Show implemented model ─────────────────────────────────────────
-    let show_result = call_tool(&store, &ws, "architecture", &json!({}));
+    let show_result = call_tool(&store, &ws, "rust_status", &json!({"detail": "full"}));
     let show_json = unwrap_tool_text(&show_result);
 
     let desired_contexts = show_json["implemented"]["bounded_contexts"]
@@ -408,7 +408,7 @@ fn self_refactor_lifecycle() {
         .expect("save_desired failed");
 
     // ── Step 1: Plan with no changes → should be in_sync ───────────────
-    let result = call_write_tool(&ws, &store, "refactor", &json!({"action": "plan"}));
+    let result = call_write_tool(&ws, &store, "rust_diagnose", &json!({"action": "plan"}));
     let plan_json = unwrap_tool_text(&result);
     // When actual == desired, expect in_sync or empty changes
     let is_sync = plan_json
@@ -431,7 +431,7 @@ fn self_refactor_lifecycle() {
     call_write_tool(
         &ws,
         &store,
-        "define",
+        "rust_annotations",
         &json!({
             "kind": "bounded_context",
             "name": "Telemetry",
@@ -442,7 +442,7 @@ fn self_refactor_lifecycle() {
     call_write_tool(
         &ws,
         &store,
-        "define",
+        "rust_annotations",
         &json!({
             "kind": "entity",
             "context": "Telemetry",
@@ -459,7 +459,7 @@ fn self_refactor_lifecycle() {
     );
 
     // ── Step 3: Plan with changes → should show pending_changes ────────
-    let result = call_write_tool(&ws, &store, "refactor", &json!({"action": "plan"}));
+    let result = call_write_tool(&ws, &store, "rust_diagnose", &json!({"action": "plan"}));
     let plan_json = unwrap_tool_text(&result);
     let changes = plan_json
         .get("pending_changes")
@@ -474,7 +474,7 @@ fn self_refactor_lifecycle() {
     eprintln!("── Refactor plan: {} pending changes ──", change_count);
 
     // ── Step 4: Accept compatibility path is an actual-first no-op ──────
-    let result = call_write_tool(&ws, &store, "refactor", &json!({"action": "accept"}));
+    let result = call_write_tool(&ws, &store, "rust_diagnose", &json!({"action": "accept"}));
     let accept_json = unwrap_tool_text(&result);
     assert_eq!(
         accept_json.get("status").and_then(|s| s.as_str()),
@@ -484,7 +484,7 @@ fn self_refactor_lifecycle() {
     );
 
     // Verify: plan still reports temporal changes because accept does not erase history.
-    let result = call_write_tool(&ws, &store, "refactor", &json!({"action": "plan"}));
+    let result = call_write_tool(&ws, &store, "rust_diagnose", &json!({"action": "plan"}));
     let plan_json = unwrap_tool_text(&result);
     let is_pending = plan_json
         .get("status")
@@ -502,7 +502,7 @@ fn self_refactor_lifecycle() {
     );
 
     // Verify: implemented model includes Telemetry.
-    let show_result = call_tool(&store, &ws, "architecture", &json!({}));
+    let show_result = call_tool(&store, &ws, "rust_status", &json!({"detail": "full"}));
     let show_json = unwrap_tool_text(&show_result);
     let actual_contexts = show_json["implemented"]["bounded_contexts"]
         .as_array()
@@ -517,7 +517,7 @@ fn self_refactor_lifecycle() {
     call_write_tool(
         &ws,
         &store,
-        "define",
+        "rust_annotations",
         &json!({
             "kind": "bounded_context",
             "name": "Ephemeral",
@@ -526,7 +526,7 @@ fn self_refactor_lifecycle() {
         }),
     );
 
-    let result = call_write_tool(&ws, &store, "refactor", &json!({"action": "reset"}));
+    let result = call_write_tool(&ws, &store, "rust_diagnose", &json!({"action": "reset"}));
     let reset_json = unwrap_tool_text(&result);
     assert_eq!(
         reset_json.get("status").and_then(|s| s.as_str()),
@@ -536,7 +536,7 @@ fn self_refactor_lifecycle() {
     );
 
     // Verify: implemented graph still has Ephemeral because reset is a compatibility no-op.
-    let show_result = call_tool(&store, &ws, "architecture", &json!({}));
+    let show_result = call_tool(&store, &ws, "rust_status", &json!({"detail": "full"}));
     let show_json = unwrap_tool_text(&show_result);
     let desired_contexts = show_json["implemented"]["bounded_contexts"]
         .as_array()
@@ -617,7 +617,7 @@ fn self_model_proves_mcp_value() {
     eprintln!("── Value: {} parameter types used >1 time ──", rows.len());
 
     // ── Value 6: Full model statistics ─────────────────────────────────
-    let result = call_tool(&store, &ws, "architecture", &json!({}));
+    let result = call_tool(&store, &ws, "rust_status", &json!({"detail": "full"}));
     let show = unwrap_tool_text(&result);
     let model = &show["current"];
     assert!(model.is_object(), "Model must be present");
@@ -664,7 +664,7 @@ fn self_scan_via_mcp_tool_dispatch() {
     let ws = ws_root.to_string_lossy().to_string();
 
     // Use the MCP write_tool dispatch directly (same path as MCP clients)
-    let result = call_write_tool(&ws, &store, "sync", &json!({}));
+    let result = call_write_tool(&ws, &store, "rust_scan", &json!({}));
     let scan_json = unwrap_tool_text(&result);
 
     assert_eq!(
@@ -686,7 +686,7 @@ fn self_scan_via_mcp_tool_dispatch() {
     eprintln!("── sync via MCP: {} ──", scan_json["message"]);
 
     // Now architecture must work
-    let show_result = call_tool(&store, &ws, "architecture", &json!({}));
+    let show_result = call_tool(&store, &ws, "rust_status", &json!({"detail": "full"}));
     let show_json = unwrap_tool_text(&show_result);
     assert!(
         show_json["current"].is_object() && show_json["current"]["bounded_contexts"].is_array(),
@@ -722,7 +722,7 @@ fn self_mutate_remove_elements() {
     call_write_tool(
         &ws,
         &store,
-        "define",
+        "rust_annotations",
         &json!({
             "kind": "bounded_context",
             "name": "Disposable",
@@ -733,7 +733,7 @@ fn self_mutate_remove_elements() {
     call_write_tool(
         &ws,
         &store,
-        "define",
+        "rust_annotations",
         &json!({
             "kind": "entity",
             "context": "Disposable",
@@ -744,7 +744,7 @@ fn self_mutate_remove_elements() {
     );
 
     // Verify they exist
-    let show = call_tool(&store, &ws, "architecture", &json!({}));
+    let show = call_tool(&store, &ws, "rust_status", &json!({"detail": "full"}));
     let json = unwrap_tool_text(&show);
     let contexts = json["implemented"]["bounded_contexts"].as_array().unwrap();
     assert!(
@@ -756,7 +756,7 @@ fn self_mutate_remove_elements() {
     let result = call_write_tool(
         &ws,
         &store,
-        "define",
+        "rust_annotations",
         &json!({
             "kind": "entity",
             "action": "remove",
@@ -770,7 +770,7 @@ fn self_mutate_remove_elements() {
     let result = call_write_tool(
         &ws,
         &store,
-        "define",
+        "rust_annotations",
         &json!({
             "kind": "bounded_context",
             "action": "remove",
@@ -780,7 +780,7 @@ fn self_mutate_remove_elements() {
     unwrap_tool_text(&result);
 
     // Verify removal
-    let show = call_tool(&store, &ws, "architecture", &json!({}));
+    let show = call_tool(&store, &ws, "rust_status", &json!({"detail": "full"}));
     let json = unwrap_tool_text(&show);
     let contexts = json["implemented"]["bounded_contexts"].as_array().unwrap();
     assert!(
@@ -810,7 +810,7 @@ fn self_diagnose_improvement_loop() {
         .expect("save_desired must succeed");
 
     // ── Step 2: Run diagnose ───────────────────────────────────────────
-    let result = call_write_tool(&ws, &store, "refactor", &json!({"action": "diagnose"}));
+    let result = call_write_tool(&ws, &store, "rust_diagnose", &json!({"action": "diagnose"}));
     let report = unwrap_tool_text(&result);
 
     eprintln!("── Diagnose results ──");
@@ -888,7 +888,7 @@ fn self_dead_code_flags_listed_via_single_graph_call() {
     let result = call_tool(
         &store,
         &ws,
-        "graph",
+        "rust_graph",
         &json!({
             "view": "edges",
             "relation": "ast_edge",

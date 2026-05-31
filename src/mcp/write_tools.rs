@@ -166,242 +166,6 @@ fn rust_native_write_tools() -> Vec<ToolDefinition> {
     ]
 }
 
-#[allow(dead_code)]
-fn legacy_write_tools() -> Vec<ToolDefinition> {
-    let mut tools = vec![
-        ToolDefinition {
-            name: "define".into(),
-            description: "Create, update, or remove semantic annotations on top of the Rust fact \
-                          graph: context labels, module metadata, DDD candidates, ownership, \
-                          policies, decisions, and rationale. This does not mutate source-extracted \
-                          Rust facts; use sync to refresh ground truth and graph/query_rust_graph \
-                          to inspect it. Use define only when code or conversation reveals meaning \
-                          static extraction cannot prove. \
-                          Fields, methods, and invariants are merged (not replaced). \
-                          All changes are auto-saved. \
-                          Returns suggested file paths for created/updated artifacts. \
-                          To remove an element, set action to 'remove'."
-                .into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "kind": {
-                        "type": "string",
-                        "enum": ["bounded_context", "aggregate", "entity", "policy", "read_model", "service", "event", "value_object", "repository", "module", "external_system", "architectural_decision"],
-                        "description": "Type of model element to create/update/remove"
-                    },
-                    "action": {
-                        "type": "string",
-                        "enum": ["upsert", "remove"],
-                        "description": "Whether to create/update or remove the element (default: upsert)"
-                    },
-                    "context": { "type": "string", "description": "Semantic context/module annotation target (required for DDD overlay kinds)" },
-                    "name": { "type": "string", "description": "Element name" },
-                    "description": { "type": "string" },
-                    "module_path": { "type": "string", "description": "Module path (bounded_context or module)" },
-                    "public": { "type": "boolean", "description": "Whether module is public (module only, default: true)" },
-                    "dependencies": {
-                        "type": "array", "items": { "type": "string" },
-                        "description": "Annotated dependencies (bounded_context: context deps; service: service deps)"
-                    },
-                    "ownership": {
-                        "type": "object",
-                        "properties": {
-                            "team": { "type": "string" },
-                            "owners": { "type": "array", "items": { "type": "string" } },
-                            "rationale": { "type": "string" }
-                        },
-                        "description": "Ownership/team metadata"
-                    },
-                    "root_entity": { "type": "string", "description": "Aggregate root entity name" },
-                    "entities": { "type": "array", "items": { "type": "string" }, "description": "Aggregate entity members" },
-                    "value_objects": { "type": "array", "items": { "type": "string" }, "description": "Aggregate value object members" },
-                    "policy_kind": { "type": "string", "enum": ["domain", "process_manager", "integration"], "description": "Policy classification" },
-                    "triggers": { "type": "array", "items": { "type": "string" }, "description": "Policy trigger events" },
-                    "commands": { "type": "array", "items": { "type": "string" }, "description": "Policy emitted commands" },
-                    "consumed_by_contexts": { "type": "array", "items": { "type": "string" }, "description": "Contexts integrating with an external system" },
-                    "kind_label": { "type": "string", "description": "Free-form kind label for external systems" },
-                    "rationale": { "type": "string", "description": "Architectural rationale or boundary rationale" },
-                    "title": { "type": "string", "description": "Architectural decision title" },
-                    "status": { "type": "string", "enum": ["proposed", "accepted", "superseded", "deprecated"], "description": "Decision lifecycle status" },
-                    "scope": { "type": "string", "description": "Decision scope" },
-                    "date": { "type": "string", "description": "Decision date" },
-                    "contexts": { "type": "array", "items": { "type": "string" }, "description": "Related bounded contexts" },
-                    "consequences": { "type": "array", "items": { "type": "string" }, "description": "Decision consequences" },
-                    "aggregate_root": { "type": "boolean", "description": "Entity only" },
-                    "fields": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "name": { "type": "string" },
-                                "type": { "type": "string" },
-                                "required": { "type": "boolean" },
-                                "description": { "type": "string" }
-                            },
-                            "required": ["name", "type"]
-                        },
-                        "description": "Fields (entity, event, value_object, read_model)"
-                    },
-                    "methods": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "name": { "type": "string" },
-                                "description": { "type": "string" },
-                                "parameters": {
-                                    "type": "array",
-                                    "items": {
-                                        "type": "object",
-                                        "properties": {
-                                            "name": { "type": "string" },
-                                            "type": { "type": "string" }
-                                        },
-                                        "required": ["name", "type"]
-                                    }
-                                },
-                                "return_type": { "type": "string" }
-                            },
-                            "required": ["name"]
-                        },
-                        "description": "Methods (entity, service, repository)"
-                    },
-                    "invariants": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "Invariants (entity only)"
-                    },
-                    "service_kind": {
-                        "type": "string",
-                        "enum": ["domain", "application", "infrastructure"],
-                        "description": "Service layer classification (service only)"
-                    },
-                    "source": { "type": "string", "description": "Source entity (event only)" },
-                    "validation_rules": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "Validation rules (value_object only)"
-                    },
-                    "aggregate": { "type": "string", "description": "Aggregate entity name (repository only)" }
-                },
-                "required": ["kind", "name"]
-            }),
-        },
-        ToolDefinition {
-            name: "sync".into(),
-            description: "Scan the workspace source code and populate the implemented Rust fact \
-                          graph from what is actually implemented. Extracts modules, structs, \
-                          functions, methods, imports, and call graphs from Rust source files. \
-                          Usually runs automatically via the file watcher; call graph/query_rust_graph \
-                          after sync to inspect persisted Cozo facts."
-                .into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {},
-                "required": []
-            }),
-        },
-        ToolDefinition {
-            name: "refactor".into(),
-            description: "Diagnose the implemented Rust architecture and report temporal graph changes. \
-                          Actions: \
-                          'diagnose' — run full analysis (health score, all checks, drift, AST statistics) \
-                          and return a prioritized action plan. Use this to start or continue improvement. \
-                          'plan' (default) — produce a refactoring plan from current facts and recent temporal changes. \
-                          'accept' and 'reset' are compatibility no-ops in actual-first mode."
-                .into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["diagnose", "plan", "accept", "reset"],
-                        "description": "Refactoring lifecycle action (default: plan)"
-                    }
-                },
-                "required": []
-            }),
-        },
-        ToolDefinition {
-            name: "constrain".into(),
-            description: "Declare and evaluate architectural constraints. \
-                          Assign Rust modules or semantic context annotations to layers (e.g., domain, application, infrastructure), \
-                          declare forbidden or allowed dependencies between layers or modules, \
-                          list current constraints, or evaluate all constraints to find violations."
-                .into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["assign_layer", "remove_layer", "add_constraint", "remove_constraint", "list", "evaluate"],
-                        "description": "Policy action to perform"
-                    },
-                    "context": { "type": "string", "description": "Bounded context name (for assign_layer/remove_layer)" },
-                    "layer": { "type": "string", "description": "Layer name, e.g. 'domain', 'application', 'infrastructure' (for assign_layer)" },
-                    "constraint_kind": {
-                        "type": "string",
-                        "enum": ["layer", "context"],
-                        "description": "Whether the constraint applies to layers or specific contexts (for add_constraint/remove_constraint)"
-                    },
-                    "source": { "type": "string", "description": "Source layer or context name (for constraints)" },
-                    "target": { "type": "string", "description": "Target layer or context name (for constraints)" },
-                    "rule": {
-                        "type": "string",
-                        "enum": ["forbidden", "allowed"],
-                        "description": "Whether the dependency is forbidden or explicitly allowed (default: forbidden)"
-                    }
-                },
-                "required": ["action"]
-            }),
-        },
-    ];
-
-    add_tool_alias(
-        &mut tools,
-        "define",
-        "set_model",
-        "Alias for define. Create, update, or remove model elements; create/update are normalized to upsert.",
-    );
-    add_tool_alias(
-        &mut tools,
-        "sync",
-        "scan_model",
-        "Alias for sync. AST-scan workspace source code and populate the implemented architecture model.",
-    );
-    add_tool_alias(
-        &mut tools,
-        "refactor",
-        "refactor_model",
-        "Alias for refactor. Diagnose, plan, and report implemented-graph changes.",
-    );
-    add_tool_alias(
-        &mut tools,
-        "constrain",
-        "assert_model",
-        "Alias for constrain. Declare and evaluate layer assignments and dependency constraints.",
-    );
-
-    tools
-}
-
-fn add_tool_alias(
-    tools: &mut Vec<ToolDefinition>,
-    source_name: &str,
-    alias_name: &str,
-    description: &str,
-) {
-    if let Some(source) = tools.iter().find(|tool| tool.name == source_name) {
-        tools.push(ToolDefinition {
-            name: alias_name.into(),
-            description: description.into(),
-            input_schema: source.input_schema.clone(),
-        });
-    }
-}
-
-/// Dispatches a write tool call.
 pub fn call_write_tool(
     workspace_path: &str,
     store: &Store,
@@ -417,13 +181,16 @@ fn dispatch_write_tool(
     name: &str,
     args: &Value,
 ) -> ToolCallResult {
+    // Only the canonical rust-native write tools are accepted.
+    if !matches!(
+        name,
+        "rust_scan" | "rust_annotations" | "rust_diagnose" | "rust_constraints"
+    ) {
+        return error_result(format!("Unknown write tool: {name}"));
+    }
     let canonical_name = canonical_write_tool_name(name);
     let mut normalized_args = args.clone();
     let mut use_normalized_args = false;
-    if name == "set_model" {
-        normalize_set_model_args(&mut normalized_args);
-        use_normalized_args = true;
-    }
     if matches!(name, "rust_annotations" | "rust_constraints") {
         normalize_rust_native_write_args(&mut normalized_args);
         use_normalized_args = true;
@@ -1025,12 +792,13 @@ fn dispatch_write_tool(
     }
 }
 
+/// Map a canonical rust-native write tool to its internal handler key.
 fn canonical_write_tool_name(name: &str) -> &str {
     match name {
-        "rust_annotations" | "define" | "set_model" => "define",
-        "rust_scan" | "sync" | "scan_model" => "sync",
-        "rust_diagnose" | "refactor" | "refactor_model" => "refactor",
-        "rust_constraints" | "constrain" | "assert_model" => "constrain",
+        "rust_annotations" => "define",
+        "rust_scan" => "sync",
+        "rust_diagnose" => "refactor",
+        "rust_constraints" => "constrain",
         other => other,
     }
 }
@@ -1044,18 +812,6 @@ fn normalize_rust_native_write_args(args: &mut Value) {
     }
     if let Some(module) = object.get("module").cloned() {
         object.insert("context".into(), module);
-    }
-}
-
-fn normalize_set_model_args(args: &mut Value) {
-    let Some(object) = args.as_object_mut() else {
-        return;
-    };
-    let Some(action) = object.get("action").and_then(|value| value.as_str()) else {
-        return;
-    };
-    if action == "create" || action == "update" {
-        object.insert("action".into(), json!("upsert"));
     }
 }
 
@@ -2398,38 +2154,6 @@ mod tests {
     }
 
     #[test]
-    fn test_set_model_alias_normalizes_create_to_upsert() {
-        let ws = "/tmp/test-set-model-alias";
-        let store = setup(ws);
-        let result = call_write_tool(
-            ws,
-            &store,
-            "set_model",
-            &json!({
-                "kind": "entity",
-                "action": "create",
-                "context": "Identity",
-                "name": "Account",
-                "fields": [{"name": "id", "type": "AccountId"}]
-            }),
-        );
-
-        assert!(result.is_error.is_none());
-        let loaded = store.load_desired(ws).unwrap().unwrap();
-        let identity = loaded
-            .bounded_contexts
-            .iter()
-            .find(|c| c.name == "Identity")
-            .unwrap();
-        assert!(
-            identity
-                .entities
-                .iter()
-                .any(|entity| entity.name == "Account")
-        );
-    }
-
-    #[test]
     fn test_build_sync_report_success_after_initial_scan() {
         let report = build_sync_report(
             SyncCounts {
@@ -2505,7 +2229,7 @@ mod tests {
         let result = call_write_tool(
             ws,
             &store,
-            "define",
+            "rust_annotations",
             &json!({
                 "kind": "entity", "context": "Identity", "name": "User",
                 "fields": [{"name": "email", "type": "String", "required": true}]
@@ -2530,7 +2254,7 @@ mod tests {
         let result = call_write_tool(
             ws,
             &store,
-            "define",
+            "rust_annotations",
             &json!({
                 "kind": "entity", "context": "Identity", "name": "User",
                 "fields": [{"name": "id", "type": "Uuid"}]
@@ -2555,7 +2279,7 @@ mod tests {
         let result = call_write_tool(
             ws,
             &store,
-            "define",
+            "rust_annotations",
             &json!({
                 "kind": "entity", "context": "Identity", "name": "Role",
                 "description": "A role assignment", "aggregate_root": false,
@@ -2580,7 +2304,7 @@ mod tests {
         let result = call_write_tool(
             ws,
             &store,
-            "define",
+            "rust_annotations",
             &json!({"kind": "entity", "context": "Nonexistent", "name": "Foo"}),
         );
         assert_eq!(result.is_error, Some(true));
@@ -2593,7 +2317,7 @@ mod tests {
         let result = call_write_tool(
             ws,
             &store,
-            "define",
+            "rust_annotations",
             &json!({
                 "kind": "bounded_context", "name": "Billing",
                 "description": "Billing context", "module_path": "src/billing",
@@ -2618,7 +2342,7 @@ mod tests {
         let result = call_write_tool(
             ws,
             &store,
-            "define",
+            "rust_annotations",
             &json!({
                 "kind": "bounded_context", "name": "Identity",
                 "description": "Updated description"
@@ -2641,7 +2365,7 @@ mod tests {
         let result = call_write_tool(
             ws,
             &store,
-            "define",
+            "rust_annotations",
             &json!({"kind": "entity", "action": "remove", "context": "Identity", "name": "User"}),
         );
         assert!(result.is_error.is_none());
@@ -2661,7 +2385,7 @@ mod tests {
         let result = call_write_tool(
             ws,
             &store,
-            "define",
+            "rust_annotations",
             &json!({"kind": "entity", "action": "remove", "context": "Identity", "name": "NotHere"}),
         );
         assert_eq!(result.is_error, Some(true));
@@ -2674,7 +2398,7 @@ mod tests {
         let result = call_write_tool(
             ws,
             &store,
-            "define",
+            "rust_annotations",
             &json!({
                 "kind": "service", "context": "Identity", "name": "AuthService",
                 "service_kind": "application", "description": "Handles authentication"
@@ -2698,7 +2422,7 @@ mod tests {
         let result = call_write_tool(
             ws,
             &store,
-            "define",
+            "rust_annotations",
             &json!({
                 "kind": "event", "context": "Identity", "name": "UserRegistered",
                 "source": "User", "fields": [{"name": "user_id", "type": "UserId"}]
@@ -2723,7 +2447,7 @@ mod tests {
         let result = call_write_tool(
             ws,
             &store,
-            "define",
+            "rust_annotations",
             &json!({
                 "kind": "aggregate",
                 "context": "Identity",
@@ -2766,7 +2490,7 @@ mod tests {
         call_write_tool(
             ws,
             &store,
-            "define",
+            "rust_annotations",
             &json!({
                 "kind": "policy",
                 "context": "Identity",
@@ -2780,7 +2504,7 @@ mod tests {
         let result = call_write_tool(
             ws,
             &store,
-            "define",
+            "rust_annotations",
             &json!({
                 "kind": "policy",
                 "context": "Identity",
@@ -2817,7 +2541,7 @@ mod tests {
         call_write_tool(
             ws,
             &store,
-            "define",
+            "rust_annotations",
             &json!({
                 "kind": "read_model",
                 "context": "Identity",
@@ -2830,7 +2554,7 @@ mod tests {
         let result = call_write_tool(
             ws,
             &store,
-            "define",
+            "rust_annotations",
             &json!({
                 "kind": "read_model",
                 "context": "Identity",
@@ -2864,7 +2588,7 @@ mod tests {
         let system_result = call_write_tool(
             ws,
             &store,
-            "define",
+            "rust_annotations",
             &json!({
                 "kind": "external_system",
                 "name": "Stripe",
@@ -2879,7 +2603,7 @@ mod tests {
         let decision_result = call_write_tool(
             ws,
             &store,
-            "define",
+            "rust_annotations",
             &json!({
                 "kind": "architectural_decision",
                 "name": "ADR-001",
@@ -2917,7 +2641,7 @@ mod tests {
         call_write_tool(
             ws,
             &store,
-            "define",
+            "rust_annotations",
             &json!({
                 "kind": "aggregate", "context": "Identity", "name": "UserAggregate", "root_entity": "User"
             }),
@@ -2925,7 +2649,7 @@ mod tests {
         call_write_tool(
             ws,
             &store,
-            "define",
+            "rust_annotations",
             &json!({
                 "kind": "external_system", "name": "Stripe"
             }),
@@ -2934,7 +2658,7 @@ mod tests {
         let rm_aggregate = call_write_tool(
             ws,
             &store,
-            "define",
+            "rust_annotations",
             &json!({
                 "kind": "aggregate", "action": "remove", "context": "Identity", "name": "UserAggregate"
             }),
@@ -2942,7 +2666,7 @@ mod tests {
         let rm_system = call_write_tool(
             ws,
             &store,
-            "define",
+            "rust_annotations",
             &json!({
                 "kind": "external_system", "action": "remove", "name": "Stripe"
             }),
@@ -2975,7 +2699,7 @@ mod tests {
         call_write_tool(
             ws,
             &store,
-            "define",
+            "rust_annotations",
             &json!({"kind": "bounded_context", "name": "Billing", "description": "Billing context"}),
         );
         let loaded = store.load_desired(ws).unwrap().unwrap();
@@ -2989,7 +2713,7 @@ mod tests {
         let result = call_write_tool(
             ws,
             &store,
-            "define",
+            "rust_annotations",
             &json!({"kind": "entity", "context": "Nonexistent", "name": "Foo"}),
         );
         assert_eq!(result.is_error, Some(true));
@@ -3025,16 +2749,16 @@ mod tests {
         call_write_tool(
             ws,
             &store,
-            "define",
+            "rust_annotations",
             &json!({"kind": "bounded_context", "name": "Billing", "description": "Billing context"}),
         );
-        let result = call_write_tool(ws, &store, "refactor", &json!({}));
+        let result = call_write_tool(ws, &store, "rust_diagnose", &json!({}));
         let text = match &result.content[0] {
             ContentBlock::Text { text } => text,
         };
         let first: serde_json::Value = serde_json::from_str(text).unwrap();
         assert_eq!(first["status"], "pending_changes");
-        let result = call_write_tool(ws, &store, "refactor", &json!({}));
+        let result = call_write_tool(ws, &store, "rust_diagnose", &json!({}));
         let text = match &result.content[0] {
             ContentBlock::Text { text } => text,
         };
@@ -3050,10 +2774,10 @@ mod tests {
         call_write_tool(
             ws,
             &store,
-            "define",
+            "rust_annotations",
             &json!({"kind": "bounded_context", "name": "Billing", "description": "Billing context"}),
         );
-        let result = call_write_tool(ws, &store, "refactor", &json!({"action": "accept"}));
+        let result = call_write_tool(ws, &store, "rust_diagnose", &json!({"action": "accept"}));
         let text = match &result.content[0] {
             ContentBlock::Text { text } => text,
         };
@@ -3062,7 +2786,7 @@ mod tests {
         assert_eq!(accepted["provenance"]["source"], "refactor_lifecycle");
         assert_eq!(accepted["provenance"]["state"], "actual");
         assert!(accepted.get("truth_maintenance").is_some());
-        let result = call_write_tool(ws, &store, "refactor", &json!({}));
+        let result = call_write_tool(ws, &store, "rust_diagnose", &json!({}));
         let text = match &result.content[0] {
             ContentBlock::Text { text } => text,
         };
@@ -3078,19 +2802,19 @@ mod tests {
         call_write_tool(
             ws,
             &store,
-            "define",
+            "rust_annotations",
             &json!({"kind": "bounded_context", "name": "Identity", "description": "Original"}),
         );
-        call_write_tool(ws, &store, "refactor", &json!({"action": "accept"}));
+        call_write_tool(ws, &store, "rust_diagnose", &json!({"action": "accept"}));
         call_write_tool(
             ws,
             &store,
-            "define",
+            "rust_annotations",
             &json!({"kind": "bounded_context", "name": "Billing", "description": "New context"}),
         );
         let desired = store.load_desired(ws).unwrap().unwrap();
         assert_eq!(desired.bounded_contexts.len(), 2);
-        let result = call_write_tool(ws, &store, "refactor", &json!({"action": "reset"}));
+        let result = call_write_tool(ws, &store, "rust_diagnose", &json!({"action": "reset"}));
         let text = match &result.content[0] {
             ContentBlock::Text { text } => text,
         };
@@ -3110,7 +2834,7 @@ mod tests {
         call_write_tool(
             ws,
             &store,
-            "define",
+            "rust_annotations",
             &json!({
                 "kind": "service", "context": "Identity", "name": "AuthService",
                 "service_kind": "application",
@@ -3120,7 +2844,7 @@ mod tests {
         call_write_tool(
             ws,
             &store,
-            "define",
+            "rust_annotations",
             &json!({
                 "kind": "service", "context": "Identity", "name": "AuthService",
                 "methods": [{"name": "logout", "return_type": "void"}]
@@ -3147,7 +2871,7 @@ mod tests {
         let result = call_write_tool(
             ws,
             &store,
-            "define",
+            "rust_annotations",
             &json!({"kind": "bounded_context", "action": "remove", "name": "Identity"}),
         );
         assert!(result.is_error.is_none());
@@ -3159,7 +2883,7 @@ mod tests {
     #[test]
     fn test_missing_kind() {
         let store = test_store();
-        let result = call_write_tool("/tmp/test-ws", &store, "define", &json!({"name": "Foo"}));
+        let result = call_write_tool("/tmp/test-ws", &store, "rust_annotations", &json!({"name": "Foo"}));
         assert_eq!(result.is_error, Some(true));
     }
 
@@ -3169,7 +2893,7 @@ mod tests {
         let store = setup(ws);
 
         // diagnose on a model with data
-        let result = call_write_tool(ws, &store, "refactor", &json!({"action": "diagnose"}));
+        let result = call_write_tool(ws, &store, "rust_diagnose", &json!({"action": "diagnose"}));
         assert!(result.is_error.is_none() || result.is_error == Some(false));
 
         let text = match &result.content[0] {
@@ -3237,7 +2961,7 @@ mod tests {
         let result = call_write_tool(
             "/tmp/test-diagnose-empty",
             &store,
-            "refactor",
+            "rust_diagnose",
             &json!({"action": "diagnose"}),
         );
         assert!(result.is_error.is_none() || result.is_error == Some(false));

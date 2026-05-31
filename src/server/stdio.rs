@@ -21,14 +21,6 @@ const WRITE_TOOLS: &[&str] = &[
     "rust_annotations",
     "rust_diagnose",
     "rust_constraints",
-    "define",
-    "sync",
-    "refactor",
-    "constrain",
-    "set_model",
-    "scan_model",
-    "refactor_model",
-    "assert_model",
 ];
 
 /// Run the MCP server over stdio (stdin/stdout), the standard transport for
@@ -445,7 +437,7 @@ mod tests {
         let store = test_store();
         let req = make_request(
             "tools/call",
-            Some(json!({"name": "architecture", "arguments": {}})),
+            Some(json!({"name": "rust_status", "arguments": {"detail": "full"}})),
         );
         let resp = handle_request("/tmp/test-stdio", &store, &req);
         assert!(resp.error.is_none());
@@ -523,7 +515,7 @@ mod tests {
 
         let req = make_request(
             "tools/call",
-            Some(json!({"name": "get_model", "arguments": {"crate": "member"}})),
+            Some(json!({"name": "rust_status", "arguments": {"crate": "member", "detail": "full"}})),
         );
         let resp = handle_request_with_registry(&registry, &req);
         assert!(resp.error.is_none());

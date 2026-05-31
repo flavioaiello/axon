@@ -206,298 +206,6 @@ fn rust_native_read_tools() -> Vec<ToolDefinition> {
     ]
 }
 
-#[allow(dead_code)]
-fn legacy_read_tools() -> Vec<ToolDefinition> {
-    let mut tools = vec![
-        ToolDefinition {
-            name: "architecture".into(),
-            description: "Show the complete implemented Rust architecture contract: workspace, \
-                          crate, modules/submodules, source files, Rust symbols, imports, calls, \
-                          and semantic overlays. Includes the compact overview projection used by \
-                          the web UI plus health and temporal change status. Call this first before \
-                          changing a Rust codebase."
-                .into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {},
-                "required": []
-            }),
-        },
-        ToolDefinition {
-            name: "graph".into(),
-            description: "Query the Rust graph database directly through bounded, structured views. \
-                          Exposes source files, symbols, modules, imports, call edges, dependency \
-                          edges, AST edges, neighborhoods, paths, and relation counts without \
-                          allowing arbitrary Datalog execution. Use this when an AI agent needs \
-                          precise graph facts before planning or editing Rust code."
-                .into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "view": {
-                        "type": "string",
-                        "enum": ["overview", "relations", "nodes", "edges", "neighborhood", "paths"],
-                        "description": "Graph view to return (default: overview)"
-                    },
-                    "kind": {
-                        "type": "string",
-                        "enum": ["all", "context", "module", "source_file", "symbol", "struct", "enum", "function", "method"],
-                        "description": "Node kind filter for nodes/neighborhood views"
-                    },
-                    "relation": {
-                        "type": "string",
-                        "enum": ["all", "context_dep", "import_edge", "calls_symbol", "ast_edge", "resolved_call"],
-                        "description": "Edge relation filter for edges/paths views"
-                    },
-                    "context": { "type": "string", "description": "Context/module filter" },
-                    "module": { "type": "string", "description": "Alias for context/module filter" },
-                    "file": { "type": "string", "description": "Source file filter" },
-                    "symbol": { "type": "string", "description": "Rust symbol filter" },
-                    "struct": { "type": "string", "description": "Alias for symbol when targeting a Rust struct" },
-                    "from": { "type": "string", "description": "Source node for paths or edge filtering" },
-                    "to": { "type": "string", "description": "Target node for paths or edge filtering" },
-                    "limit": { "type": "integer", "description": "Max returned rows per collection (default: 50, max: 200)", "default": 50 }
-                },
-                "required": []
-            }),
-        },
-        ToolDefinition {
-            name: "impact".into(),
-            description: "Analyze downstream impact in the implemented Rust graph. Use module/context \
-                          for architecture-level dependency analysis and symbol/struct for call graph \
-                          analysis.\n\
-                          Supports: transitive_deps, circular_deps, layer_violations, impact_analysis, \n\
-                          aggregate_quality, dependency_graph, field_usage, method_search, shared_fields, \n\
-                          pagerank, community_detection, betweenness_centrality, degree_centrality, \n\
-                          topological_order, call_graph_callers, call_graph_callees, \n\
-                          call_graph_reachability, call_graph_stats."
-                .into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "analysis": {
-                        "type": "string",
-                        "enum": ["transitive_deps", "circular_deps", "layer_violations", "impact_analysis",
-                                 "aggregate_quality", "dependency_graph", "field_usage", "method_search",
-                                 "shared_fields", "pagerank", "community_detection", "betweenness_centrality",
-                                 "degree_centrality", "topological_order",
-                                 "call_graph_callers", "call_graph_callees", "call_graph_reachability", "call_graph_stats"],
-                        "description": "The specific analysis to run"
-                    },
-                    "context": { "type": "string", "description": "Compatibility alias for module/context name (required for transitive_deps, impact_analysis)" },
-                    "module": { "type": "string", "description": "Rust module name/path alias for context" },
-                    "entity": { "type": "string", "description": "Compatibility alias for struct/entity name (required for impact_analysis)" },
-                    "struct": { "type": "string", "description": "Rust struct name alias for entity" },
-                    "symbol": { "type": "string", "description": "Symbol name (required for call_graph_callers, call_graph_callees, call_graph_reachability)" },
-                    "field_type": { "type": "string", "description": "Field type to search (required for field_usage)" },
-                    "method_name": { "type": "string", "description": "Method name to search (required for method_search)" }
-                },
-                "required": ["analysis"]
-            }),
-        },
-        ToolDefinition {
-            name: "safe_to_delete".into(),
-            description: "Check whether a Rust symbol or struct can be safely deleted. Evaluates \
-                          inbound call edges, imports, AST references, and any semantic overlay \
-                          dependents. Context/module is optional; provide it to narrow overlay \
-                          evidence, or omit it for a workspace-wide Rust symbol check."
-                .into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "context": { "type": "string", "description": "Optional semantic context/module filter" },
-                    "module": { "type": "string", "description": "Optional Rust module/context filter" },
-                    "entity": { "type": "string", "description": "Compatibility entity name alias" },
-                    "struct": { "type": "string", "description": "Rust struct name alias" },
-                    "symbol": { "type": "string", "description": "Rust symbol name" }
-                },
-                "required": []
-            }),
-        },
-        ToolDefinition {
-            name: "check".into(),
-            description: "Check for architectural problems over the implemented Rust graph and semantic overlays: \
-                          circular dependencies, layer violations, missing business rules on core structs, \
-                          isolated modules, or policy violations. \
-                          Run without parameters to check everything at once."
-                .into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "check_name": {
-                        "type": "string",
-                        "enum": ["layer_violations", "circular_deps", "aggregate_quality", "orphan_contexts", "policy_violations", "drift"],
-                        "description": "Specific check to run (default: runs all checks)"
-                    }
-                },
-                "required": []
-            }),
-        },
-        ToolDefinition {
-            name: "how_connected".into(),
-            description: "Show how two Rust modules/components are connected. Returns proof paths \
-                          over stored dependency facts when available."
-                .into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "from": { "type": "string", "description": "Source module or component" },
-                    "to": { "type": "string", "description": "Target module or component" }
-                },
-                "required": ["from", "to"]
-            }),
-        },
-        ToolDefinition {
-            name: "why".into(),
-            description: "Explain why something is flagged as a problem. Returns evidence-backed \
-                          explanations with specific references and remediation suggestions."
-                .into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "violation_type": {
-                        "type": "string",
-                        "enum": ["layer_violations", "circular_deps", "policy_violations", "aggregate_quality", "orphan_contexts"],
-                        "description": "The type of problem to explain"
-                    }
-                },
-                "required": ["violation_type"]
-            }),
-        },
-        ToolDefinition {
-            name: "drift".into(),
-            description: "Compare the two most recent implemented architecture snapshots. Shows what was \
-                          added or removed in the actual graph over time."
-                .into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {},
-            }),
-        },
-        ToolDefinition {
-            name: "history".into(),
-            description: "View architecture change history. Without timestamps, lists available \
-                          snapshots. With timestamps, compares two points in time to show \
-                          what changed between them."
-                .into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "state": {
-                        "type": "string",
-                        "enum": ["actual", "implemented", "current", "planned"],
-                        "description": "Which history stream to query (default: actual; planned/current are compatibility aliases)"
-                    },
-                    "ts_old": {
-                        "type": "integer",
-                        "description": "Older snapshot timestamp (microseconds). Required for comparison."
-                    },
-                    "ts_new": {
-                        "type": "integer",
-                        "description": "Newer snapshot timestamp (microseconds). Omit for latest."
-                    }
-                },
-                "required": []
-            }),
-        },
-        ToolDefinition {
-            name: "search".into(),
-            description: "Search the architecture by keyword. Finds matching Rust modules, structs, \
-                          semantic labels, services/events overlays, and decisions across the codebase."
-                .into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "query": { "type": "string", "description": "Search keywords" },
-                    "limit": { "type": "integer", "description": "Max results (default: 20)", "default": 20 }
-                },
-                "required": ["query"]
-            }),
-        },
-    ];
-
-    add_tool_alias(
-        &mut tools,
-        "architecture",
-        "get_model",
-        "Alias for architecture. Returns the implemented Rust ontology contract with health and temporal change status.",
-    );
-    add_tool_alias(
-        &mut tools,
-        "graph",
-        "query_rust_graph",
-        "Alias for graph. Returns bounded Rust graph database views over source files, symbols, modules, imports, calls, and dependencies.",
-    );
-    add_tool_alias(
-        &mut tools,
-        "impact",
-        "query_blast_radius",
-        "Alias for impact. Runs dependency, impact, graph, field, method, and call-graph analyses.",
-    );
-    add_tool_alias(
-        &mut tools,
-        "safe_to_delete",
-        "can_delete_symbol",
-        "Alias for safe_to_delete. Checks whether a symbol can be deleted and returns inbound-reference witnesses.",
-    );
-    add_tool_alias(
-        &mut tools,
-        "check",
-        "check_architectural_invariant",
-        "Alias for check. Evaluates named architectural invariants and returns proof evidence.",
-    );
-    add_tool_alias(
-        &mut tools,
-        "how_connected",
-        "query_dependency_path",
-        "Alias for how_connected. Returns proof paths between two Rust modules/components.",
-    );
-    add_tool_alias(
-        &mut tools,
-        "why",
-        "explain_violation",
-        "Alias for why. Explains architectural violations with evidence and limitations.",
-    );
-    add_tool_alias(
-        &mut tools,
-        "drift",
-        "diff_models",
-        "Alias for drift. Compares recent implemented architecture snapshots.",
-    );
-    add_tool_alias(
-        &mut tools,
-        "search",
-        "search_architecture",
-        "Alias for search. Runs full-text search over stored architecture facts.",
-    );
-    tools.push(ToolDefinition {
-        name: "model_health".into(),
-        description: "Compute a structured Datalog-derived health report over implemented Rust facts and semantic overlays: score, cycles, layer violations, aggregate quality, orphan modules/contexts, and graph analytics when available.".into(),
-        input_schema: json!({
-            "type": "object",
-            "properties": {},
-            "required": []
-        }),
-    });
-
-    tools
-}
-
-fn add_tool_alias(
-    tools: &mut Vec<ToolDefinition>,
-    source_name: &str,
-    alias_name: &str,
-    description: &str,
-) {
-    if let Some(source) = tools.iter().find(|tool| tool.name == source_name) {
-        tools.push(ToolDefinition {
-            name: alias_name.into(),
-            description: description.into(),
-            input_schema: source.input_schema.clone(),
-        });
-    }
-}
-
 /// Dispatches a tool call and returns the result.
 pub fn call_tool(store: &Store, workspace_path: &str, name: &str, args: &Value) -> ToolCallResult {
     match name {
@@ -514,15 +222,7 @@ pub fn call_tool(store: &Store, workspace_path: &str, name: &str, args: &Value) 
             }
         }
 
-        "architecture" | "get_model" => {
-            let kernel = ReasoningKernel::new(store);
-            match kernel.architecture(workspace_path) {
-                Ok(claim) => stored_claim_result(store, workspace_path, &claim),
-                Err(e) => error_result(format!("architecture failed: {e}")),
-            }
-        }
-
-        "rust_graph" | "graph" | "query_rust_graph" => {
+        "rust_graph" => {
             match store.query_rust_graph(workspace_path, args) {
                 Ok(payload) => {
                     let payload = compact_rust_graph_payload(payload);
@@ -587,7 +287,7 @@ pub fn call_tool(store: &Store, workspace_path: &str, name: &str, args: &Value) 
             }
         }
 
-        "rust_health" | "model_health" => match store.model_health(workspace_path) {
+        "rust_health" => match store.model_health(workspace_path) {
             Ok(health) => {
                 let policy_gap_count = if health.policy_coverage.context_count == 0 {
                     0
@@ -637,7 +337,7 @@ pub fn call_tool(store: &Store, workspace_path: &str, name: &str, args: &Value) 
             Err(e) => error_result(format!("model_health failed: {e}")),
         },
 
-        "rust_impact" | "impact" | "query_blast_radius" => {
+        "rust_impact" => {
             let kernel = ReasoningKernel::new(store);
             match kernel.impact(workspace_path, args) {
                 Ok(claim) => stored_claim_result(store, workspace_path, &claim),
@@ -645,7 +345,7 @@ pub fn call_tool(store: &Store, workspace_path: &str, name: &str, args: &Value) 
             }
         }
 
-        "rust_delete_safety" | "safe_to_delete" | "can_delete_symbol" => {
+        "rust_delete_safety" => {
             let context = args["context"]
                 .as_str()
                 .or_else(|| args["module"].as_str())
@@ -669,7 +369,7 @@ pub fn call_tool(store: &Store, workspace_path: &str, name: &str, args: &Value) 
             }
         }
 
-        "rust_invariants" | "check" | "check_architectural_invariant" => {
+        "rust_invariants" => {
             let invariant = args["check_name"]
                 .as_str()
                 .or_else(|| args["invariant"].as_str())
@@ -688,7 +388,7 @@ pub fn call_tool(store: &Store, workspace_path: &str, name: &str, args: &Value) 
             }
         }
 
-        "rust_path" | "how_connected" | "query_dependency_path" => {
+        "rust_path" => {
             let from = args["from"]
                 .as_str()
                 .or_else(|| args["from_context"].as_str());
@@ -709,7 +409,7 @@ pub fn call_tool(store: &Store, workspace_path: &str, name: &str, args: &Value) 
             }
         }
 
-        "rust_explain" | "why" | "explain_violation" => {
+        "rust_explain" => {
             let violation_type = match args["violation_type"].as_str() {
                 Some(v) => v,
                 None => return error_result("'violation_type' parameter is required".into()),
@@ -722,7 +422,7 @@ pub fn call_tool(store: &Store, workspace_path: &str, name: &str, args: &Value) 
             }
         }
 
-        "rust_diff" | "drift" | "diff_models" => {
+        "rust_diff" => {
             let kernel = ReasoningKernel::new(store);
             match kernel.drift(workspace_path) {
                 Ok(claim) => stored_claim_result(store, workspace_path, &claim),
@@ -730,7 +430,7 @@ pub fn call_tool(store: &Store, workspace_path: &str, name: &str, args: &Value) 
             }
         }
 
-        "rust_history" | "history" => {
+        "rust_history" => {
             let kernel = ReasoningKernel::new(store);
             match kernel.history(workspace_path, args) {
                 Ok(claim) => stored_claim_result(store, workspace_path, &claim),
@@ -738,7 +438,7 @@ pub fn call_tool(store: &Store, workspace_path: &str, name: &str, args: &Value) 
             }
         }
 
-        "rust_search" | "search" | "search_architecture" => {
+        "rust_search" => {
             let query = match args["query"].as_str() {
                 Some(q) => q,
                 None => return error_result("'query' parameter is required".into()),
@@ -1752,7 +1452,7 @@ mod tests {
         let result = call_tool(
             &store,
             &ws,
-            "graph",
+            "rust_graph",
             &json!({
                 "view": "neighborhood",
                 "symbol": "CoreService",
@@ -1926,7 +1626,7 @@ mod tests {
         let result = call_tool(
             &store,
             &ws,
-            "impact",
+            "rust_impact",
             &json!({
                 "analysis": "transitive_deps",
                 "context": "A"
@@ -1949,7 +1649,7 @@ mod tests {
         let initial = call_tool(
             &store,
             &ws,
-            "impact",
+            "rust_impact",
             &json!({"analysis": "call_graph_callers", "symbol": "Store::query_call_paths"}),
         );
         assert_eq!(initial.is_error, None);
@@ -1970,7 +1670,7 @@ mod tests {
         let refreshed = call_tool(
             &store,
             &ws,
-            "impact",
+            "rust_impact",
             &json!({"analysis": "call_graph_callers", "symbol": "Store::query_call_paths"}),
         );
         assert_eq!(refreshed.is_error, None);
@@ -2009,7 +1709,7 @@ mod tests {
         let result = call_tool(
             &store,
             &ws,
-            "impact",
+            "rust_impact",
             &json!({"analysis": "call_graph_stats"}),
         );
         assert_eq!(result.is_error, None);
@@ -2270,7 +1970,7 @@ mod tests {
         let result = call_tool(
             &store,
             &ws,
-            "safe_to_delete",
+            "rust_delete_safety",
             &json!({
                 "context": "Sales",
                 "entity": "Order"
@@ -2323,7 +2023,7 @@ mod tests {
         let result = call_tool(
             &store,
             &ws,
-            "safe_to_delete",
+            "rust_delete_safety",
             &json!({ "symbol": "TargetSymbol" }),
         );
         assert_eq!(result.is_error, None);
@@ -2403,7 +2103,7 @@ mod tests {
         let result = call_tool(
             &store,
             &ws,
-            "check",
+            "rust_invariants",
             &json!({
                 "check_name": "circular_deps"
             }),
@@ -2424,7 +2124,7 @@ mod tests {
         let result = call_tool(
             &store,
             "/tmp/test",
-            "check",
+            "rust_invariants",
             &json!({
                 "check_name": "nonexistent"
             }),
@@ -2496,7 +2196,7 @@ mod tests {
         let result = call_tool(
             &store,
             &ws,
-            "how_connected",
+            "rust_path",
             &json!({
                 "from": "A",
                 "to": "B"
@@ -2578,7 +2278,7 @@ mod tests {
         let result = call_tool(
             &store,
             &ws,
-            "why",
+            "rust_explain",
             &json!({
                 "violation_type": "layer_violations"
             }),
