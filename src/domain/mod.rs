@@ -1,4 +1,5 @@
 pub mod analyze;
+pub mod ast;
 pub mod model;
 pub mod rust_analyzer;
 pub mod rust_syn;

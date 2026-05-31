@@ -3,7 +3,7 @@ use std::path::Path;
 use syn::spanned::Spanned;
 use syn::visit::Visit;
 
-use super::analyze::{
+use super::ast::{
     CallInfo, DiscoveredDirective, DiscoveredEnum, DiscoveredFunction, DiscoveredMethod,
     DiscoveredModule, DiscoveredStruct, DiscoveredTrait, FileScan, LiveDependency, ScanResult,
 };
@@ -965,10 +965,10 @@ impl<'ast> Visit<'ast> for StructMethodVisitor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::analyze::DiscoveredDirective;
+    use crate::domain::ast::DiscoveredDirective;
     use crate::domain::scanner::AstScanner;
 
-    fn scan(source: &str) -> super::super::analyze::FileScan {
+    fn scan(source: &str) -> super::super::ast::FileScan {
         RustSynScanner
             .scan_source(Path::new("test.rs"), source)
             .expect("scan should succeed")
@@ -1119,7 +1119,7 @@ mod tests {
     // ── Call graph ──────────────────────────────────────────────────────────
 
     /// (caller, callee) pairs collected from the scan.
-    fn call_pairs(scan: &super::super::analyze::FileScan) -> Vec<(String, String)> {
+    fn call_pairs(scan: &super::super::ast::FileScan) -> Vec<(String, String)> {
         scan.calls
             .iter()
             .map(|c| (c.caller.clone(), c.callee.clone()))

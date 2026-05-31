@@ -1,7 +1,7 @@
 use anyhow::Result;
 use std::path::Path;
 
-use super::analyze::{CallInfo, FileScan, LiveDependency, ScanResult};
+use super::ast::{CallInfo, FileScan, LiveDependency, ScanResult};
 
 /// A trait that defines how to parse Rust source files into domain intelligence artifacts
 /// mapped into the `axon` graph-based boundary system.
