@@ -854,6 +854,10 @@ pub fn scan_actual_model(
                     .iter()
                     .map(|dm| {
                         let mod_path = format!("{}::{}", ctx_name, dm.name);
+                        let file_path = std::path::Path::new(&dm.file_path)
+                            .strip_prefix(workspace_root)
+                            .map(|p| p.to_string_lossy().to_string())
+                            .unwrap_or_else(|_| dm.file_path.clone());
                         let desired_mod = desired_bc.and_then(|dbc| {
                             dbc.modules
                                 .iter()
@@ -863,7 +867,7 @@ pub fn scan_actual_model(
                             name: dm.name.clone(),
                             path: mod_path,
                             public: dm.public,
-                            file_path: dm.file_path.clone(),
+                            file_path,
                             description: desired_mod
                                 .map_or(String::new(), |m| m.description.clone()),
                         }
@@ -1969,6 +1973,7 @@ pub fn compute_total(items: &[u64]) -> u64 { todo!() }
         fs::create_dir_all(&src).unwrap();
 
         // Write a Rust file with structs matching the enrichment model.
+        fs::write(src.join("mod.rs"), "pub mod model;\n").unwrap();
         fs::write(
             src.join("model.rs"),
             r#"
@@ -2057,6 +2062,14 @@ impl User {
         assert_eq!(bc.value_objects.len(), 1);
         assert_eq!(bc.value_objects[0].name, "Email");
         assert_eq!(bc.value_objects[0].fields.len(), 1);
+
+        let module = bc
+            .modules
+            .iter()
+            .find(|m| m.name == "model")
+            .expect("module declaration should be discovered");
+        assert_eq!(module.file_path, "src/domain/mod.rs");
+        assert!(!std::path::Path::new(&module.file_path).is_absolute());
 
         // Cleanup
         let _ = fs::remove_dir_all(&tmp);
