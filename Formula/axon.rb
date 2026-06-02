@@ -7,7 +7,7 @@ class Axon < Formula
 
   head "https://github.com/flavioaiello/axon.git", branch: "main"
 
-  depends_on "rust" => :build
+  depends_on "rust"
 
   def install
     system "cargo", "install", *std_cargo_args
@@ -22,6 +22,7 @@ class Axon < Formula
 
   service do
     run [opt_bin/"axon", "daemon"]
+    environment_variables PATH: std_service_path_env
     keep_alive true
     log_path var/"log/axon.log"
     error_log_path var/"log/axon.log"

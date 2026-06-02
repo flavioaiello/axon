@@ -105,7 +105,7 @@ fn read_tool_specs() -> Vec<ReadToolSpec> {
         },
         ReadToolSpec {
             name: "rust_resolve".into(),
-            description: "Refresh only the compiler-resolved call graph from rust-analyzer. `rust_scan` now runs this semantic enrichment as part of the unified scan pipeline; this tool remains available for a manual resolved-call refresh. It drives a rust-analyzer LSP session (name resolution + type inference), persists `resolved_call` edges with callee definition locations, and may take tens of seconds while rust-analyzer indexes the workspace.".into(),
+            description: "Refresh only the compiler-resolved call graph from embedded rust-analyzer libraries. `rust_scan` now runs this semantic enrichment as part of the unified scan pipeline; this tool remains available for a manual resolved-call refresh. It loads Cargo workspace metadata, persists `resolved_call` edges with callee definition locations, and may take tens of seconds while rust-analyzer indexes the workspace.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {},
@@ -123,7 +123,7 @@ fn read_tool_specs() -> Vec<ReadToolSpec> {
         },
         ReadToolSpec {
             name: "rust_readiness".into(),
-            description: "Report Axon's product readiness for this Rust workspace: graph confidence, semantic call-resolution coverage, rust-analyzer availability, cargo metadata visibility, version/runtime identity, and concrete remediation actions.".into(),
+            description: "Report Axon's product readiness for this Rust workspace: graph confidence, semantic call-resolution coverage, embedded rust-analyzer mode, Cargo/Rust toolchain visibility, version/runtime identity, and concrete remediation actions.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {},
@@ -297,7 +297,7 @@ pub fn call_tool(store: &Store, workspace_path: &str, name: &str, args: &Value) 
                     vec![
                         "Graph queries return persisted actual-state facts only; run rust_scan before relying on freshly edited files.".into(),
                         "Output is bounded and may be truncated; increase limit up to 200 or narrow filters for exhaustive local evidence.".into(),
-                        "Fact resolution: `import_edge` (use-paths) and `calls_symbol` (caller/callee names) are syntactic/name-based from the syn scanner and may be ambiguous across same-named symbols; `resolved_call` is compiler-resolved and refreshed by rust_scan when rust-analyzer succeeds.".into(),
+                        "Fact resolution: `import_edge` (use-paths) and `calls_symbol` (caller/callee names) are syntactic/name-based from the syn scanner and may be ambiguous across same-named symbols; `resolved_call` is compiler-resolved and refreshed by rust_scan when embedded rust-analyzer can load the Cargo workspace.".into(),
                     ],
                     Some(json!({"source": "rust_graph_query", "state": "actual"})),
                 );
@@ -347,8 +347,8 @@ pub fn call_tool(store: &Store, workspace_path: &str, name: &str, args: &Value) 
                     Err(e) => error_result(format!("rust_resolve: failed to persist: {e}")),
                 },
                 Err(e) => error_result(format!(
-                    "rust_resolve: rust-analyzer call resolution failed \
-                     (needs the rust-analyzer component — `rustup component add rust-analyzer`): {e}"
+                    "rust_resolve: embedded rust-analyzer call resolution failed \
+                     (ensure the daemon PATH can execute cargo and rustc): {e}"
                 )),
             }
         }
@@ -610,7 +610,7 @@ pub(crate) fn build_graph_confidence_report(store: &Store, workspace_path: &str)
     if call_edges > 0 && resolved_call_edges == 0 {
         score -= 25;
         warnings.push("Call graph evidence is syntactic/name-based only; compiler-resolved calls are unavailable.".to_string());
-        next_actions.push("Run rust_readiness, install/fix rust-analyzer if needed, then run rust_resolve or rust_scan.".to_string());
+        next_actions.push("Run rust_readiness, ensure cargo/rustc are visible to the daemon, then run rust_resolve or rust_scan.".to_string());
     }
 
     if source_files > 1 && symbols > 10 && call_edges == 0 {
@@ -688,7 +688,7 @@ pub(crate) fn build_graph_confidence_report(store: &Store, workspace_path: &str)
                     "status": if resolved_call_edges > 0 { "ready" } else if call_edges > 0 { "missing" } else { "not_applicable" },
                     "relation": "resolved_call",
                     "edges": resolved_call_edges,
-                    "precision": "compiler-resolved through rust-analyzer when available",
+                    "precision": "compiler-resolved through embedded rust-analyzer libraries when Cargo workspace loading succeeds",
                 },
                 "truth_maintenance": {
                     "status": drift_status,
@@ -710,9 +710,11 @@ pub(crate) fn build_graph_confidence_report(store: &Store, workspace_path: &str)
 fn build_readiness_report(store: &Store, workspace_path: &str) -> Value {
     let graph = build_graph_confidence_report(store, workspace_path);
     let rust_analyzer = rust_analyzer_readiness();
+    let rust_toolchain = rust_toolchain_readiness();
     let cargo_metadata = cargo_metadata_readiness(workspace_path);
     let graph_status = graph["summary"]["status"].as_str().unwrap_or("unknown");
-    let rust_analyzer_status = rust_analyzer["status"].as_str().unwrap_or("unknown");
+    let rust_toolchain_status = rust_toolchain["status"].as_str().unwrap_or("unknown");
+    let cargo_metadata_status = cargo_metadata["status"].as_str().unwrap_or("unknown");
     let semantic_calls_required = graph["graph_confidence"]["counts"]["call_edges"]
         .as_u64()
         .unwrap_or(0)
@@ -721,19 +723,20 @@ fn build_readiness_report(store: &Store, workspace_path: &str) -> Value {
             .as_u64()
             .unwrap_or(0)
             == 0;
-    let status = if graph_status == "ready"
-        && (!semantic_calls_required || rust_analyzer_status == "ready")
-    {
-        "ready"
-    } else if graph_status == "not_scanned" {
-        "not_scanned"
-    } else if graph_status == "degraded"
-        || (semantic_calls_required && rust_analyzer_status != "ready")
-    {
-        "degraded"
-    } else {
-        "usable_with_warnings"
-    };
+    let semantic_dependencies_ready =
+        rust_toolchain_status == "ready" && cargo_metadata_status == "ready";
+    let status =
+        if graph_status == "ready" && (!semantic_calls_required || semantic_dependencies_ready) {
+            "ready"
+        } else if graph_status == "not_scanned" {
+            "not_scanned"
+        } else if graph_status == "degraded"
+            || (semantic_calls_required && !semantic_dependencies_ready)
+        {
+            "degraded"
+        } else {
+            "usable_with_warnings"
+        };
 
     json!({
         "status": status,
@@ -747,6 +750,7 @@ fn build_readiness_report(store: &Store, workspace_path: &str) -> Value {
         "graph_confidence": graph["graph_confidence"],
         "environment": {
             "rust_analyzer": rust_analyzer,
+            "rust_toolchain": rust_toolchain,
             "cargo_metadata": cargo_metadata,
         },
         "refactor_loop": {
@@ -764,66 +768,59 @@ fn build_readiness_report(store: &Store, workspace_path: &str) -> Value {
 }
 
 fn rust_analyzer_readiness() -> Value {
-    let rustup = Command::new("rustup")
-        .args(["which", "rust-analyzer"])
-        .output();
-    let rustup_success = rustup.as_ref().is_ok_and(|output| output.status.success());
-    let rustup_path = rustup
-        .as_ref()
-        .ok()
-        .map(|output| output_text(&output.stdout))
-        .filter(|text| !text.is_empty());
-    let rustup_error = rustup
-        .as_ref()
-        .err()
-        .map(ToString::to_string)
-        .or_else(|| {
-            rustup
-                .as_ref()
-                .ok()
-                .filter(|output| !output.status.success())
-                .map(|output| output_text(&output.stderr))
-        })
-        .filter(|text| !text.is_empty());
+    json!({
+        "status": "ready",
+        "mode": "embedded_library",
+        "external_binary_required": false,
+        "crates": [
+            "ra_ap_ide",
+            "ra_ap_load-cargo",
+            "ra_ap_project_model",
+            "ra_ap_vfs",
+        ],
+        "details": "Axon links rust-analyzer libraries in-process; semantic resolution depends on Cargo/Rust toolchain visibility, not the rust-analyzer executable.",
+        "fix": Value::Null,
+    })
+}
 
-    let path = Command::new("rust-analyzer").arg("--version").output();
-    let path_success = path.as_ref().is_ok_and(|output| output.status.success());
-    let path_version = path
-        .as_ref()
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| output_text(&output.stdout))
-        .filter(|text| !text.is_empty());
-    let path_error = path
-        .as_ref()
-        .err()
-        .map(ToString::to_string)
-        .or_else(|| {
-            path.as_ref()
-                .ok()
-                .filter(|output| !output.status.success())
-                .map(|output| output_text(&output.stderr))
-        })
-        .filter(|text| !text.is_empty());
+fn rust_toolchain_readiness() -> Value {
+    let cargo = command_version("cargo");
+    let rustc = command_version("rustc");
+    let cargo_available = cargo["available"].as_bool().unwrap_or(false);
+    let rustc_available = rustc["available"].as_bool().unwrap_or(false);
+    let ready = cargo_available && rustc_available;
 
     json!({
-        "status": if rustup_success || path_success { "ready" } else { "missing" },
-        "rustup_component": {
-            "available": rustup_success,
-            "path": rustup_path,
-            "error": rustup_error,
-        },
-        "path_executable": {
-            "available": path_success,
-            "version": path_version,
-            "error": path_error,
-        },
-        "fix": if rustup_success || path_success {
+        "status": if ready { "ready" } else { "missing" },
+        "cargo": cargo,
+        "rustc": rustc,
+        "required_by": "embedded rust-analyzer workspace loading",
+        "fix": if ready {
             Value::Null
         } else {
-            json!("Install the component with `rustup component add rust-analyzer` or ensure the daemon PATH can execute rust-analyzer.")
+            json!("Ensure the daemon PATH can execute cargo and rustc; Homebrew services should include /opt/homebrew/bin.")
         },
     })
+}
+
+fn command_version(command: &str) -> Value {
+    match Command::new(command).arg("--version").output() {
+        Ok(output) if output.status.success() => json!({
+            "available": true,
+            "version": output_text(&output.stdout),
+            "error": Value::Null,
+        }),
+        Ok(output) => json!({
+            "available": false,
+            "version": Value::Null,
+            "error": output_text(&output.stderr),
+        }),
+        Err(error) => json!({
+            "available": false,
+            "version": Value::Null,
+            "error": error.to_string(),
+        }),
+    }
 }
 
 fn cargo_metadata_readiness(workspace_path: &str) -> Value {
