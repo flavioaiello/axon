@@ -1,11 +1,11 @@
-use crate::domain::analyze::scan_actual_model;
+use crate::domain::analyze::{SemanticResolution, scan_actual_graph};
 use crate::store::CrateRegistry;
 use anyhow::Result;
 use notify::{Event, RecursiveMode, Watcher};
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tokio::time::{Duration, sleep};
-use tracing::{error, info};
+use tokio::time::{Duration, Instant, sleep};
+use tracing::{error, info, warn};
 
 pub struct ActualStateWatcher {
     registry: Arc<CrateRegistry>,
@@ -18,7 +18,7 @@ impl ActualStateWatcher {
 
     /// Spawns the watcher on a background Tokio task
     pub async fn spawn(self) -> Result<()> {
-        let (tx, mut rx) = mpsc::channel(100);
+        let (tx, mut rx) = mpsc::unbounded_channel();
 
         // 1. Initialize the file system watcher
         let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
@@ -31,8 +31,8 @@ impl ActualStateWatcher {
                             .any(|c| c.as_os_str() == "target" || c.as_os_str() == "node_modules")
                 });
 
-                if is_source_file {
-                    let _ = tx.try_send(());
+                if is_source_file && tx.send(()).is_err() {
+                    warn!("AST watcher event dropped because the sync task has stopped");
                 }
             }
         })?;
@@ -49,14 +49,12 @@ impl ActualStateWatcher {
 
         let registry = self.registry;
 
+        info!("Performing initial in-memory architecture sync...");
+        sync_all_crates(&registry).await?;
+
         tokio::spawn(async move {
             // Keep the watcher alive by moving it into the task
             let _watcher = watcher;
-
-            info!("Performing initial in-memory architecture sync...");
-            if let Err(e) = sync_all_crates(&registry).await {
-                error!("Initial actual model sync failed: {}", e);
-            }
 
             loop {
                 // 2. Wait for the first file-change event
@@ -67,11 +65,23 @@ impl ActualStateWatcher {
                 // 3. Debounce: wait to see if more events arrive in the next 2 seconds
                 // This prevents running the AST parser 10 times during a "Save All"
                 let debounce_duration = Duration::from_secs(2);
+                let max_debounce_duration = Duration::from_secs(10);
+                let batch_started_at = Instant::now();
                 loop {
                     tokio::select! {
                         res = rx.recv() => {
                             if res.is_none() {
                                 return; // Channel closed, exit the task completely
+                            }
+                            if batch_started_at.elapsed() >= max_debounce_duration {
+                                info!(
+                                    "Code modifications still arriving after {:?}. Syncing Actual Model...",
+                                    max_debounce_duration
+                                );
+                                if let Err(e) = sync_all_crates(&registry).await {
+                                    error!("Failed to sync actual model: {}", e);
+                                }
+                                break;
                             }
                             // Reset the debounce timer if another event comes in
                             continue;
@@ -104,13 +114,19 @@ async fn sync_all_crates(registry: &CrateRegistry) -> Result<()> {
         // The previous implemented graph is optional enrichment, not a gate.
         let previous = entry.store.load_actual(&ws)?;
 
-        // Full bottom-up AST scan scoped to this crate's root
-        let actual = scan_actual_model(&entry.root, previous.as_ref())?;
+        // Full bottom-up scan scoped to this crate's root, including semantic
+        // enrichment when rust-analyzer can resolve the current workspace.
+        let scan = scan_actual_graph(&entry.root, previous.as_ref())?;
 
-        // Save into this crate's local store
-        entry.store.save_actual(&ws, &actual)?;
+        // Save into this crate's local store and refresh temporal drift as one operation.
+        let drift_count = entry.store.save_actual_scan_and_compute_drift(&ws, &scan)?;
 
-        let drift_count = entry.store.compute_drift(&ws)?;
+        if let SemanticResolution::Failed { error } = &scan.semantic_resolution {
+            warn!(
+                "rust-analyzer semantic resolution failed for crate '{}'; resolved_call edges cleared: {}",
+                entry.name, error
+            );
+        }
 
         info!(
             "Synced implemented model for crate '{}' ({} temporal change(s))",

@@ -91,6 +91,21 @@ pub struct CallEdge {
     pub context: String,
 }
 
+/// A source-level reference edge: from_file references to_path in code.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReferenceEdge {
+    /// Source file (relative path)
+    pub from_file: String,
+    /// Referenced Rust path or symbol path
+    pub to_path: String,
+    /// Kind: `type`, `trait_bound`, `expr_path`, or `macro`
+    pub reference_kind: String,
+    /// Line number of the reference site (1-based)
+    pub line: usize,
+    /// Owning bounded context of the source file
+    pub context: String,
+}
+
 // ─── Top-Level Domain Model ────────────────────────────────────────────────
 
 /// The root of the domain model configuration.
@@ -138,6 +153,9 @@ pub struct DomainModel {
     /// Symbol-level call edges (function/method calls)
     #[serde(default)]
     pub call_edges: Vec<CallEdge>,
+    /// Source-level type/path/macro reference edges
+    #[serde(default)]
+    pub reference_edges: Vec<ReferenceEdge>,
 }
 
 impl DomainModel {
@@ -162,6 +180,7 @@ impl DomainModel {
             symbols: vec![],
             import_edges: vec![],
             call_edges: vec![],
+            reference_edges: vec![],
         }
     }
 

@@ -25,7 +25,12 @@ MCP is an adapter, not the engine. The live model is maintained by the local pro
 ```bash
 brew tap flavioaiello/axon https://github.com/flavioaiello/axon
 brew install axon
+brew services start axon
 ```
+
+The MCP `serve` command bridges to the shared daemon. If the daemon is not
+running, `serve` exits with an error instead of starting a separate in-process
+model.
 
 ### From source
 
@@ -34,6 +39,11 @@ git clone https://github.com/flavioaiello/axon.git
 cd axon
 cargo install --path .
 ```
+
+When developing axon itself, remember that MCP clients run the configured
+binary, not the source tree. Use `cargo install --path .` to update the `axon`
+on your `PATH`, or point your local MCP config at `target/debug/axon` after
+running `cargo build`.
 
 ## Setup With AI Coding Agents
 
@@ -61,9 +71,28 @@ Add to `.vscode/mcp.json` in your project:
 }
 ```
 
-Once configured, Copilot gains access to all axon tools, resources, and prompts automatically.
+Once the Homebrew service is running and this is configured, Copilot gains access to all axon tools, resources, and prompts automatically.
 
-VSCodium does not provide MCP by itself; MCP support comes from the installed agent extension or from an external CLI. The examples below assume the Homebrew install above, so `axon` is available on `PATH`.
+For local axon development, build first and point VS Code at the workspace
+binary so MCP requests exercise your edited source:
+
+```json
+{
+  "servers": {
+    "axon-dev": {
+      "type": "stdio",
+      "command": "${workspaceFolder}/target/debug/axon",
+      "args": ["serve", "--workspace", "${workspaceFolder}"]
+    }
+  }
+}
+```
+
+The default `serve` command bridges to the shared daemon. Restarting the
+Homebrew service restarts that daemon, but it does not rebuild or reinstall a
+locally edited binary.
+
+VSCodium does not provide MCP by itself; MCP support comes from the installed agent extension or from an external CLI. The examples below assume the Homebrew install above, so `axon` is available on `PATH` and the daemon is already running.
 
 ### Claude Code
 
@@ -112,9 +141,10 @@ The canonical tool names are Rust-native and actual-state first. Legacy names su
 | Tool | Description |
 |:-----|:------------|
 | `rust_status` | Current actual-state Rust model: crates, modules, source files, symbols, imports, calls, semantic annotations, health, and snapshot freshness |
-| `rust_graph` | Bounded graph-database views over Rust modules, source files, symbols, imports, calls, AST edges, neighborhoods, paths, and relation counts; repeated facts are returned as compact `schema` + `cols` + `rows` JSON |
+| `rust_graph` | Bounded graph-database views over Rust modules, source files, symbols, imports, references, calls, AST edges, neighborhoods, paths, and relation counts; repeated facts are returned as compact `schema` + `cols` + `rows` JSON with `offset`/`next_offset` pagination and machine-readable exhaustiveness metadata |
 | `rust_health` | Structured Datalog health report: score (0–100), cycles, violations, missing invariants, orphan modules/contexts, and graph analytics when available |
-| `rust_impact` | Blast-radius analysis over modules, structs, symbols, dependencies, fields, methods, and call graph reachability |
+| `rust_readiness` | Product-readiness report for agents: graph confidence, semantic call-resolution coverage, rust-analyzer availability, cargo metadata visibility, version/runtime identity, and remediation actions |
+| `rust_impact` | Blast-radius and shape analysis over modules, structs, symbols, dependencies, fields, methods, call graph reachability, optimization/refactor recommendations, and Rust practice findings |
 | `rust_delete_safety` | Proof-backed safe-deletion check for structs/symbols with inbound call/import/AST witnesses; module is optional |
 | `rust_invariants` | Evaluate actual graph invariants and configured constraints: layer violations, cycles, aggregate quality, orphans, policy violations, drift freshness |
 | `rust_path` | Return proof paths between Rust modules/components |
@@ -127,7 +157,7 @@ The canonical tool names are Rust-native and actual-state first. Legacy names su
 
 | Tool | Description |
 |:-----|:------------|
-| `rust_scan` | AST-scan workspace source code and refresh the actual Rust fact graph; use `rust_graph` to inspect persisted facts |
+| `rust_scan` | Unified scan of workspace source code: refreshes the actual Rust fact graph from AST facts, code references, and compiler-resolved calls when rust-analyzer succeeds; use `rust_graph` to inspect persisted facts |
 | `rust_annotations` | Create, update, or remove semantic annotations on top of Rust facts; does not mutate source-extracted ground truth |
 | `rust_diagnose` | Diagnose and plan from actual Rust facts; `accept`/`reset` are compatibility no-ops in actual-first mode |
 | `rust_constraints` | Declare and evaluate constraints: layer assignments, allowed/forbidden dependencies |
@@ -150,7 +180,8 @@ axon [command] [options]
 
 | Command | Description |
 |:--------|:------------|
-| `serve` | Start the MCP stdio server, background Rust watcher, and local web graph |
+| `serve` | Start the MCP stdio bridge to the shared daemon; use `--standalone` for an in-process server |
+| `daemon` | Run the shared in-memory daemon, live watcher, and multi-workspace web graph |
 | `web` | Start only the background Rust watcher and local web graph |
 | `export <file>` | Export domain model to JSON (`--state actual`; legacy aliases are accepted) |
 | `list` | Show all crates and their model status |
@@ -164,6 +195,7 @@ Examples:
 ```bash
 axon web --workspace .
 axon serve --workspace .
+axon serve --workspace . --standalone
 ```
 
 Open `http://127.0.0.1:8888` to inspect the live Rust architecture overview. If the port is occupied, axon reports a bind error instead of switching ports.

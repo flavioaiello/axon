@@ -11,9 +11,10 @@
 //! each one uses `callHierarchy/outgoingCalls` to get the *resolved* callees with
 //! their definition locations. Only callees defined inside the workspace are kept.
 //!
-//! It is deliberately opt-in (invoked by the `rust_resolve` tool): spawning
-//! rust-analyzer and letting it index a workspace costs tens of seconds. `syn`
-//! stays the default ground-truth scanner.
+//! The unified scan pipeline invokes this as semantic enrichment after the fast
+//! `syn` pass. The `rust_resolve` tool can also run it manually. Spawning
+//! rust-analyzer and letting it index a workspace can cost tens of seconds, so
+//! callers must surface failures or latency explicitly.
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
@@ -60,8 +61,12 @@ struct Callable {
 pub fn resolve_calls(workspace_root: &Path) -> Result<Vec<ResolvedCall>> {
     use std::collections::HashMap;
 
-    let root = std::fs::canonicalize(workspace_root)
-        .with_context(|| format!("workspace path does not exist: {}", workspace_root.display()))?;
+    let root = std::fs::canonicalize(workspace_root).with_context(|| {
+        format!(
+            "workspace path does not exist: {}",
+            workspace_root.display()
+        )
+    })?;
     let files = rust_source_files(&root);
     if files.is_empty() {
         bail!("no Rust source files found under {}", root.display());
@@ -105,7 +110,11 @@ pub fn resolve_calls(workspace_root: &Path) -> Result<Vec<ResolvedCall>> {
         };
         for item in items {
             let outgoing = client
-                .request("callHierarchy/outgoingCalls", json!({ "item": item }), REQUEST_TIMEOUT)
+                .request(
+                    "callHierarchy/outgoingCalls",
+                    json!({ "item": item }),
+                    REQUEST_TIMEOUT,
+                )
                 .unwrap_or(Value::Null);
             let Some(calls) = outgoing.as_array() else {
                 continue;
@@ -128,7 +137,11 @@ pub fn resolve_calls(workspace_root: &Path) -> Result<Vec<ResolvedCall>> {
                     .get(&(callee_file.clone(), line0))
                     .cloned()
                     .unwrap_or_else(|| to["name"].as_str().unwrap_or("").to_string());
-                let key = (callable.qualified.clone(), callee.clone(), callee_file.clone());
+                let key = (
+                    callable.qualified.clone(),
+                    callee.clone(),
+                    callee_file.clone(),
+                );
                 if seen.insert(key) {
                     out.push(ResolvedCall {
                         caller: callable.qualified.clone(),
@@ -153,7 +166,11 @@ pub fn resolve_calls(workspace_root: &Path) -> Result<Vec<ResolvedCall>> {
 fn rust_source_files(root: &Path) -> Vec<PathBuf> {
     let scan_root = {
         let src = root.join("src");
-        if src.is_dir() { src } else { root.to_path_buf() }
+        if src.is_dir() {
+            src
+        } else {
+            root.to_path_buf()
+        }
     };
     let mut files = Vec::new();
     for entry in ignore::WalkBuilder::new(&scan_root).build().flatten() {
@@ -191,8 +208,14 @@ impl RaClient {
             .spawn()
             .with_context(|| format!("failed to spawn rust-analyzer ({})", bin))?;
 
-        let stdin = child.stdin.take().context("rust-analyzer stdin unavailable")?;
-        let stdout = child.stdout.take().context("rust-analyzer stdout unavailable")?;
+        let stdin = child
+            .stdin
+            .take()
+            .context("rust-analyzer stdin unavailable")?;
+        let stdout = child
+            .stdout
+            .take()
+            .context("rust-analyzer stdout unavailable")?;
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
@@ -243,7 +266,9 @@ impl RaClient {
         while !self.quiescent {
             let remaining = deadline
                 .checked_duration_since(Instant::now())
-                .ok_or_else(|| anyhow!("rust-analyzer indexing timed out after {READY_TIMEOUT:?}"))?;
+                .ok_or_else(|| {
+                    anyhow!("rust-analyzer indexing timed out after {READY_TIMEOUT:?}")
+                })?;
             match self.rx.recv_timeout(remaining) {
                 Ok(msg) => self.pump(msg)?,
                 Err(RecvTimeoutError::Timeout) => {
@@ -260,9 +285,9 @@ impl RaClient {
     /// Handle one incoming message that is *not* the response we're waiting for:
     /// answer server→client requests, and record the quiescent signal.
     fn pump(&mut self, msg: Value) -> Result<()> {
-        if msg.get("method").is_some() && msg.get("id").is_some() {
+        if let (Some(_), Some(id)) = (msg.get("method"), msg.get("id").cloned()) {
             self.write_message(json!({
-                "jsonrpc": "2.0", "id": msg.get("id").cloned().unwrap(), "result": null
+                "jsonrpc": "2.0", "id": id, "result": null
             }))?;
             return Ok(());
         }
@@ -403,7 +428,14 @@ fn collect_callables(
             _ => None,
         };
         if let Some(children) = sym.get("children").and_then(Value::as_array) {
-            collect_callables(children, child_container.as_deref(), file_rel, uri, defs, work);
+            collect_callables(
+                children,
+                child_container.as_deref(),
+                file_rel,
+                uri,
+                defs,
+                work,
+            );
         }
     }
 }
@@ -468,7 +500,10 @@ fn path_to_uri(path: &Path) -> String {
 
 /// Locate the `rust-analyzer` binary: prefer rustup's resolution, fall back to PATH.
 fn rust_analyzer_binary() -> Result<String> {
-    if let Ok(out) = Command::new("rustup").args(["which", "rust-analyzer"]).output() {
+    if let Ok(out) = Command::new("rustup")
+        .args(["which", "rust-analyzer"])
+        .output()
+    {
         let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
         if out.status.success() && !p.is_empty() {
             return Ok(p);
@@ -512,7 +547,8 @@ mod tests {
         assert!(names.contains(&"Store::save"));
         // The index lets pass 2 resolve a callee at (file, line) → qualified name.
         assert_eq!(
-            defs.get(&("src/store/cozo.rs".to_string(), 11)).map(String::as_str),
+            defs.get(&("src/store/cozo.rs".to_string(), 11))
+                .map(String::as_str),
             Some("Store::save")
         );
     }

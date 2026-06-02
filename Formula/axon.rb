@@ -1,10 +1,9 @@
 class Axon < Formula
-  desc "Domain Model Context Protocol Server — architectural meta-layer for GitHub Copilot"
+  desc "Domain Model Context Protocol server for Rust architecture reasoning"
   homepage "https://github.com/flavioaiello/axon"
-  license "MIT"
   url "https://github.com/flavioaiello/axon/archive/refs/tags/v0.4.10.tar.gz"
   sha256 "a6e9328f67195b556ec91eaa0fd43847e1febb8066b81742a2bd7deec742a523"
-  version "0.4.10"
+  license "MIT"
 
   head "https://github.com/flavioaiello/axon.git", branch: "main"
 
@@ -37,8 +36,9 @@ class Axon < Formula
 
       It listens on ~/.axon/daemon.sock and holds each workspace's model
       separately in memory. Every editor still launches `axon serve` (stdio),
-      which transparently bridges to the daemon — and falls back to a standalone
-      in-process server if the daemon isn't running. So .mcp.json is unchanged:
+      which bridges to the daemon. Start the service first; `serve` will report
+      an error instead of silently falling back to a split in-process model.
+      So .mcp.json is unchanged:
 
         {
           "servers": {
@@ -57,6 +57,10 @@ class Axon < Formula
       To list all crates in a workspace:
 
         axon list --workspace /path/to/project
+
+      For an explicitly isolated in-process server, use:
+
+        axon serve --standalone --workspace /path/to/project
     EOS
   end
 

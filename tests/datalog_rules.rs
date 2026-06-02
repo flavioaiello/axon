@@ -64,6 +64,7 @@ fn empty_model() -> DomainModel {
         symbols: vec![],
         import_edges: vec![],
         call_edges: vec![],
+        reference_edges: vec![],
     }
 }
 
@@ -508,6 +509,57 @@ fn default_constraints_seeded_at_crate_root() {
             rule.to_string()
         )));
     }
+}
+
+#[test]
+fn persisted_policy_reload_updates_long_lived_store() {
+    let root = unique_crate_root("axon_policy_reload");
+    let ws = canonicalize_path(&root.to_string_lossy());
+    let store = Store::open(&root).unwrap();
+
+    let mut reasoning = empty_ctx("reasoning");
+    reasoning.dependencies = vec!["store".into()];
+    let store_ctx = empty_ctx("store");
+    let mut model = empty_model();
+    model.bounded_contexts = vec![reasoning, store_ctx];
+    store.save_actual(&ws, &model).unwrap();
+
+    store
+        .upsert_layer_assignment(&ws, "reasoning", "application")
+        .unwrap();
+    store
+        .upsert_layer_assignment(&ws, "store", "infrastructure")
+        .unwrap();
+
+    let before = store.evaluate_policy_violations(&ws).unwrap();
+    assert_eq!(before["status"], "false");
+    assert_eq!(before["count"], 1);
+
+    fs::write(
+        root.join(".axon").join("policy.json"),
+        r#"{
+  "version": 1,
+  "layer_assignments": [
+    { "context": "reasoning", "layer": "infrastructure" },
+    { "context": "store", "layer": "infrastructure" }
+  ],
+  "dependency_constraints": []
+}
+"#,
+    )
+    .unwrap();
+
+    assert!(store.reload_persisted_policy(&ws).unwrap());
+    let assignments = store.list_layer_assignments(&ws).unwrap();
+    assert!(assignments.contains(&("reasoning".into(), "infrastructure".into())));
+    assert!(!assignments.contains(&("reasoning".into(), "application".into())));
+
+    let after = store.evaluate_policy_violations(&ws).unwrap();
+    assert_eq!(after["status"], "true");
+    assert_eq!(after["count"], 0);
+
+    let health = store.model_health(&ws).unwrap();
+    assert!(health.policy_violations.is_empty());
 }
 
 #[test]
@@ -1149,6 +1201,40 @@ fn model_health_reports_policy_coverage_gaps() {
     assert_eq!(updated.policy_coverage.layer_assignment_count, 1);
     assert_eq!(updated.policy_coverage.dependency_constraint_count, 1);
     assert_eq!(updated.policy_coverage.missing_layer_assignments, vec!["B"]);
+}
+
+#[test]
+fn model_health_reports_policy_violations() {
+    let store = temp_store();
+    let ws = ws();
+    let canon = canonicalize(&ws);
+    let mut model = empty_model();
+    let mut app = empty_ctx("App");
+    app.dependencies = vec!["Infra".into()];
+    let infra = empty_ctx("Infra");
+    model.bounded_contexts = vec![app, infra];
+    store.save_desired(&ws, &model).unwrap();
+
+    store
+        .upsert_layer_assignment(&canon, "App", "application")
+        .unwrap();
+    store
+        .upsert_layer_assignment(&canon, "Infra", "infrastructure")
+        .unwrap();
+    store
+        .upsert_dependency_constraint(
+            &canon,
+            "layer",
+            "application",
+            "infrastructure",
+            "forbidden",
+        )
+        .unwrap();
+
+    let health = store.model_health(&canon).unwrap();
+    assert_eq!(health.policy_violations.len(), 1);
+    assert_eq!(health.policy_violations[0]["from_context"], "App");
+    assert!(health.score < 100);
 }
 
 #[test]

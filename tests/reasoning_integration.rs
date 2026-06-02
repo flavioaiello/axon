@@ -531,6 +531,7 @@ fn ecommerce_model() -> DomainModel {
         symbols: vec![],
         import_edges: vec![],
         call_edges: vec![],
+        reference_edges: vec![],
     }
 }
 
@@ -1093,6 +1094,7 @@ fn perf_scale_10_contexts() {
         symbols: vec![],
         import_edges: vec![],
         call_edges: vec![],
+        reference_edges: vec![],
     };
 
     // Total: 10 contexts × 3 entities × (5 fields + 2 methods + 2 params) = 270 sub-structure rows

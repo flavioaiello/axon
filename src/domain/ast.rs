@@ -24,6 +24,17 @@ pub struct CallInfo {
     pub line: usize,
 }
 
+/// A source-level code reference that is not necessarily a `use` import or call.
+#[derive(Debug, Clone)]
+pub struct CodeReference {
+    /// Referenced Rust path as written in source, e.g. `crate::store::CozoStore`.
+    pub to_path: String,
+    /// Kind of reference: `type`, `trait_bound`, `expr_path`, or `macro`.
+    pub reference_kind: String,
+    /// Line number of the reference site (1-based).
+    pub line: usize,
+}
+
 /// A struct discovered in the source code with its fields.
 #[derive(Debug, Clone)]
 pub struct DiscoveredStruct {
@@ -154,6 +165,7 @@ pub struct FileScan {
     pub functions: Vec<DiscoveredFunction>,
     pub imports: Vec<LiveDependency>,
     pub calls: Vec<CallInfo>,
+    pub references: Vec<CodeReference>,
     /// Compiler directives on items/fields of any visibility (see
     /// [`DiscoveredDirective`]). Decoupled from the public-only symbol vectors.
     pub directives: Vec<DiscoveredDirective>,

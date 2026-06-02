@@ -1,4 +1,4 @@
-use crate::domain::model::DomainModel;
+use super::load_actual_model;
 use crate::mcp::protocol::*;
 use crate::mcp::tools::build_model_overview;
 use crate::store::Store;
@@ -74,14 +74,14 @@ pub fn read_resource(store: &Store, workspace_path: &str, uri: &str) -> Resource
             )
         }
         "axon://architecture/rules" => {
-            let model = load_model(store, workspace_path);
+            let model = load_actual_model(store, workspace_path);
             (
                 "application/json",
                 serde_json::to_string(&model.rules).unwrap_or_default(),
             )
         }
         "axon://architecture/conventions" => {
-            let model = load_model(store, workspace_path);
+            let model = load_actual_model(store, workspace_path);
             (
                 "application/json",
                 serde_json::to_string(&model.conventions).unwrap_or_default(),
@@ -101,15 +101,6 @@ pub fn read_resource(store: &Store, workspace_path: &str, uri: &str) -> Resource
             text,
         }],
     }
-}
-
-/// Load the implemented model from store for rules/conventions that aren't yet in Datalog relations.
-fn load_model(store: &Store, workspace_path: &str) -> DomainModel {
-    store
-        .load_desired(workspace_path)
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| DomainModel::empty(workspace_path))
 }
 
 /// Read a single bounded context from Datalog, assembling its sub-structures.
@@ -199,6 +190,7 @@ mod tests {
             symbols: vec![],
             import_edges: vec![],
             call_edges: vec![],
+            reference_edges: vec![],
         };
         store.save_desired(ws, &model).unwrap();
         (store, ws.to_string())

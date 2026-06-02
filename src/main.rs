@@ -7,11 +7,7 @@ use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
-#[command(
-    name = "axon",
-    version,
-    about = "Domain Model Context Protocol Server"
-)]
+#[command(name = "axon", version, about = "Domain Model Context Protocol Server")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -154,11 +150,7 @@ async fn main() -> Result<()> {
 
             let watcher =
                 server::watcher::ActualStateWatcher::new(std::sync::Arc::clone(&registry));
-            tokio::spawn(async move {
-                if let Err(e) = watcher.spawn().await {
-                    tracing::error!("AST Watcher failed: {}", e);
-                }
-            });
+            watcher.spawn().await?;
 
             server::web::run(registry, port).await?;
         }
@@ -221,7 +213,8 @@ async fn main() -> Result<()> {
             for entry in registry.crates() {
                 let ws = entry.workspace_key();
                 let previous = entry.store.load_actual(&ws)?;
-                let actual = domain::analyze::scan_actual_model(&entry.root, previous.as_ref())?;
+                let scan = domain::analyze::scan_actual_graph(&entry.root, previous.as_ref())?;
+                let actual = &scan.model;
 
                 let entity_count: usize = actual
                     .bounded_contexts
@@ -251,13 +244,14 @@ async fn main() -> Result<()> {
                 let source_file_count = actual.source_files.len();
                 let symbol_count = actual.symbols.len();
                 let import_edge_count = actual.import_edges.len();
+                let reference_edge_count = actual.reference_edges.len();
                 let call_edge_count = actual.call_edges.len();
+                let resolved_call_count = scan.resolved_calls.len();
 
-                entry.store.save_actual(&ws, &actual)?;
-                let drift_count = entry.store.compute_drift(&ws)?;
+                let drift_count = entry.store.save_actual_scan_and_compute_drift(&ws, &scan)?;
 
                 eprintln!(
-                    "Crate '{}': {} contexts -> {} entities, {} VOs, {} services, {} repos, {} events; {} files, {} symbols, {} imports, {} calls; {} temporal changes",
+                    "Crate '{}': {} contexts -> {} entities, {} VOs, {} services, {} repos, {} events; {} files, {} symbols, {} imports, {} references, {} calls, {} resolved calls; {} temporal changes",
                     entry.name,
                     actual.bounded_contexts.len(),
                     entity_count,
@@ -268,9 +262,18 @@ async fn main() -> Result<()> {
                     source_file_count,
                     symbol_count,
                     import_edge_count,
+                    reference_edge_count,
                     call_edge_count,
+                    resolved_call_count,
                     drift_count
                 );
+                if let domain::analyze::SemanticResolution::Failed { error } =
+                    &scan.semantic_resolution
+                {
+                    eprintln!(
+                        "  rust-analyzer semantic resolution failed; resolved_call edges cleared: {error}"
+                    );
+                }
             }
             eprintln!(
                 "Implemented model saved for {} crate(s).",
@@ -343,11 +346,7 @@ async fn run_standalone(workspace: String, web_port: u16) -> Result<()> {
     );
 
     let watcher = server::watcher::ActualStateWatcher::new(std::sync::Arc::clone(&registry));
-    tokio::spawn(async move {
-        if let Err(e) = watcher.spawn().await {
-            tracing::error!("AST Watcher failed: {}", e);
-        }
-    });
+    watcher.spawn().await?;
 
     spawn_web_graph(std::sync::Arc::clone(&registry), web_port);
     server::stdio::run(registry).await

@@ -18,11 +18,11 @@ use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Mutex;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 use super::WorkspaceRegistries as Registries;
-use super::stdio::handle_request_with_registry;
 use super::watcher::ActualStateWatcher;
+use crate::mcp::handle_request_with_registry;
 use crate::mcp::protocol::{JsonRpcRequest, JsonRpcResponse};
 use crate::store::CrateRegistry;
 use crate::store::cozo::canonicalize_path;
@@ -132,13 +132,13 @@ async fn ensure_registry(registries: &Registries, workspace: &str) -> Result<Arc
         registry.crates().len()
     );
 
-    // Keep this workspace's model fresh (initial scan + live updates).
+    // Keep this workspace's model fresh. `spawn` completes the initial scan
+    // before returning, so the first MCP request does not see an empty model.
     let watcher = ActualStateWatcher::new(Arc::clone(&registry));
-    tokio::spawn(async move {
-        if let Err(e) = watcher.spawn().await {
-            error!("daemon watcher failed: {e}");
-        }
-    });
+    watcher
+        .spawn()
+        .await
+        .with_context(|| format!("start watcher for workspace {key}"))?;
 
     map.insert(key, Arc::clone(&registry));
     Ok(registry)
@@ -230,13 +230,42 @@ mod tests {
             "initialize should return a result, got: {line}"
         );
 
+        write_half
+            .write_all(
+                br#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"rust_status","arguments":{"detail":"full"}}}
+"#,
+            )
+            .await
+            .unwrap();
+        write_half.flush().await.unwrap();
+
+        let line = tokio::time::timeout(Duration::from_secs(5), lines.next_line())
+            .await
+            .expect("daemon rust_status response timed out")
+            .unwrap()
+            .expect("daemon closed without responding to rust_status");
+        let resp: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(resp["jsonrpc"], "2.0");
+        assert_eq!(resp["id"], 2);
+        let content = resp["result"]["content"].as_array().unwrap();
+        let text = content[0]["text"].as_str().unwrap();
+        let status: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(
+            status["implemented"]["bounded_contexts"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(status["truth_maintenance"]["drift"]["entry_count"], 0);
+
         let _ = std::fs::remove_file(&socket);
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
-    async fn bridge_falls_back_when_no_daemon() {
-        // Connecting to a non-existent socket must signal fallback, not error.
+    async fn bridge_reports_when_no_daemon() {
+        // Connecting to a non-existent socket must signal absence, not error.
         let missing = std::env::temp_dir().join("axon_no_such_daemon.sock");
         let _ = std::fs::remove_file(&missing);
         let bridged = super::super::bridge::try_bridge(&missing, "/tmp/whatever")
@@ -244,7 +273,7 @@ mod tests {
             .expect("try_bridge should not error when daemon is absent");
         assert!(
             !bridged,
-            "no daemon → bridge should return false (fall back)"
+            "no daemon -> bridge should return false so caller can retry or abort"
         );
     }
 }

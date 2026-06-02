@@ -492,15 +492,15 @@ fn add_model_graph(
         let Some(from_module_id) = rust_module_id_for_file(&module_ids, &import.from_file) else {
             continue;
         };
-        if let Some(to_module_id) = rust_module_id_for_import(&module_ids, &import.to_module) {
-            if from_module_id != to_module_id {
-                add_counted_edge(
-                    &mut architecture_edges,
-                    &from_module_id,
-                    &to_module_id,
-                    "imports",
-                );
-            }
+        if let Some(to_module_id) = rust_module_id_for_import(&module_ids, &import.to_module)
+            && from_module_id != to_module_id
+        {
+            add_counted_edge(
+                &mut architecture_edges,
+                &from_module_id,
+                &to_module_id,
+                "imports",
+            );
         }
     }
 
@@ -696,9 +696,7 @@ fn rust_module_id_for_file(
         if let Some(id) = module_ids.get(&path) {
             return Some(id.clone());
         }
-        let Some((parent, _)) = path.rsplit_once("::") else {
-            return None;
-        };
+        let (parent, _) = path.rsplit_once("::")?;
         path = parent.to_string();
     }
 }
@@ -718,9 +716,7 @@ fn rust_module_id_for_import(
         if let Some(id) = module_ids.get(&candidate) {
             return Some(id.clone());
         }
-        let Some((parent, _)) = candidate.rsplit_once("::") else {
-            return None;
-        };
+        let (parent, _) = candidate.rsplit_once("::")?;
         candidate = parent.to_string();
     }
 }
@@ -1017,6 +1013,7 @@ mod tests {
                 context: "Billing".into(),
             }],
             call_edges: vec![],
+            reference_edges: vec![],
         };
         entry.store.save_actual(&ws, &model).unwrap();
 

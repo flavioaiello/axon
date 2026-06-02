@@ -881,7 +881,9 @@ fn self_dead_code_flags_listed_via_single_graph_call() {
     let ws = ws_root.to_string_lossy().to_string();
 
     let actual = scan_actual_model(&ws_root, None).expect("scan_actual_model must succeed");
-    store.save_actual(&ws, &actual).expect("save_actual must succeed");
+    store
+        .save_actual(&ws, &actual)
+        .expect("save_actual must succeed");
 
     // A single MCP graph call returns every `#[allow(dead_code)]` flag, including
     // the ones on private fns and struct fields, each with a source location.

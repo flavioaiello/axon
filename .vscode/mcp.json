@@ -2,7 +2,7 @@
   "servers": {
     "axon": {
       "type": "stdio",
-      "command": "${workspaceFolder}/target/debug/axon",
+      "command": "/opt/homebrew/bin/axon",
       "args": [
         "serve",
         "--workspace",

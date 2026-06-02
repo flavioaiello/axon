@@ -16,7 +16,7 @@ fn rust_native_write_tools() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: "rust_scan".into(),
-            description: "Scan the workspace source code and refresh the actual Rust fact graph from implementation ground truth. Extracts modules, structs, functions, methods, imports, and call graphs from Rust source files.".into(),
+            description: "Scan the workspace source code through the unified Rust fact pipeline and refresh the actual graph from implementation ground truth. Extracts modules, structs, functions, methods, imports, code references, syntactic calls, and compiler-resolved calls when rust-analyzer can resolve the workspace.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {},
@@ -273,13 +273,14 @@ fn dispatch_write_tool(
         }
 
         "sync" => {
-            use crate::domain::analyze::scan_actual_model;
+            use crate::domain::analyze::{SemanticResolution, scan_actual_graph};
 
             let workspace_root = std::path::Path::new(workspace_path);
             let previous = store.load_actual(workspace_path).ok().flatten();
 
-            match scan_actual_model(workspace_root, previous.as_ref()) {
-                Ok(actual) => {
+            match scan_actual_graph(workspace_root, previous.as_ref()) {
+                Ok(scan) => {
+                    let actual = &scan.model;
                     let entity_count: usize = actual
                         .bounded_contexts
                         .iter()
@@ -316,51 +317,76 @@ fn dispatch_write_tool(
                         symbols: actual.symbols.len(),
                         import_edges: actual.import_edges.len(),
                         persisted_import_edges: None,
+                        reference_edges: actual.reference_edges.len(),
+                        persisted_reference_edges: None,
                         call_edges: actual.call_edges.len(),
                         persisted_call_edges: None,
+                        resolved_call_edges: scan.resolved_calls.len(),
+                        persisted_resolved_call_edges: None,
+                        semantic_resolution_succeeded: matches!(
+                            scan.semantic_resolution,
+                            SemanticResolution::Resolved
+                        ),
                     };
 
-                    match store.save_actual(workspace_path, &actual) {
-                        Ok(()) => {
+                    match store.save_actual_scan_and_compute_drift(workspace_path, &scan) {
+                        Ok(drift_count) => {
                             if let Ok(relation_counts) =
                                 store.rust_graph_relation_counts(workspace_path)
                             {
                                 counts.persisted_import_edges =
                                     relation_counts.get("import_edge").copied();
+                                counts.persisted_reference_edges =
+                                    relation_counts.get("reference_edge").copied();
                                 counts.persisted_call_edges =
                                     relation_counts.get("calls_symbol").copied();
+                                counts.persisted_resolved_call_edges =
+                                    relation_counts.get("resolved_call").copied();
                             }
                             let had_previous = previous.is_some();
+                            let semantic_resolution_error = if let SemanticResolution::Failed {
+                                error,
+                            } = &scan.semantic_resolution
+                            {
+                                Some(format!(
+                                    "rust-analyzer semantic resolution failed; resolved_call edges cleared: {error}"
+                                ))
+                            } else {
+                                None
+                            };
                             let mut follow_on_failures = Vec::new();
 
-                            let drift_entry_count = match store.compute_drift(workspace_path) {
-                                Ok(count) => Some(count),
-                                Err(e) => {
-                                    follow_on_failures
-                                        .push(format!("drift recomputation failed: {e}"));
-                                    None
-                                }
-                            };
-
-                            let mut refresh_states = vec!["actual"];
-                            if drift_entry_count.is_some() {
-                                refresh_states.push("drift");
+                            if let Err(e) = store.reload_persisted_policy(workspace_path) {
+                                follow_on_failures
+                                    .push(format!("policy reload after scan failed: {e}"));
                             }
+
+                            let drift_entry_count = Some(drift_count);
+
+                            let refresh_states = vec!["actual", "drift"];
                             if let Err(e) =
                                 eager_refresh_dependencies(store, workspace_path, &refresh_states)
                             {
                                 follow_on_failures.push(e);
                             }
 
-                            let payload = build_sync_report(
+                            let mut payload = build_sync_report(
                                 counts,
                                 had_previous,
                                 drift_entry_count,
                                 &follow_on_failures,
                             );
+                            if let Some(error) = &semantic_resolution_error {
+                                payload["semantic_resolution_error"] = json!(error);
+                            }
+                            crate::mcp::tools::attach_graph_confidence(
+                                &mut payload,
+                                store,
+                                workspace_path,
+                            );
                             let proof = json!({
-                                "rule": "sync succeeds only when scan extraction, actual persistence, and follow-on synchronization steps complete without error",
-                                "derived_from": ["scan_actual_model", "save_actual", "compute_drift"],
+                                "rule": "sync succeeds when scan extraction, actual persistence, and drift recomputation complete; semantic enrichment is recorded separately when unavailable",
+                                "derived_from": ["scan_actual_graph", "save_actual_scan", "compute_drift", "resolve_calls"],
                                 "witness_count": counts.contexts_scanned,
                             });
                             let evidence = json!({
@@ -376,13 +402,24 @@ fn dispatch_write_tool(
                                     "import_edges": counts.persisted_import_edges.unwrap_or(counts.import_edges),
                                     "extracted_import_edges": counts.import_edges,
                                     "persisted_import_edges": counts.persisted_import_edges,
+                                    "reference_edges": counts.persisted_reference_edges.unwrap_or(counts.reference_edges),
+                                    "extracted_reference_edges": counts.reference_edges,
+                                    "persisted_reference_edges": counts.persisted_reference_edges,
                                     "call_edges": counts.persisted_call_edges.unwrap_or(counts.call_edges),
                                     "extracted_call_edges": counts.call_edges,
                                     "persisted_call_edges": counts.persisted_call_edges,
+                                    "resolved_call_edges": counts.persisted_resolved_call_edges.unwrap_or(counts.resolved_call_edges),
+                                    "extracted_resolved_call_edges": counts.resolved_call_edges,
+                                    "persisted_resolved_call_edges": counts.persisted_resolved_call_edges,
+                                    "semantic_resolution": if counts.semantic_resolution_succeeded { "resolved" } else { "failed" },
                                 },
                                 "follow_on_failures": follow_on_failures,
+                                "semantic_resolution_error": semantic_resolution_error,
                             });
-                            let limitations = sync_limitations(drift_entry_count.is_none());
+                            let limitations = sync_limitations(
+                                drift_entry_count.is_none(),
+                                !counts.semantic_resolution_succeeded,
+                            );
 
                             if payload["status"] == "partial_failure" {
                                 reasoning_error_result(
@@ -406,7 +443,9 @@ fn dispatch_write_tool(
                                 )
                             }
                         }
-                        Err(e) => error_result(format!("Scan succeeded but save failed: {e}")),
+                        Err(e) => {
+                            error_result(format!("Scan succeeded but save/drift failed: {e}"))
+                        }
                     }
                 }
                 Err(e) => error_result(format!("Scan failed: {e}")),
@@ -627,11 +666,7 @@ fn dispatch_write_tool(
                         return error_result("'layer' is required for assign_layer");
                     }
                     match store.upsert_layer_assignment(workspace_path, &context, &layer) {
-                        Ok(()) => match invalidate_and_refresh_facts(
-                            store,
-                            workspace_path,
-                            &[fact_ref("layer_assignment", &context, "actual")],
-                        ) {
+                        Ok(()) => match invalidate_and_refresh_policy(store, workspace_path) {
                             Ok(()) => text_result(json!({
                                 "message": format!("Assigned context '{}' to layer '{}'", context, layer),
                             }).to_string()),
@@ -649,11 +684,7 @@ fn dispatch_write_tool(
                         return error_result("'context' is required for remove_layer");
                     }
                     match store.remove_layer_assignment(workspace_path, &context) {
-                        Ok(true) => match invalidate_and_refresh_facts(
-                            store,
-                            workspace_path,
-                            &[fact_ref("layer_assignment", &context, "actual")],
-                        ) {
+                        Ok(true) => match invalidate_and_refresh_policy(store, workspace_path) {
                             Ok(()) => text_result(format!(
                                 "Removed layer assignment for context '{context}'"
                             )),
@@ -686,15 +717,7 @@ fn dispatch_write_tool(
                         return error_result("'rule' must be 'forbidden' or 'allowed'");
                     }
                     match store.upsert_dependency_constraint(workspace_path, &constraint_kind, &source, &target, rule) {
-                        Ok(()) => match invalidate_and_refresh_facts(
-                            store,
-                            workspace_path,
-                            &[fact_ref(
-                                "dependency_constraint",
-                                &format!("{}:{}->{}", constraint_kind, source, target),
-                                "actual",
-                            )],
-                        ) {
+                        Ok(()) => match invalidate_and_refresh_policy(store, workspace_path) {
                             Ok(()) => text_result(json!({
                                 "message": format!("{} dependency: {} → {} ({})", rule, source, target, constraint_kind),
                             }).to_string()),
@@ -721,15 +744,7 @@ fn dispatch_write_tool(
                         &source,
                         &target,
                     ) {
-                        Ok(true) => match invalidate_and_refresh_facts(
-                            store,
-                            workspace_path,
-                            &[fact_ref(
-                                "dependency_constraint",
-                                &format!("{}:{}->{}", constraint_kind, source, target),
-                                "actual",
-                            )],
-                        ) {
+                        Ok(true) => match invalidate_and_refresh_policy(store, workspace_path) {
                             Ok(()) => text_result(format!(
                                 "Removed {} constraint {} -> {}",
                                 constraint_kind, source, target
@@ -745,6 +760,9 @@ fn dispatch_write_tool(
                 }
 
                 "list" => {
+                    if let Err(e) = store.reload_persisted_policy(workspace_path) {
+                        return error_result(format!("Policy reload failed: {e}"));
+                    }
                     let layers = store
                         .list_layer_assignments(workspace_path)
                         .unwrap_or_default();
@@ -1601,6 +1619,26 @@ fn invalidate_and_refresh_facts(
     Ok(())
 }
 
+fn invalidate_and_refresh_policy(store: &Store, workspace_path: &str) -> Result<(), String> {
+    store
+        .invalidate_reasoning_claims_for_facts(
+            workspace_path,
+            &[
+                fact_ref("layer_assignment", "*", "actual"),
+                fact_ref("dependency_constraint", "*", "actual"),
+            ],
+        )
+        .map_err(|e| format!("reasoning policy fact invalidation failed: {e}"))?;
+    store
+        .invalidate_reasoning_claims_for_dependency(workspace_path, "actual")
+        .map_err(|e| format!("reasoning policy dependency invalidation failed: {e}"))?;
+    let kernel = ReasoningKernel::new(store);
+    kernel
+        .eager_refresh_stale_claims(workspace_path)
+        .map_err(|e| format!("reasoning eager refresh failed after policy invalidation: {e}"))?;
+    Ok(())
+}
+
 fn eager_refresh_dependencies(
     store: &Store,
     workspace_path: &str,
@@ -1718,10 +1756,8 @@ fn reasoning_fact_refs_for_define(args: &Value) -> Vec<ReasoningFactRef> {
             }
             refs.push(fact_ref("field", "*", fact_state));
         }
-        "module" => {
-            if !context.is_empty() && !name.is_empty() {
-                refs.push(fact_ref("module", &format!("{context}/{name}"), fact_state));
-            }
+        "module" if !context.is_empty() && !name.is_empty() => {
+            refs.push(fact_ref("module", &format!("{context}/{name}"), fact_state));
         }
         "external_system" => {
             if !name.is_empty() {
@@ -1966,8 +2002,13 @@ struct SyncCounts {
     symbols: usize,
     import_edges: usize,
     persisted_import_edges: Option<usize>,
+    reference_edges: usize,
+    persisted_reference_edges: Option<usize>,
     call_edges: usize,
     persisted_call_edges: Option<usize>,
+    resolved_call_edges: usize,
+    persisted_resolved_call_edges: Option<usize>,
+    semantic_resolution_succeeded: bool,
 }
 
 fn build_sync_report(
@@ -1983,7 +2024,13 @@ fn build_sync_report(
     };
     let drift_recomputed = drift_entry_count.is_some();
     let persisted_import_edges = counts.persisted_import_edges.unwrap_or(counts.import_edges);
+    let persisted_reference_edges = counts
+        .persisted_reference_edges
+        .unwrap_or(counts.reference_edges);
     let persisted_call_edges = counts.persisted_call_edges.unwrap_or(counts.call_edges);
+    let persisted_resolved_call_edges = counts
+        .persisted_resolved_call_edges
+        .unwrap_or(counts.resolved_call_edges);
     let message = if follow_on_failures.is_empty() {
         if had_previous {
             format!(
@@ -2033,9 +2080,16 @@ fn build_sync_report(
         "import_edges": persisted_import_edges,
         "extracted_import_edges": counts.import_edges,
         "persisted_import_edges": counts.persisted_import_edges,
+        "reference_edges": persisted_reference_edges,
+        "extracted_reference_edges": counts.reference_edges,
+        "persisted_reference_edges": counts.persisted_reference_edges,
         "call_edges": persisted_call_edges,
         "extracted_call_edges": counts.call_edges,
         "persisted_call_edges": counts.persisted_call_edges,
+        "resolved_call_edges": persisted_resolved_call_edges,
+        "extracted_resolved_call_edges": counts.resolved_call_edges,
+        "persisted_resolved_call_edges": counts.persisted_resolved_call_edges,
+        "semantic_resolution": if counts.semantic_resolution_succeeded { "resolved" } else { "failed" },
         "implemented_state_saved": true,
         "had_previous_snapshot": had_previous,
         "drift_recomputed": drift_recomputed,
@@ -2044,11 +2098,18 @@ fn build_sync_report(
     })
 }
 
-fn sync_limitations(drift_failed: bool) -> Vec<String> {
+fn sync_limitations(drift_failed: bool, semantic_resolution_failed: bool) -> Vec<String> {
     let mut limitations = vec![
         "Scan coverage is limited to statically extracted facts from supported languages.".into(),
         "Dynamic dispatch, reflection, generated code, and runtime-only dependencies are not modeled.".into(),
     ];
+
+    if semantic_resolution_failed {
+        limitations.push(
+            "Compiler-resolved call edges are unavailable until rust-analyzer resolution succeeds."
+                .into(),
+        );
+    }
 
     if drift_failed {
         limitations.push(
@@ -2062,9 +2123,57 @@ fn sync_limitations(drift_failed: bool) -> Vec<String> {
 fn diagnose_pipeline(store: &Store, workspace_path: &str) -> ToolCallResult {
     let kernel = ReasoningKernel::new(store);
     match kernel.diagnose(workspace_path) {
-        Ok(claim) => stored_claim_result(store, workspace_path, &claim),
+        Ok(mut claim) => {
+            attach_diagnose_readiness(&mut claim.payload, store, workspace_path);
+            stored_claim_result(store, workspace_path, &claim)
+        }
         Err(e) => error_result(format!("diagnose failed: {e}")),
     }
+}
+
+fn attach_diagnose_readiness(payload: &mut Value, store: &Store, workspace_path: &str) {
+    let confidence = crate::mcp::tools::build_graph_confidence_report(store, workspace_path);
+    let Some(object) = payload.as_object_mut() else {
+        return;
+    };
+    object.insert(
+        "graph_confidence".into(),
+        confidence["graph_confidence"].clone(),
+    );
+    object.insert("readiness_summary".into(), confidence["summary"].clone());
+
+    let graph_status = confidence["summary"]["status"]
+        .as_str()
+        .unwrap_or("unknown");
+    if graph_status == "ready" {
+        return;
+    }
+
+    if object["status"].as_str() == Some("healthy") {
+        object.insert("status".into(), json!("healthy_with_readiness_warnings"));
+    }
+
+    object.insert(
+        "readiness_warnings".into(),
+        confidence["graph_confidence"]["warnings"].clone(),
+    );
+
+    let mut next_actions = object
+        .remove("next_actions")
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default();
+    if let Some(actions) = confidence["graph_confidence"]["next_actions"].as_array() {
+        let base_priority = next_actions.len();
+        for (offset, action) in actions.iter().enumerate() {
+            next_actions.push(json!({
+                "priority": base_priority + offset,
+                "tool": "rust_readiness",
+                "reason": action,
+            }));
+        }
+    }
+    object.insert("next_action_count".into(), json!(next_actions.len()));
+    object.insert("next_actions".into(), Value::Array(next_actions));
 }
 
 #[cfg(test)]
@@ -2128,6 +2237,7 @@ mod tests {
             symbols: vec![],
             import_edges: vec![],
             call_edges: vec![],
+            reference_edges: vec![],
         }
     }
 
@@ -2167,8 +2277,13 @@ mod tests {
                 symbols: 9,
                 import_edges: 4,
                 persisted_import_edges: Some(3),
+                reference_edges: 6,
+                persisted_reference_edges: Some(6),
                 call_edges: 11,
                 persisted_call_edges: Some(7),
+                resolved_call_edges: 5,
+                persisted_resolved_call_edges: Some(5),
+                semantic_resolution_succeeded: true,
             },
             false,
             Some(5),
@@ -2185,10 +2300,31 @@ mod tests {
         assert_eq!(report["import_edges"], 3);
         assert_eq!(report["extracted_import_edges"], 4);
         assert_eq!(report["persisted_import_edges"], 3);
+        assert_eq!(report["reference_edges"], 6);
+        assert_eq!(report["extracted_reference_edges"], 6);
         assert_eq!(report["call_edges"], 7);
         assert_eq!(report["extracted_call_edges"], 11);
         assert_eq!(report["persisted_call_edges"], 7);
+        assert_eq!(report["resolved_call_edges"], 5);
+        assert_eq!(report["semantic_resolution"], "resolved");
         assert!(report["follow_on_failures"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_diagnose_readiness_degrades_healthy_payload() {
+        let store = test_store();
+        let ws = format!("/tmp/test-diagnose-readiness-{}", std::process::id());
+        let mut payload = json!({
+            "status": "healthy",
+            "next_actions": [],
+        });
+
+        attach_diagnose_readiness(&mut payload, &store, &ws);
+
+        assert_eq!(payload["status"], "healthy_with_readiness_warnings");
+        assert_eq!(payload["graph_confidence"]["status"], "not_scanned");
+        assert!(payload["readiness_warnings"].as_array().unwrap().len() >= 1);
+        assert!(payload["next_action_count"].as_u64().unwrap() >= 1);
     }
 
     #[test]
@@ -2206,8 +2342,13 @@ mod tests {
                 symbols: 1,
                 import_edges: 0,
                 persisted_import_edges: None,
+                reference_edges: 0,
+                persisted_reference_edges: None,
                 call_edges: 0,
                 persisted_call_edges: None,
+                resolved_call_edges: 0,
+                persisted_resolved_call_edges: None,
+                semantic_resolution_succeeded: false,
             },
             false,
             None,
@@ -2220,6 +2361,40 @@ mod tests {
         assert_eq!(report["drift_recomputed"], false);
         assert_eq!(report["drift_entry_count"], serde_json::Value::Null);
         assert_eq!(report["follow_on_failures"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_build_sync_report_treats_semantic_resolution_failure_as_degraded_success() {
+        let report = build_sync_report(
+            SyncCounts {
+                contexts_scanned: 1,
+                entities: 1,
+                value_objects: 0,
+                services: 0,
+                repositories: 0,
+                events: 0,
+                source_files: 1,
+                symbols: 1,
+                import_edges: 1,
+                persisted_import_edges: Some(1),
+                reference_edges: 1,
+                persisted_reference_edges: Some(1),
+                call_edges: 1,
+                persisted_call_edges: Some(1),
+                resolved_call_edges: 0,
+                persisted_resolved_call_edges: Some(0),
+                semantic_resolution_succeeded: false,
+            },
+            false,
+            Some(0),
+            &[],
+        );
+
+        assert_eq!(report["status"], "scanned");
+        assert_eq!(report["implemented_state_saved"], true);
+        assert_eq!(report["semantic_resolution"], "failed");
+        assert_eq!(report["resolved_call_edges"], 0);
+        assert!(report["follow_on_failures"].as_array().unwrap().is_empty());
     }
 
     #[test]
@@ -2883,7 +3058,12 @@ mod tests {
     #[test]
     fn test_missing_kind() {
         let store = test_store();
-        let result = call_write_tool("/tmp/test-ws", &store, "rust_annotations", &json!({"name": "Foo"}));
+        let result = call_write_tool(
+            "/tmp/test-ws",
+            &store,
+            "rust_annotations",
+            &json!({"name": "Foo"}),
+        );
         assert_eq!(result.is_error, Some(true));
     }
 
@@ -2908,6 +3088,10 @@ mod tests {
             "must have health_score"
         );
         assert!(report.get("invariants").is_some(), "must have invariants");
+        assert!(
+            report.get("practice_findings").is_some(),
+            "must have practice_findings"
+        );
         assert!(
             report.get("next_actions").is_some(),
             "must have next_actions"

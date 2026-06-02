@@ -4,9 +4,12 @@ use std::path::{Path, PathBuf};
 use syn::spanned::Spanned;
 use syn::visit::Visit;
 
-use super::model::*;
+use super::model::DomainModel;
+use super::rust_analyzer::{self, ResolvedCall};
+use super::rust_facts::*;
 use super::rust_syn::RustSynScanner;
 use super::scanner::AstScanner;
+use super::semantic_annotations::*;
 
 // The scan-result value types (`CallInfo`, `FileScan`, `Discovered*`, …) live in
 // the leaf `super::ast` module and are re-exported here for backward
@@ -14,8 +17,41 @@ use super::scanner::AstScanner;
 // would otherwise form between `analyze`, `scanner`, and `rust_syn`.
 pub use super::ast::*;
 
-// ─── Live Import Extraction ────────────────────────────────────────────────
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SemanticResolution {
+    Resolved,
+    Failed { error: String },
+}
 
+#[derive(Debug, Clone)]
+pub struct ActualScan {
+    pub model: DomainModel,
+    pub resolved_calls: Vec<ResolvedCall>,
+    pub semantic_resolution: SemanticResolution,
+}
+
+pub fn scan_actual_graph(
+    workspace_root: &Path,
+    desired: Option<&DomainModel>,
+) -> Result<ActualScan> {
+    let model = scan_actual_model(workspace_root, desired)?;
+    match rust_analyzer::resolve_calls(workspace_root) {
+        Ok(resolved_calls) => Ok(ActualScan {
+            model,
+            resolved_calls,
+            semantic_resolution: SemanticResolution::Resolved,
+        }),
+        Err(error) => Ok(ActualScan {
+            model,
+            resolved_calls: Vec::new(),
+            semantic_resolution: SemanticResolution::Failed {
+                error: error.to_string(),
+            },
+        }),
+    }
+}
+
+// ─── Live Import Extraction ────────────────────────────────────────────────
 
 struct ImportVisitor {
     imports: Vec<String>,
@@ -108,7 +144,6 @@ pub fn scan_workspace(workspace_root: &Path) -> Result<Vec<LiveDependency>> {
 }
 
 // ─── Domain Structure Extraction ───────────────────────────────────────────
-
 
 // ─── Inline Rust scanner (used by test suite only) ─────────────────────────
 
@@ -458,7 +493,6 @@ fn discover_crate_sources(workspace_root: &Path) -> Vec<CrateSource> {
 
 // ─── Struct & Enum Classification ──────────────────────────────────────────
 
-
 /// Classification of a discovered struct based on naming conventions and
 /// structural heuristics. Used when no enrichment model is available or when a
 /// struct is not declared in the enrichment model.
@@ -621,13 +655,25 @@ fn classify_trait_port(name: &str) -> PortRole {
 /// (`OrderRepository` → `Order`). Falls back to the full name.
 fn aggregate_from_repo_name(name: &str) -> String {
     for suffix in ["Repository", "Repo", "Store"] {
-        if let Some(stripped) = name.strip_suffix(suffix) {
-            if !stripped.is_empty() {
-                return stripped.to_string();
-            }
+        if let Some(stripped) = name.strip_suffix(suffix)
+            && !stripped.is_empty()
+        {
+            return stripped.to_string();
         }
     }
     name.to_string()
+}
+
+fn first_dependency_segment(path: &str) -> Option<&str> {
+    let stripped = path
+        .strip_prefix("crate::")
+        .or_else(|| path.strip_prefix("super::"))
+        .or_else(|| path.strip_prefix("self::"))
+        .unwrap_or(path);
+    stripped
+        .split("::")
+        .next()
+        .filter(|segment| !segment.is_empty())
 }
 
 // ─── Full Workspace Scan ───────────────────────────────────────────────────
@@ -672,6 +718,7 @@ pub fn scan_actual_model(
         symbols: vec![],
         import_edges: vec![],
         call_edges: vec![],
+        reference_edges: vec![],
     };
 
     // 1. Discover all crate source directories
@@ -740,6 +787,7 @@ pub fn scan_actual_model(
         // 3. For each discovered context, scan and classify
         // Collect per-context imports for dependency inference
         let mut context_imports: Vec<(String, Vec<LiveDependency>)> = Vec::new();
+        let mut context_references: Vec<(String, Vec<CodeReference>)> = Vec::new();
 
         for (ctx_name, scan_dir, module_path) in &module_dirs {
             // Single pass over the context's files: each file is read once and
@@ -751,6 +799,7 @@ pub fn scan_actual_model(
             let mut traits = Vec::new();
             let mut functions = Vec::new();
             let mut ctx_deps = Vec::new();
+            let mut ctx_refs = Vec::new();
 
             if scan_dir.exists() {
                 for entry in ignore::WalkBuilder::new(scan_dir).build() {
@@ -794,6 +843,18 @@ pub fn scan_actual_model(
                     }
                     ctx_deps.extend(scan.imports);
 
+                    // Reference edges (type paths, trait bounds, fully-qualified paths, macros)
+                    for reference in &scan.references {
+                        actual.reference_edges.push(ReferenceEdge {
+                            from_file: rel_path.clone(),
+                            to_path: reference.to_path.clone(),
+                            reference_kind: reference.reference_kind.clone(),
+                            line: reference.line,
+                            context: ctx_name.clone(),
+                        });
+                    }
+                    ctx_refs.extend(scan.references);
+
                     // Call edges
                     for ci in scan.calls {
                         actual.call_edges.push(CallEdge {
@@ -829,6 +890,7 @@ pub fn scan_actual_model(
                 }
             }
             context_imports.push((ctx_name.clone(), ctx_deps));
+            context_references.push((ctx_name.clone(), ctx_refs));
 
             // Resolve matching desired bounded context (by name or module_path)
             let desired_bc = desired.and_then(|d| {
@@ -1411,22 +1473,9 @@ pub fn scan_actual_model(
             let mut inferred_deps: Vec<String> = Vec::new();
             let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
             for dep in imports {
-                // Extract the first meaningful module segment from the Rust import path.
-                let raw = &dep.to_module;
-
-                // Rust: strip crate::/super:: prefix, split on ::
-                let first_segment = if let Some(stripped) = raw
-                    .strip_prefix("crate::")
-                    .or_else(|| raw.strip_prefix("super::"))
-                {
-                    stripped.split("::").next().unwrap_or("")
-                } else {
-                    raw.split("::").next().unwrap_or(raw)
-                };
-
-                if first_segment.is_empty() {
+                let Some(first_segment) = first_dependency_segment(&dep.to_module) else {
                     continue;
-                }
+                };
                 let seg_lower = first_segment.to_ascii_lowercase();
                 if seg_lower == ctx_lower {
                     continue; // skip self-references
@@ -1439,18 +1488,37 @@ pub fn scan_actual_model(
                     inferred_deps.push(canonical.clone());
                 }
             }
+            if let Some((_, references)) = context_references
+                .iter()
+                .find(|(reference_ctx, _)| reference_ctx == ctx_name)
+            {
+                for reference in references {
+                    let Some(first_segment) = first_dependency_segment(&reference.to_path) else {
+                        continue;
+                    };
+                    let seg_lower = first_segment.to_ascii_lowercase();
+                    if seg_lower == ctx_lower {
+                        continue;
+                    }
+                    let Some(canonical) = ctx_by_lower.get(&seg_lower) else {
+                        continue;
+                    };
+                    if seen.insert(seg_lower) {
+                        inferred_deps.push(canonical.clone());
+                    }
+                }
+            }
 
-            if !inferred_deps.is_empty() {
-                if let Some(bc) = actual
+            if !inferred_deps.is_empty()
+                && let Some(bc) = actual
                     .bounded_contexts
                     .iter_mut()
                     .find(|bc| bc.name == *ctx_name)
-                {
-                    // Merge: keep desired deps, add inferred ones that aren't already present
-                    for dep in inferred_deps {
-                        if !bc.dependencies.iter().any(|d| d.eq_ignore_ascii_case(&dep)) {
-                            bc.dependencies.push(dep);
-                        }
+            {
+                // Merge: keep desired deps, add inferred ones that aren't already present
+                for dep in inferred_deps {
+                    if !bc.dependencies.iter().any(|d| d.eq_ignore_ascii_case(&dep)) {
+                        bc.dependencies.push(dep);
                     }
                 }
             }
@@ -1698,17 +1766,6 @@ mod tests {
             required: true,
             description: String::new(),
         }];
-        let methods = vec![DiscoveredMethod {
-            owner: "Foo".into(),
-            name: "do_thing".into(),
-            parameters: vec![],
-            return_type: String::new(),
-            file_path: String::new(),
-            start_line: 0,
-            end_line: 0,
-            extends: vec![],
-            implements: vec![],
-        }];
 
         // Data fields + methods → Entity
         assert_eq!(
@@ -1801,6 +1858,61 @@ impl InvoiceRepository {
                 .iter()
                 .any(|r| r.name == "InvoiceRepository")
         );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_scan_actual_model_infers_dependencies_from_reference_edges() {
+        use std::env::temp_dir;
+        use std::fs;
+
+        let tmp = temp_dir().join(format!("axon_ref_deps_test_{}", std::process::id()));
+        let billing = tmp.join("src").join("billing");
+        let orders = tmp.join("src").join("orders");
+        fs::create_dir_all(&billing).unwrap();
+        fs::create_dir_all(&orders).unwrap();
+
+        fs::write(
+            billing.join("types.rs"),
+            r#"
+pub struct Invoice {
+    pub id: u64,
+}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            orders.join("handler.rs"),
+            r#"
+pub struct OrderHandler {
+    pub invoice: crate::billing::types::Invoice,
+}
+
+impl OrderHandler {
+    pub fn invoice(&self) -> crate::billing::types::Invoice { todo!() }
+}
+"#,
+        )
+        .unwrap();
+
+        let actual = scan_actual_model(&tmp, None).unwrap();
+        let orders = actual
+            .bounded_contexts
+            .iter()
+            .find(|bc| bc.name == "orders")
+            .expect("orders context");
+
+        assert!(
+            orders.dependencies.iter().any(|dep| dep == "billing"),
+            "reference-only dependency should infer orders -> billing: {:?}",
+            orders.dependencies
+        );
+        assert!(actual.reference_edges.iter().any(|edge| {
+            edge.context == "orders"
+                && edge.to_path == "crate::billing::types::Invoice"
+                && edge.reference_kind == "type"
+        }));
 
         let _ = fs::remove_dir_all(&tmp);
     }
@@ -2042,6 +2154,7 @@ impl User {
             symbols: vec![],
             import_edges: vec![],
             call_edges: vec![],
+            reference_edges: vec![],
         };
 
         let actual = scan_actual_model(&tmp, Some(&desired)).unwrap();

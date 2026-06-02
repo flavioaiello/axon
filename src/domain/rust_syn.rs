@@ -1,11 +1,13 @@
 use anyhow::{Context, Result};
 use std::path::Path;
+use syn::parse::Parser;
 use syn::spanned::Spanned;
 use syn::visit::Visit;
 
 use super::ast::{
-    CallInfo, DiscoveredDirective, DiscoveredEnum, DiscoveredFunction, DiscoveredMethod,
-    DiscoveredModule, DiscoveredStruct, DiscoveredTrait, FileScan, LiveDependency, ScanResult,
+    CallInfo, CodeReference, DiscoveredDirective, DiscoveredEnum, DiscoveredFunction,
+    DiscoveredMethod, DiscoveredModule, DiscoveredStruct, DiscoveredTrait, FileScan,
+    LiveDependency, ScanResult,
 };
 use super::model::Field;
 use super::scanner::AstScanner;
@@ -60,6 +62,137 @@ fn collect_imports(syntax_tree: &syn::File) -> Vec<String> {
     let mut visitor = ImportVisitor { imports: vec![] };
     visitor.visit_file(syntax_tree);
     visitor.imports
+}
+
+struct ReferenceVisitor {
+    references: Vec<CodeReference>,
+}
+
+impl ReferenceVisitor {
+    fn record_path(&mut self, path: &syn::Path, reference_kind: &str, line: usize) {
+        let to_path = path_to_string(path);
+        if should_record_reference(&to_path) {
+            self.references.push(CodeReference {
+                to_path,
+                reference_kind: reference_kind.to_string(),
+                line,
+            });
+        }
+    }
+}
+
+impl<'ast> Visit<'ast> for ReferenceVisitor {
+    fn visit_type_path(&mut self, node: &'ast syn::TypePath) {
+        self.record_path(&node.path, "type", node.path.span().start().line);
+        syn::visit::visit_type_path(self, node);
+    }
+
+    fn visit_type_param_bound(&mut self, node: &'ast syn::TypeParamBound) {
+        if let syn::TypeParamBound::Trait(bound) = node {
+            self.record_path(&bound.path, "trait_bound", bound.path.span().start().line);
+        }
+        syn::visit::visit_type_param_bound(self, node);
+    }
+
+    fn visit_expr_path(&mut self, node: &'ast syn::ExprPath) {
+        self.record_path(&node.path, "expr_path", node.path.span().start().line);
+        syn::visit::visit_expr_path(self, node);
+    }
+
+    fn visit_macro(&mut self, node: &'ast syn::Macro) {
+        self.record_path(&node.path, "macro", node.path.span().start().line);
+        syn::visit::visit_macro(self, node);
+    }
+
+    fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
+        if node.ident == "tests" || has_cfg_test(&node.attrs) {
+            return;
+        }
+        syn::visit::visit_item_mod(self, node);
+    }
+}
+
+fn collect_references(syntax_tree: &syn::File) -> Vec<CodeReference> {
+    use std::collections::HashSet;
+
+    let mut visitor = ReferenceVisitor { references: vec![] };
+    visitor.visit_file(syntax_tree);
+
+    let mut seen = HashSet::new();
+    visitor
+        .references
+        .into_iter()
+        .filter(|reference| {
+            seen.insert((
+                reference.to_path.clone(),
+                reference.reference_kind.clone(),
+                reference.line,
+            ))
+        })
+        .collect()
+}
+
+fn path_to_string(path: &syn::Path) -> String {
+    path.segments
+        .iter()
+        .map(|segment| segment.ident.to_string())
+        .collect::<Vec<_>>()
+        .join("::")
+}
+
+fn should_record_reference(path: &str) -> bool {
+    let segments: Vec<&str> = path
+        .split("::")
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    let Some(first) = segments.first() else {
+        return false;
+    };
+    if *first == "self" || *first == "Self" || *first == "crate" || *first == "super" {
+        return true;
+    }
+    if segments.len() > 1 {
+        return true;
+    }
+    let single = *first;
+    if is_primitive_or_prelude_type(single) {
+        return false;
+    }
+    single
+        .chars()
+        .next()
+        .is_some_and(|ch| ch.is_ascii_uppercase())
+}
+
+fn is_primitive_or_prelude_type(name: &str) -> bool {
+    matches!(
+        name,
+        "str"
+            | "bool"
+            | "char"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "usize"
+            | "i8"
+            | "i16"
+            | "i32"
+            | "i64"
+            | "i128"
+            | "isize"
+            | "f32"
+            | "f64"
+            | "String"
+            | "Option"
+            | "Result"
+            | "Vec"
+            | "Box"
+            | "Arc"
+            | "Rc"
+            | "Pin"
+    )
 }
 
 /// Extract structs, enums, methods, modules, and traits from an already-parsed
@@ -140,6 +273,13 @@ impl<'ast> Visit<'ast> for FnVisitor {
         }
         syn::visit::visit_item_fn(self, node);
     }
+
+    fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
+        if node.ident == "tests" || has_cfg_test(&node.attrs) {
+            return;
+        }
+        syn::visit::visit_item_mod(self, node);
+    }
 }
 
 /// Extract public free functions from an already-parsed file. Methods (inside
@@ -173,26 +313,43 @@ fn collect_calls_from_items(items: &[syn::Item], calls: &mut Vec<CallInfo>) {
     for item in items {
         match item {
             syn::Item::Impl(imp) => {
+                if has_cfg_test(&imp.attrs) {
+                    continue;
+                }
                 let owner = type_to_string(&imp.self_ty);
                 for impl_item in &imp.items {
                     if let syn::ImplItem::Fn(method) = impl_item {
+                        if has_cfg_test(&method.attrs) {
+                            continue;
+                        }
                         let caller = format!("{}::{}", owner, method.sig.ident);
                         collect_calls_from_block(&method.block, &caller, Some(&owner), calls);
                     }
                 }
             }
             syn::Item::Fn(func) => {
+                if has_cfg_test(&func.attrs) {
+                    continue;
+                }
                 let caller = func.sig.ident.to_string();
                 collect_calls_from_block(&func.block, &caller, None, calls);
             }
             syn::Item::Trait(tr) => {
+                if has_cfg_test(&tr.attrs) {
+                    continue;
+                }
                 // Trait *default* method bodies contain calls too. `Self` here is
                 // the (unknown) implementor, so self-resolution is left off.
                 for trait_item in &tr.items {
                     let syn::TraitItem::Fn(method) = trait_item else {
                         continue;
                     };
-                    let Some(block) = &method.default else { continue };
+                    if has_cfg_test(&method.attrs) {
+                        continue;
+                    }
+                    let Some(block) = &method.default else {
+                        continue;
+                    };
                     let caller = format!("{}::{}", tr.ident, method.sig.ident);
                     collect_calls_from_block(block, &caller, None, calls);
                 }
@@ -251,6 +408,7 @@ impl AstScanner for RustSynScanner {
             })
             .collect();
         let calls = collect_calls(&syntax_tree);
+        let references = collect_references(&syntax_tree);
         let directives = collect_directives(&syntax_tree);
         Ok(FileScan {
             structs,
@@ -261,6 +419,7 @@ impl AstScanner for RustSynScanner {
             functions,
             imports,
             calls,
+            references,
             directives,
         })
     }
@@ -442,10 +601,27 @@ fn has_cfg_test(attrs: &[syn::Attribute]) -> bool {
         if !attr.path().is_ident("cfg") {
             return false;
         }
-        attr.parse_args::<syn::Ident>()
-            .map(|ident| ident == "test")
+        attr.parse_args::<syn::Meta>()
+            .map(|meta| cfg_meta_contains_test(&meta))
             .unwrap_or(false)
     })
+}
+
+fn cfg_meta_contains_test(meta: &syn::Meta) -> bool {
+    match meta {
+        syn::Meta::Path(path) => path.is_ident("test"),
+        syn::Meta::NameValue(_) => false,
+        syn::Meta::List(list) => {
+            if list.path.is_ident("test") {
+                return true;
+            }
+            let parser = syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated;
+            parser
+                .parse2(list.tokens.clone())
+                .map(|nested| nested.iter().any(cfg_meta_contains_test))
+                .unwrap_or(false)
+        }
+    }
 }
 
 fn type_to_string(ty: &syn::Type) -> String {
@@ -465,10 +641,8 @@ fn type_to_string(ty: &syn::Type) -> String {
             }
             // Check if previous token ended with a lifetime identifier char
             // and next is an alpha/underscore (type name after lifetime).
-            let prev_is_lifetime = result.chars().last().map_or(false, |c| c.is_alphanumeric());
-            let next_is_ident = chars
-                .peek()
-                .map_or(false, |c| c.is_alphabetic() || *c == '_');
+            let prev_is_lifetime = result.chars().last().is_some_and(|c| c.is_alphanumeric());
+            let next_is_ident = chars.peek().is_some_and(|c| c.is_alphabetic() || *c == '_');
             if prev_is_lifetime && next_is_ident {
                 // Check if we're after a lifetime ('a, 'b, etc.)
                 let has_lifetime = result.contains('\'');
@@ -635,6 +809,9 @@ impl<'ast> Visit<'ast> for DirectiveVisitor {
         self.record(&name, &node.attrs);
         for item in &node.items {
             if let syn::TraitItem::Fn(method) = item {
+                if has_cfg_test(&method.attrs) {
+                    continue;
+                }
                 self.record(&format!("{name}::{}", method.sig.ident), &method.attrs);
             }
         }
@@ -650,6 +827,9 @@ impl<'ast> Visit<'ast> for DirectiveVisitor {
         let owner = type_to_string(&node.self_ty);
         for item in &node.items {
             if let syn::ImplItem::Fn(method) = item {
+                if has_cfg_test(&method.attrs) {
+                    continue;
+                }
                 self.record(&format!("{owner}::{}", method.sig.ident), &method.attrs);
             }
         }
@@ -668,9 +848,7 @@ impl<'ast> Visit<'ast> for DirectiveVisitor {
 
 /// Extract compiler directives from an already-parsed file.
 fn collect_directives(syntax_tree: &syn::File) -> Vec<DiscoveredDirective> {
-    let mut visitor = DirectiveVisitor {
-        directives: vec![],
-    };
+    let mut visitor = DirectiveVisitor { directives: vec![] };
     visitor.visit_file(syntax_tree);
     visitor.directives
 }
@@ -687,7 +865,7 @@ struct StructMethodVisitor {
 
 impl<'ast> Visit<'ast> for StructMethodVisitor {
     fn visit_item_struct(&mut self, node: &'ast syn::ItemStruct) {
-        if !is_public(&node.vis) {
+        if !is_public(&node.vis) || has_cfg_test(&node.attrs) {
             return;
         }
 
@@ -872,7 +1050,8 @@ impl<'ast> Visit<'ast> for StructMethodVisitor {
                     return_type,
                     file_path: self.file_path.clone(),
                     extends: vec![],
-                    implements: vec![],                })
+                    implements: vec![],
+                })
             })
             .collect();
 
@@ -889,6 +1068,10 @@ impl<'ast> Visit<'ast> for StructMethodVisitor {
     }
 
     fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
+        if has_cfg_test(&node.attrs) {
+            return;
+        }
+
         let owner = type_to_string(&node.self_ty);
 
         // Record trait impl relationship
@@ -910,7 +1093,7 @@ impl<'ast> Visit<'ast> for StructMethodVisitor {
 
         for item in &node.items {
             if let syn::ImplItem::Fn(method) = item {
-                if !is_public(&method.vis) {
+                if !is_public(&method.vis) || has_cfg_test(&method.attrs) {
                     continue;
                 }
 
@@ -954,7 +1137,8 @@ impl<'ast> Visit<'ast> for StructMethodVisitor {
                     return_type,
                     file_path: self.file_path.clone(),
                     extends: vec![],
-                    implements: vec![],                });
+                    implements: vec![],
+                });
             }
         }
 
@@ -1009,7 +1193,10 @@ mod tests {
             pub struct Kept;
             "#,
         );
-        assert_eq!(directives_for(&scan.directives, "Kept"), vec!["allow(dead_code)"]);
+        assert_eq!(
+            directives_for(&scan.directives, "Kept"),
+            vec!["allow(dead_code)"]
+        );
     }
 
     #[test]
@@ -1025,6 +1212,109 @@ mod tests {
                 .iter()
                 .any(|d| d.starts_with("cfg(") && d.contains("async"))
         );
+    }
+
+    #[test]
+    fn cfg_test_items_are_excluded_from_production_scan() {
+        let scan = scan(
+            r#"
+            pub trait Port {}
+            pub struct Adapter;
+
+            impl Adapter {
+                pub fn live(&self) {}
+            }
+
+            #[cfg(any(test, feature = "fixtures"))]
+            pub struct TestOnly {
+                pub id: u64,
+            }
+
+            #[cfg(test)]
+            impl Adapter {
+                pub fn helper(&self) { self.danger(); }
+                pub fn danger(&self) {}
+            }
+
+            #[cfg(test)]
+            impl Port for Adapter {}
+            "#,
+        );
+
+        let structs: Vec<&str> = scan.structs.iter().map(|s| s.name.as_str()).collect();
+        assert!(structs.contains(&"Adapter"));
+        assert!(
+            !structs.contains(&"TestOnly"),
+            "cfg(test) struct leaked: {structs:?}"
+        );
+
+        let methods: Vec<String> = scan
+            .methods
+            .iter()
+            .map(|m| format!("{}::{}", m.owner, m.name))
+            .collect();
+        assert!(methods.contains(&"Adapter::live".to_string()));
+        assert!(
+            !methods
+                .iter()
+                .any(|m| m == "Adapter::helper" || m == "Adapter::danger"),
+            "cfg(test) impl method leaked: {methods:?}"
+        );
+
+        let adapter = scan
+            .structs
+            .iter()
+            .find(|s| s.name == "Adapter")
+            .expect("Adapter struct");
+        assert!(
+            adapter.implements.is_empty(),
+            "cfg(test) trait impl leaked: {:?}",
+            adapter.implements
+        );
+
+        let pairs = call_pairs(&scan);
+        assert!(
+            !pairs.contains(&("Adapter::helper".into(), "Adapter::danger".into())),
+            "cfg(test) impl call leaked: {pairs:?}"
+        );
+    }
+
+    #[test]
+    fn code_references_capture_types_bounds_and_qualified_paths() {
+        let scan = scan(
+            r#"
+            pub trait Port: crate::domain::ports::BasePort {}
+
+            pub struct Handler<T: crate::domain::ports::Port> {
+                repo: crate::store::CozoStore,
+                payload: T,
+            }
+
+            impl Handler<crate::store::CozoStore> {
+                pub fn load(&self) -> crate::domain::model::DomainModel {
+                    crate::server::daemon::start();
+                    crate::domain::model::DomainModel::default()
+                }
+            }
+            "#,
+        );
+
+        let refs: Vec<(&str, &str)> = scan
+            .references
+            .iter()
+            .map(|reference| {
+                (
+                    reference.to_path.as_str(),
+                    reference.reference_kind.as_str(),
+                )
+            })
+            .collect();
+
+        assert!(refs.contains(&("crate::domain::ports::BasePort", "trait_bound")));
+        assert!(refs.contains(&("crate::domain::ports::Port", "trait_bound")));
+        assert!(refs.contains(&("crate::store::CozoStore", "type")));
+        assert!(refs.contains(&("crate::domain::model::DomainModel", "type")));
+        assert!(refs.contains(&("crate::server::daemon::start", "expr_path")));
     }
 
     #[test]
@@ -1113,7 +1403,7 @@ mod tests {
         let ds = directives_for(&scan.directives, "Plain");
         assert!(ds.contains(&"Debug"));
         assert!(ds.contains(&"Clone"));
-        assert!(!ds.iter().any(|d| *d == "doc"));
+        assert!(!ds.contains(&"doc"));
     }
 
     // ── Call graph ──────────────────────────────────────────────────────────

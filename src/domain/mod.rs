@@ -2,8 +2,10 @@ pub mod analyze;
 pub mod ast;
 pub mod model;
 pub mod rust_analyzer;
+pub mod rust_facts;
 pub mod rust_syn;
 pub mod scanner;
+pub mod semantic_annotations;
 
 /// Convert PascalCase / camelCase to snake_case.
 pub fn to_snake(s: &str) -> String {

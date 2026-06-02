@@ -5,51 +5,13 @@ use std::collections::{BTreeMap, HashMap};
 use crate::domain::model::DomainModel;
 use crate::store::Store;
 use crate::store::cozo::{
-    ModelHealth, PersistedReasoningClaim, ReasoningAssumption, ReasoningDependency,
+    ACTUAL_STATE, ModelHealth, PersistedReasoningClaim, ReasoningAssumption, ReasoningDependency,
     ReasoningDerivation, ReasoningJustification, ReasoningProvenance, ReasoningSupportEdge,
-    canonicalize_path,
+    canonical_model_state, canonicalize_path,
 };
 
-pub const CLAIM_ARCHITECTURE_OVERVIEW: &str = "architecture.overview";
-pub const CLAIM_CHECK_LAYER_VIOLATIONS: &str = "check.layer_violations";
-pub const CLAIM_CHECK_CIRCULAR_DEPS: &str = "check.circular_deps";
-pub const CLAIM_CHECK_AGGREGATE_QUALITY: &str = "check.aggregate_quality";
-pub const CLAIM_CHECK_ORPHAN_CONTEXTS: &str = "check.orphan_contexts";
-pub const CLAIM_CHECK_POLICY_VIOLATIONS: &str = "check.policy_violations";
-pub const CLAIM_CHECK_DRIFT: &str = "check.drift";
-pub const CLAIM_CHECK_ALL: &str = "check.all";
-pub const CLAIM_WHY_LAYER_VIOLATIONS: &str = "why.layer_violations";
-pub const CLAIM_WHY_CIRCULAR_DEPS: &str = "why.circular_deps";
-pub const CLAIM_WHY_POLICY_VIOLATIONS: &str = "why.policy_violations";
-pub const CLAIM_WHY_AGGREGATE_QUALITY: &str = "why.aggregate_quality";
-pub const CLAIM_WHY_ORPHAN_CONTEXTS: &str = "why.orphan_contexts";
-pub const CLAIM_DRIFT_OVERVIEW: &str = "drift.overview";
-pub const CLAIM_DIAGNOSE_REFACTOR: &str = "diagnose.refactor";
-pub const CLAIM_REFACTOR_PLAN: &str = "refactor.plan";
-pub const CLAIM_SAFE_TO_DELETE_PREFIX: &str = "safe_to_delete";
-pub const CLAIM_HOW_CONNECTED_PREFIX: &str = "how_connected";
-pub const CLAIM_IMPACT_PREFIX: &str = "impact";
-pub const CLAIM_HISTORY_PREFIX: &str = "history";
-pub const CLAIM_SEARCH_PREFIX: &str = "search";
-
-const CANONICAL_CLAIM_IDS: [&str; 16] = [
-    CLAIM_ARCHITECTURE_OVERVIEW,
-    CLAIM_CHECK_LAYER_VIOLATIONS,
-    CLAIM_CHECK_CIRCULAR_DEPS,
-    CLAIM_CHECK_AGGREGATE_QUALITY,
-    CLAIM_CHECK_ORPHAN_CONTEXTS,
-    CLAIM_CHECK_POLICY_VIOLATIONS,
-    CLAIM_CHECK_DRIFT,
-    CLAIM_CHECK_ALL,
-    CLAIM_WHY_LAYER_VIOLATIONS,
-    CLAIM_WHY_CIRCULAR_DEPS,
-    CLAIM_WHY_POLICY_VIOLATIONS,
-    CLAIM_WHY_AGGREGATE_QUALITY,
-    CLAIM_WHY_ORPHAN_CONTEXTS,
-    CLAIM_DRIFT_OVERVIEW,
-    CLAIM_DIAGNOSE_REFACTOR,
-    CLAIM_REFACTOR_PLAN,
-];
+mod claims;
+use claims::*;
 
 type CanonicalClaimBuilder = for<'a> fn(
     &ReasoningKernel<'a>,
@@ -274,6 +236,7 @@ impl<'a> ReasoningKernel<'a> {
     }
 
     fn ensure_fresh(&self, workspace_path: &str, claim_id: &str) -> Result<()> {
+        self.store.reload_persisted_policy(workspace_path)?;
         let refresh_needed = match self.store.load_reasoning_claim(workspace_path, claim_id)? {
             Some(claim) => claim.stale,
             None => true,
@@ -295,6 +258,7 @@ impl<'a> ReasoningKernel<'a> {
     where
         F: FnOnce(&Self, i64, &MaterializedReasoningData) -> Result<PersistedReasoningClaim>,
     {
+        self.store.reload_persisted_policy(workspace_path)?;
         if let Some(claim) = self.store.load_reasoning_claim(workspace_path, claim_id)? {
             let basis = self.snapshot_basis(workspace_path)?;
             if !claim.stale && claim_dependencies_match_basis(&claim, &basis) {
@@ -474,13 +438,13 @@ impl<'a> ReasoningKernel<'a> {
         Ok(SnapshotBasis {
             desired_ts: self
                 .store
-                .list_snapshots(workspace_path, "desired")?
+                .list_snapshots(workspace_path, ACTUAL_STATE)?
                 .into_iter()
                 .next()
                 .unwrap_or(0),
             actual_ts: self
                 .store
-                .list_snapshots(workspace_path, "actual")?
+                .list_snapshots(workspace_path, ACTUAL_STATE)?
                 .into_iter()
                 .next()
                 .unwrap_or(0),
@@ -594,10 +558,7 @@ impl<'a> ReasoningKernel<'a> {
         computed_at_us: i64,
     ) -> Result<PersistedReasoningClaim> {
         let raw_state = args["state"].as_str().unwrap_or("actual");
-        let state = match raw_state {
-            "planned" | "current" | "implemented" => "actual",
-            other => other,
-        };
+        let state = canonical_model_state(raw_state);
         let has_timestamps = args["ts_old"].is_number() || args["ts_new"].is_number();
         let subject = json!({
             "state": raw_state,
@@ -607,7 +568,7 @@ impl<'a> ReasoningKernel<'a> {
 
         let payload = if has_timestamps {
             let ts_old = args["ts_old"].as_i64().unwrap_or(0);
-            let ts_new = args["ts_new"].as_i64().unwrap_or_else(|| now_us());
+            let ts_new = args["ts_new"].as_i64().unwrap_or_else(now_us);
             let mut payload = self
                 .store
                 .diff_snapshots(workspace_path, state, ts_old, ts_new)?;
@@ -1199,8 +1160,53 @@ impl<'a> ReasoningKernel<'a> {
                         "actual",
                     )
                 }
+                "optimization_recommendations" => {
+                    let result = self.store.optimization_recommendations(&canonical)?;
+                    (
+                        json!({
+                            "analysis": analysis,
+                            "result": result,
+                        }),
+                        vec![
+                            "source_file".into(),
+                            "symbol".into(),
+                            "import_edge".into(),
+                            "calls_symbol".into(),
+                            "ast_edge".into(),
+                        ],
+                        "graph-derived refactoring and optimization recommendation heuristics over actual-state Rust facts".to_string(),
+                        vec![
+                            "Recommendations are static candidates, not automatic edits or proven runtime wins.".into(),
+                            "Use rust_resolve, cargo test, benchmarks, and rust_diff to validate any proposed shape.".into(),
+                        ],
+                        vec![dependency("snapshot", "actual", data.basis.actual_ts)],
+                        "actual",
+                    )
+                }
+                "practice_findings" => {
+                    let result = self.store.practice_findings(&canonical)?;
+                    (
+                        json!({
+                            "analysis": analysis,
+                            "result": result,
+                        }),
+                        vec![
+                            "symbol".into(),
+                            "calls_symbol".into(),
+                            "ast_edge".into(),
+                            "reference_edge".into(),
+                        ],
+                        "graph-ranked Rust practice findings over actual-state source facts".to_string(),
+                        vec![
+                            "Practice findings are static triage signals, not proof of a bug.".into(),
+                            "Use cargo check, Clippy, tests, and local review to validate remediation.".into(),
+                        ],
+                        vec![dependency("snapshot", "actual", data.basis.actual_ts)],
+                        "actual",
+                    )
+                }
                 other => anyhow::bail!(
-                    "Unknown analysis type: '{}'. Valid types: transitive_deps, circular_deps, layer_violations, impact_analysis, aggregate_quality, dependency_graph, field_usage, method_search, shared_fields, pagerank, community_detection, betweenness_centrality, degree_centrality, topological_order, call_graph_callers, call_graph_callees, call_graph_reachability, call_graph_stats",
+                    "Unknown analysis type: '{}'. Valid types: transitive_deps, circular_deps, layer_violations, impact_analysis, aggregate_quality, dependency_graph, field_usage, method_search, shared_fields, pagerank, community_detection, betweenness_centrality, degree_centrality, topological_order, call_graph_callers, call_graph_callees, call_graph_reachability, call_graph_stats, optimization_recommendations, practice_findings",
                     other
                 ),
             };
@@ -2067,10 +2073,19 @@ impl<'a> ReasoningKernel<'a> {
 
     fn diagnose_claim(
         &self,
+        workspace_path: &str,
         data: &MaterializedReasoningData,
         computed_at_us: i64,
     ) -> PersistedReasoningClaim {
         let policy_count = data.policy_result["count"].as_u64().unwrap_or(0);
+        let practice_findings = self
+            .store
+            .practice_findings(workspace_path)
+            .unwrap_or_else(|_| json!({ "findings": [], "count": 0 }));
+        let top_practice_findings = practice_findings["findings"]
+            .as_array()
+            .map(|findings| findings.iter().take(3).cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
         let invariants = json!({
             "circular_deps": {
                 "status": if data.circular_deps.is_empty() { "pass" } else { "fail" },
@@ -2221,6 +2236,18 @@ impl<'a> ReasoningKernel<'a> {
                 ),
             }));
         }
+        if !top_practice_findings.is_empty() {
+            next_actions.push(json!({
+                "priority": priority,
+                "tool": "rust_impact",
+                "action": "practice_findings",
+                "reason": format!(
+                    "{} Rust practice finding(s) ranked by graph evidence. Inspect top findings before broad refactors.",
+                    practice_findings["count"].as_u64().unwrap_or(top_practice_findings.len() as u64)
+                ),
+                "evidence": top_practice_findings.clone(),
+            }));
+        }
         if next_actions.is_empty() && data.has_actual {
             next_actions.push(json!({
                 "priority": 0,
@@ -2266,12 +2293,16 @@ impl<'a> ReasoningKernel<'a> {
                     "pending_changes": data.pending_changes,
                 },
                 "ast_edges": data.ast_stats,
+                "practice_findings": {
+                    "count": practice_findings["count"],
+                    "top": top_practice_findings,
+                },
                 "has_implemented_model": data.has_actual,
                 "next_actions": next_actions,
                 "loop_hint": "After implementing fixes, call sync then diagnose again to verify improvement.",
             }),
             vec![ReasoningDerivation {
-                rule: "diagnose composes persisted health, invariant, drift, and AST analyses into a prioritized refactoring report".into(),
+                rule: "diagnose composes persisted health, invariant, drift, AST, and Rust practice analyses into a prioritized refactoring report".into(),
                 derived_from: vec![
                     "model_health".into(),
                     "circular_deps".into(),
@@ -2280,6 +2311,7 @@ impl<'a> ReasoningKernel<'a> {
                     "evaluate_policy_violations".into(),
                     "diff_graph".into(),
                     "load_actual".into(),
+                    "practice_findings".into(),
                 ],
                 witness_count: failing_invariants.len() + 1,
             }],
@@ -2583,6 +2615,7 @@ impl<'a> ReasoningKernel<'a> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_claim(
     claim_id: &str,
     claim_kind: &str,
@@ -3128,11 +3161,11 @@ fn build_drift_overview_rule(
 
 fn build_diagnose_refactor_rule(
     kernel: &ReasoningKernel<'_>,
-    _workspace_path: &str,
+    workspace_path: &str,
     data: &MaterializedReasoningData,
     computed_at_us: i64,
 ) -> Result<PersistedReasoningClaim> {
-    Ok(kernel.diagnose_claim(data, computed_at_us))
+    Ok(kernel.diagnose_claim(workspace_path, data, computed_at_us))
 }
 
 fn build_refactor_plan_rule(
@@ -3706,7 +3739,7 @@ fn build_model_overview_json(store: &Store, workspace: &str, state: &str) -> Val
 fn build_rust_ontology_contract_json(store: &Store, workspace: &str, state: &str) -> Value {
     let model = match state {
         "actual" | "implemented" | "current" => store.load_actual(workspace),
-        _ => store.load_desired(workspace),
+        _ => store.load_actual(workspace),
     }
     .ok()
     .flatten();
@@ -3771,7 +3804,7 @@ fn build_rust_ontology_contract_json(store: &Store, workspace: &str, state: &str
     json!({
         "available": true,
         "contract": "Rust facts are the ground truth. DDD and pattern terms are semantic overlays, not primary storage nodes.",
-        "complete_fact_relations": ["source_file", "symbol", "import_edge", "calls_symbol", "ast_edge"],
+        "complete_fact_relations": ["source_file", "symbol", "import_edge", "calls_symbol", "ast_edge", "reference_edge"],
         "overview_projection": {
             "nodes": ["crate", "module", "submodule", "struct"],
             "edges": ["contains", "declares", "imports", "calls"],
@@ -3792,7 +3825,7 @@ fn build_rust_ontology_contract_json(store: &Store, workspace: &str, state: &str
         "structs": structs,
         "query_guidance": {
             "overview": "Use architecture/get_model for the Rust ontology summary.",
-            "connectivity": "Use impact with dependency_graph, call_graph_callers, call_graph_callees, call_graph_reachability, or call_graph_stats.",
+            "connectivity": "Use impact with dependency_graph, call_graph_callers, call_graph_callees, call_graph_reachability, call_graph_stats, optimization_recommendations, or practice_findings.",
             "deletion": "Use safe_to_delete with module + struct/symbol aliases.",
             "refresh": "Use sync after code changes if the watcher has not already updated the graph."
         }
@@ -4140,17 +4173,30 @@ fn default_justifications_for_claim(
                     &["calls_symbol"],
                 ));
             }
+            "optimization_recommendations" => {
+                justifications.extend(actual_relation_justifications(
+                    &data.basis,
+                    &[
+                        "source_file",
+                        "symbol",
+                        "import_edge",
+                        "calls_symbol",
+                        "ast_edge",
+                    ],
+                ));
+            }
+            "practice_findings" => {
+                justifications.extend(actual_relation_justifications(
+                    &data.basis,
+                    &["symbol", "calls_symbol", "ast_edge", "reference_edge"],
+                ));
+            }
             _ => {}
         }
         for key in ["context", "entity", "symbol", "field_type", "method_name"] {
             if let Some(value) = subject[key].as_str().filter(|value| !value.is_empty()) {
-                let fact_kind = match key {
-                    "field_type" => "field_type",
-                    "method_name" => "method_name",
-                    _ => key,
-                };
                 justifications.push(fact_justification(
-                    fact_kind,
+                    key,
                     value,
                     "actual",
                     data.basis.actual_ts,
@@ -4248,6 +4294,7 @@ mod tests {
             symbols: vec![],
             import_edges: vec![],
             call_edges: vec![],
+            reference_edges: vec![],
         }
     }
 
@@ -4306,6 +4353,7 @@ mod tests {
             symbols: vec![],
             import_edges: vec![],
             call_edges: vec![],
+            reference_edges: vec![],
         }
     }
 
