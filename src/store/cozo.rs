@@ -6928,6 +6928,27 @@ impl Store {
     pub fn practice_findings(&self, workspace: &str) -> Result<serde_json::Value> {
         let ws = canonicalize_path(workspace);
         let params = params_map(&[("ws", &ws)]);
+        let practice_scope = |file_path: &str, symbol: &str| -> &'static str {
+            let path = file_path.replace('\\', "/");
+            if path.ends_with("_tests.rs")
+                || path.ends_with("_test.rs")
+                || path.starts_with("tests/")
+                || path.contains("/tests/")
+                || symbol.starts_with("test_")
+                || symbol.contains("::tests::")
+            {
+                "test"
+            } else {
+                "production"
+            }
+        };
+        let scoped_priority = |priority_score: i64, scope: &str| -> i64 {
+            if scope == "test" {
+                priority_score.clamp(10, 25)
+            } else {
+                priority_score
+            }
+        };
 
         let symbols = self
             .run_script(
@@ -6980,22 +7001,34 @@ impl Store {
                 || directive.contains("clippy::pedantic");
             let stale_code_suppression =
                 directive.contains("dead_code") || directive.contains("unused");
-            let severity = if risky_suppression { "warning" } else { "info" };
-            let priority_score = if risky_suppression {
-                75
-            } else if stale_code_suppression {
-                50
+            let file_path = dv_str(&row[3]);
+            let scope = practice_scope(&file_path, &from_node);
+            let severity = if scope == "test" {
+                "info"
+            } else if risky_suppression {
+                "warning"
             } else {
-                35
+                "info"
             };
+            let priority_score = scoped_priority(
+                if risky_suppression {
+                    75
+                } else if stale_code_suppression {
+                    50
+                } else {
+                    35
+                },
+                scope,
+            );
             findings.push(json!({
                 "kind": if stale_code_suppression { "lint_suppression_stale_code" } else { "lint_suppression" },
                 "category": "lint_suppression",
                 "severity": severity,
                 "priority_score": priority_score,
+                "scope": scope,
                 "confidence": "high",
                 "target": from_node,
-                "file_path": dv_str(&row[3]),
+                "file_path": file_path,
                 "line": dv_i64(&row[4]),
                 "rationale": "A lint suppression weakens compiler feedback and should be explicit, narrow, and temporary.",
                 "remediation": "Remove the suppression if possible, or narrow it to the smallest item with a documented reason.",
@@ -7027,14 +7060,23 @@ impl Store {
                 continue;
             };
             let inbound = inbound_by_callee.get(&callee).map_or(0, BTreeSet::len);
+            let file_path = dv_str(&row[2]);
+            let scope = practice_scope(&file_path, &caller);
+            let raw_priority = base_score + inbound.min(10) as i64;
+            let remediation = if scope == "test" {
+                "Keep test unwraps when they express fixture setup or assertion intent; otherwise use expect with an intent-specific message."
+            } else {
+                remediation
+            };
             findings.push(json!({
                 "kind": kind,
                 "category": "error_handling",
-                "severity": "warning",
-                "priority_score": base_score + inbound.min(10) as i64,
+                "severity": if scope == "test" { "info" } else { "warning" },
+                "priority_score": scoped_priority(raw_priority, scope),
+                "scope": scope,
                 "confidence": "medium",
                 "target": format!("{caller}->{callee}"),
-                "file_path": dv_str(&row[2]),
+                "file_path": file_path,
                 "line": dv_i64(&row[3]),
                 "rationale": "Unchecked Option/Result handling can turn a recoverable state into a panic on an architecture path.",
                 "remediation": remediation,
@@ -7086,14 +7128,17 @@ impl Store {
             }) else {
                 continue;
             };
+            let file_path = dv_str(&row[0]);
+            let scope = practice_scope(&file_path, &to_path);
             findings.push(json!({
                 "kind": kind,
                 "category": "control_flow_debt",
-                "severity": severity,
-                "priority_score": priority_score,
+                "severity": if scope == "test" { "info" } else { severity },
+                "priority_score": scoped_priority(priority_score, scope),
+                "scope": scope,
                 "confidence": "high",
                 "target": to_path,
-                "file_path": dv_str(&row[0]),
+                "file_path": file_path,
                 "line": dv_i64(&row[3]),
                 "rationale": "Macro-level control flow can hide unfinished or fail-fast behavior from graph-level refactor planning.",
                 "remediation": remediation,
@@ -7150,14 +7195,17 @@ impl Store {
             if callers.len() < 4 {
                 continue;
             }
+            let file_path = dv_str(&row[3]);
+            let scope = practice_scope(&file_path, &name);
             findings.push(json!({
                 "kind": "high_fan_in_private_symbol",
                 "category": "coupling",
                 "severity": "info",
-                "priority_score": 42 + callers.len().min(20) as i64,
+                "priority_score": scoped_priority(42 + callers.len().min(20) as i64, scope),
+                "scope": scope,
                 "confidence": "medium",
                 "target": name,
-                "file_path": dv_str(&row[3]),
+                "file_path": file_path,
                 "line": dv_i64(&row[4]),
                 "rationale": "A private function or method has broad fan-in; changes to it may deserve a clearer boundary or extracted helper API.",
                 "remediation": "Review whether the symbol should remain private implementation detail, become a deliberate facade, or be split by caller intent.",

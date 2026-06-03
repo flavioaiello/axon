@@ -877,7 +877,30 @@ fn self_diagnose_improvement_loop() {
 #[test]
 fn self_dead_code_flags_listed_via_single_graph_call() {
     let store = temp_store();
-    let ws_root = axon_root();
+    let id = format!(
+        "axon_dead_code_fixture_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time before epoch")
+            .as_nanos()
+    );
+    let ws_root = temp_dir().join(id);
+    let src = ws_root.join("src");
+    std::fs::create_dir_all(&src).expect("create fixture src dir");
+    std::fs::write(
+        src.join("lib.rs"),
+        r#"
+#[allow(dead_code)]
+fn dormant_helper() {}
+
+struct Fixture {
+    #[allow(dead_code)]
+    hidden: u64,
+}
+"#,
+    )
+    .expect("write fixture source");
     let ws = ws_root.to_string_lossy().to_string();
 
     let actual = scan_actual_model(&ws_root, None).expect("scan_actual_model must succeed");
@@ -911,6 +934,8 @@ fn self_dead_code_flags_listed_via_single_graph_call() {
         text.contains(".rs"),
         "dead_code flags must carry a file location: {text}"
     );
+
+    let _ = std::fs::remove_dir_all(&ws_root);
 
     eprintln!("── dead_code flags via single graph call: verified ──");
 }

@@ -254,7 +254,7 @@ mod tests {
 
     fn make_request(method: &str, params: Option<Value>) -> JsonRpcRequest {
         JsonRpcRequest {
-            jsonrpc: "2.0".into(),
+            _jsonrpc: "2.0".into(),
             id: Some(json!(1)),
             method: method.into(),
             params,

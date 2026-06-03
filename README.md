@@ -22,11 +22,25 @@ MCP is an adapter, not the engine. The live model is maintained by the local pro
 
 ### Homebrew (macOS)
 
+This tap tracks `main`: `brew install flavioaiello/axon/axon` downloads GitHub's
+current `main` branch tarball and builds it locally.
+
 ```bash
 brew tap flavioaiello/axon https://github.com/flavioaiello/axon
-brew install axon
-brew services start axon
+brew install flavioaiello/axon/axon
+brew services start flavioaiello/axon/axon
 ```
+
+To pull a newer commit after it lands on `main`:
+
+```bash
+brew update
+brew reinstall flavioaiello/axon/axon
+brew services restart flavioaiello/axon/axon
+```
+
+Because the source tarball moves with `main`, Homebrew may print a checksum
+warning and show the checksum for the downloaded archive.
 
 The MCP `serve` command bridges to the shared daemon. If the daemon is not
 running, `serve` exits with an error instead of starting a separate in-process

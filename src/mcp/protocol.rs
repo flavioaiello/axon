@@ -6,8 +6,8 @@ use serde_json::{Value, json};
 
 #[derive(Debug, Deserialize)]
 pub struct JsonRpcRequest {
-    #[allow(dead_code)]
-    pub jsonrpc: String,
+    #[serde(rename = "jsonrpc")]
+    pub _jsonrpc: String,
     pub id: Option<Value>,
     pub method: String,
     #[serde(default)]
@@ -162,9 +162,9 @@ pub fn with_reasoning_context(
         payload = json!({ "result": payload });
     }
 
-    let object = payload
-        .as_object_mut()
-        .expect("reasoning payload must be a JSON object");
+    let Some(object) = payload.as_object_mut() else {
+        return payload;
+    };
 
     if let Some(proof) = proof {
         object.insert("proof".into(), proof);
@@ -244,9 +244,8 @@ pub struct PromptsListResult {
 #[derive(Debug, Deserialize)]
 pub struct PromptGetParams {
     pub name: String,
-    #[serde(default)]
-    #[allow(dead_code)]
-    pub arguments: Option<Value>,
+    #[serde(default, rename = "arguments")]
+    pub _arguments: Option<Value>,
 }
 
 #[derive(Debug, Serialize)]

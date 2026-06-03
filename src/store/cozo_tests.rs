@@ -776,6 +776,13 @@ fn practice_findings_rank_rust_best_practice_signals() {
             line: 30,
             context: "store".into(),
         },
+        CallEdge {
+            caller: "test_load_fixture".into(),
+            callee: "unwrap".into(),
+            file_path: "src/store/cozo_tests.rs".into(),
+            line: 31,
+            context: "store".into(),
+        },
     ];
     model.ast_edges = vec![ASTEdge {
         from_node: "Store::legacy".into(),
@@ -823,6 +830,22 @@ fn practice_findings_rank_rust_best_practice_signals() {
             .all(|pair| pair[0]["priority_score"].as_i64().unwrap()
                 >= pair[1]["priority_score"].as_i64().unwrap()),
         "findings should be score-sorted: {result}"
+    );
+    let production_unwrap = findings
+        .iter()
+        .find(|finding| finding["target"] == "Store::load->unwrap")
+        .expect("production unwrap finding");
+    let test_unwrap = findings
+        .iter()
+        .find(|finding| finding["target"] == "test_load_fixture->unwrap")
+        .expect("test unwrap finding");
+    assert_eq!(production_unwrap["scope"], "production");
+    assert_eq!(test_unwrap["scope"], "test");
+    assert_eq!(test_unwrap["severity"], "info");
+    assert!(
+        production_unwrap["priority_score"].as_i64().unwrap()
+            > test_unwrap["priority_score"].as_i64().unwrap(),
+        "test-only findings should not outrank production findings: {result}"
     );
 }
 

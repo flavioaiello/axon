@@ -1,11 +1,9 @@
 class Axon < Formula
   desc "Domain Model Context Protocol server for Rust architecture reasoning"
   homepage "https://github.com/flavioaiello/axon"
-  url "https://github.com/flavioaiello/axon/archive/refs/tags/v0.4.13.tar.gz"
-  sha256 "40feb03bc6492478d9463ad0113b1dcc77aa2045eb6ecce905a5840290a85f3a"
+  url "https://github.com/flavioaiello/axon/archive/refs/heads/main.tar.gz"
+  version "main"
   license "MIT"
-
-  head "https://github.com/flavioaiello/axon.git", branch: "main"
 
   depends_on "rust"
 
@@ -14,10 +12,9 @@ class Axon < Formula
     # Binary is named axon
   end
 
-  def post_install
-    # Ensure the data and log directories exist
-    (var/"axon").mkpath
-    (var/"log").mkpath
+  post_install_steps do
+    mkdir_p "axon", base: :var
+    mkdir_p "log", base: :var
   end
 
   service do
@@ -33,7 +30,7 @@ class Axon < Formula
       Axon keeps domain models in memory. For one warm, shared brain across every
       VS Code / VSCodium window, run the daemon:
 
-        brew services start axon
+        brew services start flavioaiello/axon/axon
 
       It listens on ~/.axon/daemon.sock and holds each workspace's model
       separately in memory. Every editor still launches `axon serve` (stdio),
