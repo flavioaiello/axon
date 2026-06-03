@@ -560,50 +560,101 @@ impl<'a> ReasoningKernel<'a> {
         let raw_state = args["state"].as_str().unwrap_or("actual");
         let state = canonical_model_state(raw_state);
         let has_timestamps = args["ts_old"].is_number() || args["ts_new"].is_number();
+        let mode = args["mode"]
+            .as_str()
+            .unwrap_or(if has_timestamps { "compare" } else { "list" });
         let subject = json!({
+            "mode": mode,
             "state": raw_state,
             "ts_old": args["ts_old"],
             "ts_new": args["ts_new"],
         });
 
-        let payload = if has_timestamps {
-            let ts_old = args["ts_old"].as_i64().unwrap_or(0);
-            let ts_new = args["ts_new"].as_i64().unwrap_or_else(now_us);
-            let mut payload = self
-                .store
-                .diff_snapshots(workspace_path, state, ts_old, ts_new)?;
-            payload["status"] = json!("comparison");
-            payload
-        } else {
-            let timestamps = self.store.list_snapshots(workspace_path, state)?;
-            json!({
-                "status": "listing",
-                "state": raw_state,
-                "snapshots": timestamps,
-                "count": timestamps.len(),
-            })
+        let payload = match mode {
+            "latest_diff" => {
+                let timestamps = self.store.list_snapshots(workspace_path, state)?;
+                if timestamps.len() < 2 {
+                    json!({
+                        "status": "latest_diff_unavailable",
+                        "state": raw_state,
+                        "snapshots": timestamps,
+                        "count": timestamps.len(),
+                        "summary": {
+                            "total_changes": 0,
+                            "additions": 0,
+                            "removals": 0,
+                        }
+                    })
+                } else {
+                    let ts_new = timestamps[0];
+                    let ts_old = timestamps[1];
+                    let mut payload =
+                        self.store
+                            .diff_snapshots(workspace_path, state, ts_old, ts_new)?;
+                    payload["status"] = json!("latest_diff");
+                    payload["snapshot_count"] = json!(timestamps.len());
+                    payload
+                }
+            }
+            "compare" => {
+                let ts_old = args["ts_old"].as_i64().unwrap_or(0);
+                let ts_new = args["ts_new"].as_i64().unwrap_or_else(now_us);
+                let mut payload =
+                    self.store
+                        .diff_snapshots(workspace_path, state, ts_old, ts_new)?;
+                payload["status"] = json!("comparison");
+                payload
+            }
+            "list" => {
+                let timestamps = self.store.list_snapshots(workspace_path, state)?;
+                json!({
+                    "status": "listing",
+                    "state": raw_state,
+                    "snapshots": timestamps,
+                    "count": timestamps.len(),
+                })
+            }
+            other => anyhow::bail!(
+                "Unknown history mode '{other}'. Use 'list', 'compare', or 'latest_diff'."
+            ),
         };
+        let status = payload["status"].as_str().unwrap_or(mode).to_string();
+        let witness_count = payload["count"]
+            .as_u64()
+            .or_else(|| payload["summary"]["total_changes"].as_u64())
+            .unwrap_or(0) as usize;
 
         Ok(build_claim(
             &history_claim_id(args),
             "history",
             &subject.to_string(),
-            if has_timestamps { "comparison" } else { "listing" },
-            if has_timestamps {
-                format!("Compared {} snapshots for '{raw_state}' history.", payload["summary"]["total_changes"].as_u64().unwrap_or(0))
-            } else {
-                format!("Listed {} snapshot(s) for '{raw_state}' history.", payload["count"].as_u64().unwrap_or(0))
+            status.as_str(),
+            match mode {
+                "latest_diff" => format!(
+                    "Compared the two most recent '{raw_state}' snapshots with {} change(s).",
+                    payload["summary"]["total_changes"].as_u64().unwrap_or(0)
+                ),
+                "compare" => format!(
+                    "Compared {} snapshots for '{raw_state}' history.",
+                    payload["summary"]["total_changes"].as_u64().unwrap_or(0)
+                ),
+                _ => format!(
+                    "Listed {} snapshot(s) for '{raw_state}' history.",
+                    payload["count"].as_u64().unwrap_or(0)
+                ),
             },
             payload.clone(),
             vec![ReasoningDerivation {
-                rule: if has_timestamps {
+                rule: if mode == "latest_diff" {
+                    "latest_diff compares the two most recent stored temporal snapshots"
+                } else if mode == "compare" {
                     "snapshot history diff compares two stored temporal snapshots"
                 } else {
                     "snapshot history listing returns recorded temporal snapshots for a state"
                 }
                 .into(),
                 derived_from: vec!["snapshot_log".into()],
-                witness_count: payload["count"].as_u64().unwrap_or_else(|| payload["summary"]["total_changes"].as_u64().unwrap_or(0)) as usize,
+                witness_count,
             }],
             vec![support("evidence", "History payload", payload)],
             data.truth_assumptions.clone(),
@@ -1177,7 +1228,7 @@ impl<'a> ReasoningKernel<'a> {
                         "graph-derived refactoring and optimization recommendation heuristics over actual-state Rust facts".to_string(),
                         vec![
                             "Recommendations are static candidates, not automatic edits or proven runtime wins.".into(),
-                            "Use rust_resolve, cargo test, benchmarks, and rust_diff to validate any proposed shape.".into(),
+                            "Use rust_scan, cargo test, benchmarks, and rust_history with mode=latest_diff to validate any proposed shape.".into(),
                         ],
                         vec![dependency("snapshot", "actual", data.basis.actual_ts)],
                         "actual",
@@ -3270,12 +3321,20 @@ fn impact_claim_id(args: &Value) -> Result<String> {
 
 fn history_claim_id(args: &Value) -> String {
     let raw_state = args["state"].as_str().unwrap_or("actual");
-    match (args["ts_old"].as_i64(), args["ts_new"].as_i64()) {
-        (Some(ts_old), ts_new) => format!(
+    let has_timestamps = args["ts_old"].is_number() || args["ts_new"].is_number();
+    let mode = args["mode"]
+        .as_str()
+        .unwrap_or(if has_timestamps { "compare" } else { "list" });
+    match mode {
+        "latest_diff" => format!(
+            "{CLAIM_HISTORY_PREFIX}:{}:latest_diff",
+            escape_claim_component(raw_state)
+        ),
+        "compare" => format!(
             "{CLAIM_HISTORY_PREFIX}:{}:{}:{}",
             escape_claim_component(raw_state),
-            ts_old,
-            ts_new.unwrap_or(0)
+            args["ts_old"].as_i64().unwrap_or(0),
+            args["ts_new"].as_i64().unwrap_or(0)
         ),
         _ => format!(
             "{CLAIM_HISTORY_PREFIX}:{}",

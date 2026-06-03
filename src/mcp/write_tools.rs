@@ -25,7 +25,7 @@ fn rust_native_write_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "rust_annotations".into(),
-            description: "Add, update, or remove semantic annotations layered on top of extracted Rust facts: module labels, ownership, policies, decisions, invariants, service roles, and rationale. This does not mutate source-extracted Rust facts; use rust_scan to refresh implementation ground truth.".into(),
+            description: "Add, update, or remove semantic annotations layered on top of extracted Rust facts: module labels, ownership, policies, decisions, invariants, service roles, and rationale. Pass kind/action/name plus module/context when scoped; put kind-specific fields either top-level or under data. This does not mutate source-extracted Rust facts; use rust_scan to refresh implementation ground truth.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -42,79 +42,12 @@ fn rust_native_write_tools() -> Vec<ToolDefinition> {
                     "module": { "type": "string", "description": "Rust module target for the annotation" },
                     "context": { "type": "string", "description": "Compatibility alias for module/context annotation target" },
                     "name": { "type": "string", "description": "Annotation name" },
-                    "description": { "type": "string" },
-                    "module_path": { "type": "string", "description": "Rust module path" },
-                    "public": { "type": "boolean", "description": "Whether an annotated module is public (default: true)" },
-                    "dependencies": { "type": "array", "items": { "type": "string" }, "description": "Annotated dependency names" },
-                    "ownership": {
+                    "data": {
                         "type": "object",
-                        "properties": {
-                            "team": { "type": "string" },
-                            "owners": { "type": "array", "items": { "type": "string" } },
-                            "rationale": { "type": "string" }
-                        },
-                        "description": "Ownership metadata"
-                    },
-                    "root_entity": { "type": "string", "description": "Aggregate root struct/entity name" },
-                    "entities": { "type": "array", "items": { "type": "string" }, "description": "Aggregate entity members" },
-                    "value_objects": { "type": "array", "items": { "type": "string" }, "description": "Aggregate value object members" },
-                    "policy_kind": { "type": "string", "enum": ["domain", "process_manager", "integration"], "description": "Policy classification" },
-                    "triggers": { "type": "array", "items": { "type": "string" }, "description": "Policy trigger events" },
-                    "commands": { "type": "array", "items": { "type": "string" }, "description": "Policy emitted commands" },
-                    "consumed_by_contexts": { "type": "array", "items": { "type": "string" }, "description": "Consumers of an external system annotation" },
-                    "kind_label": { "type": "string", "description": "Free-form kind label for external systems" },
-                    "rationale": { "type": "string", "description": "Architectural rationale" },
-                    "title": { "type": "string", "description": "Decision title" },
-                    "status": { "type": "string", "enum": ["proposed", "accepted", "superseded", "deprecated"], "description": "Decision status" },
-                    "scope": { "type": "string", "description": "Decision scope" },
-                    "date": { "type": "string", "description": "Decision date" },
-                    "contexts": { "type": "array", "items": { "type": "string" }, "description": "Related modules/semantic contexts" },
-                    "consequences": { "type": "array", "items": { "type": "string" }, "description": "Decision consequences" },
-                    "aggregate_root": { "type": "boolean", "description": "Entity annotation only" },
-                    "fields": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "name": { "type": "string" },
-                                "type": { "type": "string" },
-                                "required": { "type": "boolean" },
-                                "description": { "type": "string" }
-                            },
-                            "required": ["name", "type"]
-                        },
-                        "description": "Annotated fields"
-                    },
-                    "methods": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "name": { "type": "string" },
-                                "description": { "type": "string" },
-                                "parameters": {
-                                    "type": "array",
-                                    "items": {
-                                        "type": "object",
-                                        "properties": {
-                                            "name": { "type": "string" },
-                                            "type": { "type": "string" }
-                                        },
-                                        "required": ["name", "type"]
-                                    }
-                                },
-                                "return_type": { "type": "string" }
-                            },
-                            "required": ["name"]
-                        },
-                        "description": "Annotated methods"
-                    },
-                    "invariants": { "type": "array", "items": { "type": "string" }, "description": "Struct/entity invariants" },
-                    "service_kind": { "type": "string", "enum": ["domain", "application", "infrastructure"], "description": "Service role annotation" },
-                    "source": { "type": "string", "description": "Source struct/entity for event annotations" },
-                    "validation_rules": { "type": "array", "items": { "type": "string" }, "description": "Value-object validation rules" },
-                    "aggregate": { "type": "string", "description": "Aggregate struct/entity name" }
+                        "description": "Kind-specific fields such as description, module_path, ownership, dependencies, fields, methods, invariants, policy metadata, decision metadata, or aggregate links."
+                    }
                 },
+                "additionalProperties": true,
                 "required": ["kind", "name"]
             }),
         },
@@ -825,6 +758,15 @@ fn normalize_rust_native_write_args(args: &mut Value) {
     let Some(object) = args.as_object_mut() else {
         return;
     };
+    if let Some(data) = object.remove("data") {
+        if let Value::Object(data_object) = data {
+            for (key, value) in data_object {
+                object.entry(key).or_insert(value);
+            }
+        } else {
+            object.insert("data".into(), data);
+        }
+    }
     if object.contains_key("context") {
         return;
     }
@@ -2456,9 +2398,14 @@ mod tests {
             &store,
             "rust_annotations",
             &json!({
-                "kind": "entity", "context": "Identity", "name": "Role",
-                "description": "A role assignment", "aggregate_root": false,
-                "fields": [{"name": "name", "type": "String"}]
+                "kind": "entity",
+                "module": "Identity",
+                "name": "Role",
+                "data": {
+                    "description": "A role assignment",
+                    "aggregate_root": false,
+                    "fields": [{"name": "name", "type": "String"}]
+                }
             }),
         );
         assert!(result.is_error.is_none());

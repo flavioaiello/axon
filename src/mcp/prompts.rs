@@ -94,7 +94,7 @@ Axon tracks the **implemented Rust architecture**: source-extracted Rust facts a
 3. **Use the overview correctly** → the web graph intentionally shows only crate/module/submodule/struct; MCP keeps source files, symbols, imports, and calls available for precision
 4. **Enrich missing semantics** → call `rust_annotations` only when static extraction needs DDD/policy labels or ownership context
 5. **Analyze impact** → call `rust_impact` with module/struct/symbol aliases and analysis type (dependency_graph, call_graph_callers, call_graph_reachability, optimization_recommendations, practice_findings, etc.)
-6. **Review history** → call `rust_diff` or `rust_history` to compare recent actual graph snapshots
+6. **Review history** → call `rust_history` with `mode: "latest_diff"` to compare recent actual graph snapshots
 7. **Constrain architecture** → call `rust_constraints` to declare layers and forbidden/allowed dependencies
 
 ### Continuous Improvement

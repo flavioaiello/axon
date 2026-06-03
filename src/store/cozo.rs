@@ -525,7 +525,7 @@ impl Store {
             ":create ast_edge { workspace: String, from_node: String, to_node: String, edge_type: String, state: String, vld: Validity default 'ASSERT' => file_path: String default '', line: Int default 0 }",
             // Resolved call edges from rust-analyzer (name resolution + type
             // inference): which concrete definition a call site actually targets —
-            // something the syn scanner cannot determine. Populated by `rust_resolve`.
+            // something the syn scanner cannot determine. Populated by the rust_scan semantic phase.
             ":create resolved_call { workspace: String, caller: String, callee: String, callee_file: String, state: String, vld: Validity default 'ASSERT' => callee_line: Int default 0 }",
             // ── Source-level relations ──
             ":create source_file { workspace: String, path: String, state: String, vld: Validity default 'ASSERT' => context: String default '', language: String default '' }",
@@ -6656,7 +6656,7 @@ impl Store {
                 "evidence": {
                     "importing_files": importers.into_iter().collect::<Vec<_>>(),
                 },
-                "validation": ["Run rust_graph neighborhood for the target", "Apply the import rewrite", "Run cargo test and compare rust_diff"],
+                "validation": ["Run rust_graph neighborhood for the target", "Apply the import rewrite", "Run cargo test and compare rust_history mode=latest_diff"],
             }));
         }
 
@@ -6793,7 +6793,7 @@ impl Store {
                     "matching_symbols": matches,
                     "ambiguous_call_edges": ambiguous_calls,
                 },
-                "validation": ["Run rust_resolve for compiler-resolved call edges", "Use rust-analyzer rename", "Run cargo test"],
+                "validation": ["Run rust_scan for compiler-resolved call edges", "Use rust-analyzer rename", "Run cargo test"],
             }));
         }
 
@@ -6863,7 +6863,7 @@ impl Store {
                     "caller_context_counts": counts,
                     "total_inbound_calls": total,
                 },
-                "validation": ["Check ownership semantics before moving", "Use rust_impact on the symbol", "Run cargo test and rust_diff"],
+                "validation": ["Check ownership semantics before moving", "Use rust_impact on the symbol", "Run cargo test and rust_history mode=latest_diff"],
             }));
         }
 

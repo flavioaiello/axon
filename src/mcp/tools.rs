@@ -57,7 +57,7 @@ fn read_tool_specs() -> Vec<ReadToolSpec> {
     vec![
         ReadToolSpec {
             name: "rust_status".into(),
-            description: "Show the current actual-state Rust model: crate inventory, module tree, source files, Rust symbols, imports, calls, semantic annotations, health, and snapshot freshness. Call this first before planning Rust changes.".into(),
+            description: "Show the current actual-state Rust model: crate inventory, module tree, source files, Rust symbols, imports, calls, semantic annotations, health, graph confidence, and snapshot freshness. Call this first before planning Rust changes.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -72,7 +72,7 @@ fn read_tool_specs() -> Vec<ReadToolSpec> {
         },
         ReadToolSpec {
             name: "rust_graph".into(),
-            description: "Query persisted actual-state Rust facts through bounded graph views: modules, source files, symbols, import edges, reference edges, call edges, AST edges, neighborhoods, paths, and relation counts. Reference edges (`relation=reference_edge`) capture code paths from types, trait bounds, qualified expressions, and macros. AST edges (`relation=ast_edge`) carry `extends`/`implements` plus compiler directives as `decorators` edges — `to_node` is the directive text (e.g. `allow(dead_code)`, `cfg(feature = \"x\")`, `Debug`) and `from_node` the annotated item (`Owner::method`, `Owner.field`, or a bare name), each with a `file`/`line`. So `view=edges, relation=ast_edge, to=\"dead_code\"` lists every dead-code flag in one call (directives are captured on items/fields of any visibility). Results use compact schema-plus-rows JSON (`schema`, `cols`, `rows`) for repeated facts. Arbitrary Datalog is not exposed.".into(),
+            description: "Query persisted actual-state Rust facts through bounded graph views: modules, source files, symbols, import edges, reference edges, call edges, compiler-resolved call edges, AST edges, neighborhoods, paths, and relation counts. Reference edges (`relation=reference_edge`) capture code paths from types, trait bounds, qualified expressions, and macros. AST edges (`relation=ast_edge`) carry `extends`/`implements` plus compiler directives as `decorators` edges; `to_node` is the directive text and `from_node` is the annotated item, each with a file/line. Use `view=paths` with `relation=context_dep` or `relation=calls_symbol` for connectivity. Results use compact schema-plus-rows JSON (`schema`, `cols`, `rows`). Arbitrary Datalog is not exposed.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -104,24 +104,6 @@ fn read_tool_specs() -> Vec<ReadToolSpec> {
             }),
         },
         ReadToolSpec {
-            name: "rust_resolve".into(),
-            description: "Refresh only the compiler-resolved call graph from embedded rust-analyzer libraries. `rust_scan` now runs this semantic enrichment as part of the unified scan pipeline; this tool remains available for a manual resolved-call refresh. It loads Cargo workspace metadata, persists `resolved_call` edges with callee definition locations, and may take tens of seconds while rust-analyzer indexes the workspace.".into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {},
-                "required": []
-            }),
-        },
-        ReadToolSpec {
-            name: "rust_health".into(),
-            description: "Compute a Datalog-derived health report over actual Rust facts and optional semantic annotations: score, cycles, layer violations, missing invariants, orphan modules/contexts, and graph analytics when available.".into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {},
-                "required": []
-            }),
-        },
-        ReadToolSpec {
             name: "rust_readiness".into(),
             description: "Report Axon's product readiness for this Rust workspace: graph confidence, semantic call-resolution coverage, embedded rust-analyzer mode, Cargo/Rust toolchain visibility, version/runtime identity, and concrete remediation actions.".into(),
             input_schema: json!({
@@ -132,7 +114,7 @@ fn read_tool_specs() -> Vec<ReadToolSpec> {
         },
         ReadToolSpec {
             name: "rust_impact".into(),
-            description: "Analyze blast radius in the actual Rust graph. Use module for dependency analysis and symbol or struct for call graph analysis.".into(),
+            description: "Analyze blast radius, dependency shape, call graph usage, centrality, refactor recommendations, and Rust practice findings in the actual Rust graph. Use module for dependency analysis and symbol or struct for call/entity analyses.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -157,7 +139,7 @@ fn read_tool_specs() -> Vec<ReadToolSpec> {
         },
         ReadToolSpec {
             name: "rust_delete_safety".into(),
-            description: "Check whether a Rust symbol or struct can be safely deleted. Evaluates inbound call edges, imports, AST references, and semantic annotation dependents. Module is optional; omit it for a workspace-wide symbol check.".into(),
+            description: "Check whether a Rust symbol or struct can be safely deleted. Evaluates inbound call edges, imports, AST references, type references, and semantic annotation dependents. Module is optional; omit it for a workspace-wide symbol check.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -170,7 +152,7 @@ fn read_tool_specs() -> Vec<ReadToolSpec> {
         },
         ReadToolSpec {
             name: "rust_invariants".into(),
-            description: "Check actual Rust graph invariants and configured constraints: circular dependencies, layer violations, missing invariants on annotated core structs, isolated modules, policy violations, and drift freshness. Run without parameters to check everything.".into(),
+            description: "Check actual Rust graph invariants and configured constraints: circular dependencies, layer violations, missing invariants on annotated core structs, isolated modules/contexts, policy violations, and drift freshness. Run without parameters to check everything.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -181,19 +163,6 @@ fn read_tool_specs() -> Vec<ReadToolSpec> {
                     }
                 },
                 "required": []
-            }),
-        },
-        ReadToolSpec {
-            name: "rust_path".into(),
-            description: "Show how two Rust modules/components or symbols are connected. Returns proof paths over stored dependency facts or call-graph reachability when available.".into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "from": { "type": "string", "description": "Source Rust module or component" },
-                    "to": { "type": "string", "description": "Target Rust module or component" },
-                    "relation": { "type": "string", "enum": ["context_dep", "calls_symbol"], "description": "Connectivity relation to traverse (default: context_dep)" }
-                },
-                "required": ["from", "to"]
             }),
         },
         ReadToolSpec {
@@ -212,40 +181,30 @@ fn read_tool_specs() -> Vec<ReadToolSpec> {
             }),
         },
         ReadToolSpec {
-            name: "rust_diff".into(),
-            description: "Compare the two most recent actual Rust graph snapshots. Shows added and removed Rust facts over time.".into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {},
-                "required": []
-            }),
-        },
-        ReadToolSpec {
             name: "rust_history".into(),
-            description: "List actual Rust graph snapshots or compare two snapshot timestamps to show what changed between them.".into(),
+            description: "List actual Rust graph snapshots, compare two snapshot timestamps, or return the latest graph diff with mode=latest_diff. Use latest_diff as the replacement for the removed rust_diff tool.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
+                    "mode": {
+                        "type": "string",
+                        "enum": ["list", "compare", "latest_diff"],
+                        "description": "History operation (default: list). Use latest_diff to compare the two most recent actual snapshots."
+                    },
                     "state": {
                         "type": "string",
                         "enum": ["actual", "implemented", "current", "planned"],
                         "description": "History stream to query (default: actual; implemented/current/planned are accepted aliases)"
                     },
-                    "ts_old": {
-                        "type": "integer",
-                        "description": "Older snapshot timestamp (microseconds). Required for comparison."
-                    },
-                    "ts_new": {
-                        "type": "integer",
-                        "description": "Newer snapshot timestamp (microseconds). Omit for latest."
-                    }
+                    "ts_old": { "type": "integer", "description": "Older snapshot timestamp (microseconds). Required for comparison." },
+                    "ts_new": { "type": "integer", "description": "Newer snapshot timestamp (microseconds). Omit for latest." }
                 },
                 "required": []
             }),
         },
         ReadToolSpec {
             name: "rust_search".into(),
-            description: "Search actual Rust facts and semantic annotations by keyword. Finds modules, structs, symbols, labels, and decisions across the codebase.".into(),
+            description: "Search actual Rust facts and semantic annotations by keyword. Finds modules, structs, symbols, labels, policies, constraints, and decisions across the codebase.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -321,100 +280,7 @@ pub fn call_tool(store: &Store, workspace_path: &str, name: &str, args: &Value) 
             Err(e) => error_result(format!("query_rust_graph failed: {e}")),
         },
 
-        "rust_resolve" => {
-            let crate_dir = std::path::Path::new(workspace_path);
-            match crate::domain::rust_analyzer::resolve_calls(crate_dir) {
-                Ok(calls) => match store.save_resolved_calls(workspace_path, &calls) {
-                    Ok(count) => {
-                        let sample: Vec<String> = calls
-                            .iter()
-                            .take(10)
-                            .map(|c| {
-                                format!(
-                                    "{} → {} [{}:{}]",
-                                    c.caller, c.callee, c.callee_file, c.callee_line
-                                )
-                            })
-                            .collect();
-                        json_result(json!({
-                            "status": "ok",
-                            "resolved_calls": count,
-                            "sample": sample,
-                            "note": "Query with rust_graph(view=edges, relation=resolved_call). \
-                                     Each edge resolves a call site to the concrete function it targets.",
-                        }))
-                    }
-                    Err(e) => error_result(format!("rust_resolve: failed to persist: {e}")),
-                },
-                Err(e) => error_result(format!(
-                    "rust_resolve: embedded rust-analyzer call resolution failed \
-                     (ensure the daemon PATH can execute cargo and rustc): {e}"
-                )),
-            }
-        }
-
         "rust_readiness" => json_result(build_readiness_report(store, workspace_path)),
-
-        "rust_health" => match store.model_health(workspace_path) {
-            Ok(health) => {
-                let context_count = health.policy_coverage.context_count;
-                let has_implemented_model = context_count > 0;
-                let policy_gap_count = if health.policy_coverage.context_count == 0 {
-                    0
-                } else {
-                    health.policy_coverage.missing_layer_assignments.len()
-                        + usize::from(health.policy_coverage.dependency_constraint_count == 0)
-                };
-                let confidence = build_graph_confidence_report(store, workspace_path);
-                json_result(with_reasoning_context(
-                        json!({
-                            "status": if has_implemented_model { "ok" } else { "not_scanned" },
-                            "implemented_model": {
-                                "available": has_implemented_model,
-                                "context_count": context_count,
-                            },
-                            "model_health": health,
-                            "graph_confidence": confidence["graph_confidence"],
-                            "readiness_summary": confidence["summary"],
-                        }),
-                        Some(json!({
-                            "rule": "model health is computed from persisted architecture relations",
-                            "derived_from": [
-                                "context_dep",
-                                "service",
-                                "entity",
-                                "invariant",
-                                "event",
-                                "context",
-                                "layer_assignment",
-                                "dependency_constraint"
-                            ],
-                            "witness_count": health.circular_deps.len()
-                                + health.layer_violations.len()
-                                + health.missing_invariants.len()
-                                + health.orphan_contexts.len()
-                                + policy_gap_count,
-                        })),
-                        Some(json!({
-                            "score": health.score,
-                            "has_implemented_model": has_implemented_model,
-                            "context_count": context_count,
-                            "circular_dependency_count": health.circular_deps.len(),
-                            "layer_violation_count": health.layer_violations.len(),
-                            "missing_invariant_count": health.missing_invariants.len(),
-                            "orphan_context_count": health.orphan_contexts.len(),
-                            "policy_gap_count": policy_gap_count,
-                            "policy_coverage": health.policy_coverage,
-                        })),
-                        vec![
-                            "Model health uses the latest persisted implemented architecture facts.".into(),
-                            "Graph analytics (PageRank, betweenness, community, module cycles) are computed in-process over the context/module graph and do not depend on Cozo fixed rules.".into(),
-                        ],
-                        Some(json!({"source": "model_health", "state": "actual"})),
-                    ))
-            }
-            Err(e) => error_result(format!("model_health failed: {e}")),
-        },
 
         "rust_impact" => {
             let kernel = ReasoningKernel::new(store);
@@ -467,27 +333,6 @@ pub fn call_tool(store: &Store, workspace_path: &str, name: &str, args: &Value) 
             }
         }
 
-        "rust_path" => {
-            let from = args["from"]
-                .as_str()
-                .or_else(|| args["from_context"].as_str());
-            let from = match from {
-                Some(f) => f,
-                None => return error_result("'from' parameter is required".into()),
-            };
-            let to = args["to"].as_str().or_else(|| args["to_context"].as_str());
-            let to = match to {
-                Some(t) => t,
-                None => return error_result("'to' parameter is required".into()),
-            };
-            let relation = args["relation"].as_str().unwrap_or("context_dep");
-            let kernel = ReasoningKernel::new(store);
-            match kernel.how_connected_with_relation(workspace_path, relation, from, to) {
-                Ok(claim) => stored_claim_result(store, workspace_path, &claim),
-                Err(e) => error_result(format!("rust_path failed: {e}")),
-            }
-        }
-
         "rust_explain" => {
             let violation_type = match args["violation_type"].as_str() {
                 Some(v) => v,
@@ -498,14 +343,6 @@ pub fn call_tool(store: &Store, workspace_path: &str, name: &str, args: &Value) 
             match kernel.explain(workspace_path, violation_type) {
                 Ok(claim) => stored_claim_result(store, workspace_path, &claim),
                 Err(e) => error_result(format!("why '{}' failed: {e}", violation_type)),
-            }
-        }
-
-        "rust_diff" => {
-            let kernel = ReasoningKernel::new(store);
-            match kernel.drift(workspace_path) {
-                Ok(claim) => stored_claim_result(store, workspace_path, &claim),
-                Err(e) => error_result(format!("rust_diff failed: {e}")),
             }
         }
 
@@ -610,7 +447,10 @@ pub(crate) fn build_graph_confidence_report(store: &Store, workspace_path: &str)
     if call_edges > 0 && resolved_call_edges == 0 {
         score -= 25;
         warnings.push("Call graph evidence is syntactic/name-based only; compiler-resolved calls are unavailable.".to_string());
-        next_actions.push("Run rust_readiness, ensure cargo/rustc are visible to the daemon, then run rust_resolve or rust_scan.".to_string());
+        next_actions.push(
+            "Run rust_readiness, ensure cargo/rustc are visible to the daemon, then run rust_scan."
+                .to_string(),
+        );
     }
 
     if source_files > 1 && symbols > 10 && call_edges == 0 {
@@ -761,7 +601,7 @@ fn build_readiness_report(store: &Store, workspace_path: &str) -> Value {
                 "apply edits with rust-analyzer-aware tooling where possible",
                 "cargo check or targeted cargo test",
                 "rust_scan",
-                "rust_diff and rust_diagnose"
+                "rust_history with mode=latest_diff and rust_diagnose"
             ]
         }
     })
@@ -1693,24 +1533,23 @@ mod tests {
     #[test]
     fn test_list_tools_count() {
         let tools = list_tools();
-        assert_eq!(tools.len(), 13);
+        assert_eq!(tools.len(), 9);
         let names: Vec<_> = tools.iter().map(|tool| tool.name.as_str()).collect();
         for expected in [
             "rust_status",
             "rust_graph",
-            "rust_resolve",
-            "rust_health",
             "rust_readiness",
             "rust_impact",
             "rust_delete_safety",
             "rust_invariants",
-            "rust_path",
             "rust_explain",
-            "rust_diff",
             "rust_history",
             "rust_search",
         ] {
             assert!(names.contains(&expected));
+        }
+        for omitted in ["rust_resolve", "rust_health", "rust_path", "rust_diff"] {
+            assert!(!names.contains(&omitted));
         }
         for legacy in [
             "get_model",
@@ -1723,17 +1562,81 @@ mod tests {
     }
 
     #[test]
-    fn test_health_marks_empty_store_not_scanned() {
+    fn test_status_includes_health_for_empty_store() {
         let store = test_store();
-        let result = call_tool(&store, "/tmp/test-tools", "rust_health", &json!({}));
+        let result = call_tool(&store, "/tmp/test-tools", "rust_status", &json!({}));
         assert_eq!(result.is_error, None);
         let ContentBlock::Text { text } = &result.content[0];
         let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
-        assert_eq!(parsed["status"], "not_scanned");
-        assert_eq!(parsed["implemented_model"]["available"], false);
-        assert_eq!(parsed["evidence"]["has_implemented_model"], false);
+        assert_eq!(parsed["status"], "no_model");
+        assert!(parsed["health"]["score"].is_number());
         assert_eq!(parsed["graph_confidence"]["status"], "not_scanned");
         assert_eq!(parsed["readiness_summary"]["status"], "not_scanned");
+    }
+
+    #[test]
+    fn test_history_latest_diff_compares_recent_snapshots() {
+        let store = test_store();
+        let ws = format!("/tmp/test-history-latest-diff-{}", std::process::id());
+        let mut first = DomainModel::empty("HistoryDiff");
+        first.bounded_contexts = vec![BoundedContext {
+            name: "Catalog".into(),
+            description: "Catalog context".into(),
+            module_path: "src/catalog".into(),
+            ownership: Ownership::default(),
+            aggregates: vec![],
+            policies: vec![],
+            read_models: vec![],
+            entities: vec![],
+            value_objects: vec![],
+            services: vec![],
+            repositories: vec![],
+            events: vec![],
+            modules: vec![],
+            dependencies: vec![],
+            api_endpoints: vec![],
+        }];
+        store.save_actual(&ws, &first).unwrap();
+
+        let mut second = first.clone();
+        second.bounded_contexts.push(BoundedContext {
+            name: "Billing".into(),
+            description: "Billing context".into(),
+            module_path: "src/billing".into(),
+            ownership: Ownership::default(),
+            aggregates: vec![],
+            policies: vec![],
+            read_models: vec![],
+            entities: vec![],
+            value_objects: vec![],
+            services: vec![],
+            repositories: vec![],
+            events: vec![],
+            modules: vec![],
+            dependencies: vec![],
+            api_endpoints: vec![],
+        });
+        store.save_actual(&ws, &second).unwrap();
+
+        let result = call_tool(
+            &store,
+            &ws,
+            "rust_history",
+            &json!({ "mode": "latest_diff" }),
+        );
+        assert_eq!(result.is_error, None);
+        let ContentBlock::Text { text } = &result.content[0];
+        let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["status"], "latest_diff");
+        assert_eq!(parsed["claim_kind"], "history");
+        assert_eq!(parsed["summary"]["additions"], 1);
+        assert!(
+            parsed["added"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|change| { change["kind"] == "context" && change["name"] == "Billing" })
+        );
     }
 
     #[test]
@@ -2745,11 +2648,11 @@ mod tests {
     }
 
     #[test]
-    fn test_how_connected_dispatch() {
+    fn test_graph_paths_uses_dependency_relation() {
         let store = test_store();
         let ws = format!("/tmp/test-deppath-{}", std::process::id());
         store
-            .save_desired(
+            .save_actual(
                 &ws,
                 &DomainModel {
                     name: "P".into(),
@@ -2809,8 +2712,10 @@ mod tests {
         let result = call_tool(
             &store,
             &ws,
-            "rust_path",
+            "rust_graph",
             &json!({
+                "view": "paths",
+                "relation": "context_dep",
                 "from": "A",
                 "to": "B"
             }),
@@ -2819,14 +2724,16 @@ mod tests {
         let ContentBlock::Text { text } = &result.content[0];
         let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
         assert_eq!(parsed["reachable"], true);
-        assert_eq!(parsed["claim_kind"], "how_connected");
+        assert_eq!(parsed["view"], "paths");
+        assert_eq!(parsed["relation"], "context_dep");
+        assert_eq!(parsed["rows"][0][0], json!(["A", "B"]));
         assert_eq!(parsed["provenance"]["state"], "actual");
         assert_eq!(parsed["proof"]["derived_from"][0], "context_dep");
         assert!(!parsed["limitations"].as_array().unwrap().is_empty());
     }
 
     #[test]
-    fn test_how_connected_dispatch_uses_call_graph_relation() {
+    fn test_graph_paths_uses_call_graph_relation() {
         let store = test_store();
         let ws = format!("/tmp/test-callpath-{}", std::process::id());
         let mut model = DomainModel::empty(&ws);
@@ -2842,29 +2749,6 @@ mod tests {
         let result = call_tool(
             &store,
             &ws,
-            "rust_path",
-            &json!({
-                "relation": "calls_symbol",
-                "from": "Store::upsert_layer_assignment",
-                "to": "persist_policy"
-            }),
-        );
-        assert_eq!(result.is_error, None);
-        let ContentBlock::Text { text } = &result.content[0];
-        let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
-        assert_eq!(parsed["reachable"], true);
-        assert_eq!(parsed["relation"], "calls_symbol");
-        assert_eq!(
-            parsed["paths"][0],
-            json!(["Store::upsert_layer_assignment", "persist_policy"])
-        );
-        assert_eq!(parsed["provenance"]["source"], "call_graph_reachability");
-        assert_eq!(parsed["proof"]["derived_from"][0], "calls_symbol");
-        assert_eq!(parsed["proof"]["witness_count"], 1);
-
-        let graph_result = call_tool(
-            &store,
-            &ws,
             "rust_graph",
             &json!({
                 "view": "paths",
@@ -2873,10 +2757,11 @@ mod tests {
                 "to": "persist_policy"
             }),
         );
-        assert_eq!(graph_result.is_error, None);
-        let ContentBlock::Text { text } = &graph_result.content[0];
+        assert_eq!(result.is_error, None);
+        let ContentBlock::Text { text } = &result.content[0];
         let graph: serde_json::Value = serde_json::from_str(text).unwrap();
         assert_eq!(graph["reachable"], true);
+        assert_eq!(graph["relation"], "calls_symbol");
         assert_eq!(
             graph["rows"][0][0],
             json!(["Store::upsert_layer_assignment", "persist_policy"])

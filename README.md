@@ -238,16 +238,12 @@ The canonical tool names are Rust-native and actual-state first. Older names suc
 |:-----|:------------|
 | `rust_status` | Current actual-state Rust model: crates, modules, source files, symbols, imports, calls, semantic annotations, health, and snapshot freshness |
 | `rust_graph` | Bounded graph-database views over Rust modules, source files, symbols, imports, references, calls, AST edges, neighborhoods, paths, and relation counts; repeated facts are returned as compact `schema` + `cols` + `rows` JSON with `offset`/`next_offset` pagination and machine-readable exhaustiveness metadata |
-| `rust_resolve` | Manually refresh compiler-resolved call edges with embedded rust-analyzer libraries; `rust_scan` already attempts this during the unified scan, but this tool is useful when you only need to refresh `resolved_call` facts |
-| `rust_health` | Structured Datalog health report: score (0–100), cycles, violations, missing invariants, orphan modules/contexts, and graph analytics when available |
 | `rust_readiness` | Product-readiness report for agents: graph confidence, semantic call-resolution coverage, rust-analyzer availability, cargo metadata visibility, version/runtime identity, and remediation actions |
 | `rust_impact` | Blast-radius and shape analysis over modules, structs, symbols, dependencies, fields, methods, call graph reachability, optimization/refactor recommendations, and Rust practice findings |
 | `rust_delete_safety` | Proof-backed safe-deletion check for structs/symbols with inbound call/import/AST witnesses; module is optional |
 | `rust_invariants` | Evaluate actual graph invariants and configured constraints: layer violations, cycles, aggregate quality, orphans, policy violations, drift freshness |
-| `rust_path` | Return proof paths between Rust modules/components |
 | `rust_explain` | Evidence-backed explanation with witness paths for failing invariants or constraints |
-| `rust_diff` | Compare recent actual Rust graph snapshots — added/removed facts and changes |
-| `rust_history` | List actual Rust graph snapshots or compare two snapshot timestamps |
+| `rust_history` | List actual Rust graph snapshots, compare two snapshot timestamps, or compare the two most recent snapshots with `mode: "latest_diff"` |
 | `rust_search` | Search Rust facts and semantic annotations by keyword |
 
 ### Write tools
@@ -255,7 +251,7 @@ The canonical tool names are Rust-native and actual-state first. Older names suc
 | Tool | Description |
 |:-----|:------------|
 | `rust_scan` | Unified scan of workspace source code: refreshes the actual Rust fact graph from AST facts, code references, and compiler-resolved calls when rust-analyzer succeeds; use `rust_graph` to inspect persisted facts |
-| `rust_annotations` | Create, update, or remove semantic annotations on top of Rust facts; does not mutate source-extracted ground truth |
+| `rust_annotations` | Create, update, or remove semantic annotations on top of Rust facts with compact `kind`/`name`/`module` plus `data` arguments; does not mutate source-extracted ground truth |
 | `rust_diagnose` | Diagnose and plan from actual Rust facts; `accept`/`reset` are compatibility no-ops in actual-first mode |
 | `rust_constraints` | Declare and evaluate constraints: layer assignments, allowed/forbidden dependencies |
 
@@ -387,13 +383,12 @@ actions instead of silently treating absence as proof.
 }
 ```
 
-### `rust_health`
+### Health in `rust_status`
 
 ```json
 {
   "status": "ok",
-  "implemented_model": { "available": true, "context_count": 2 },
-  "model_health": {
+  "health": {
     "score": 85,
     "circular_deps": [],
     "module_cycles": [],
@@ -405,8 +400,8 @@ actions instead of silently treating absence as proof.
     "score": 85,
     "counts": { "source_files": 14, "symbols": 210, "resolved_call_edges": 198 }
   },
-  "proof": { "rule": "model health is computed from persisted architecture relations" },
-  "evidence": { "score": 85, "context_count": 2 }
+  "readiness_summary": { "status": "usable_with_warnings" },
+  "proof": { "rule": "architecture overview combines implemented graph reconstruction with health and temporal diff summary" }
 }
 ```
 
@@ -433,13 +428,16 @@ actions instead of silently treating absence as proof.
 }
 ```
 
-### `rust_diff`
+### `rust_history` with `mode: "latest_diff"`
 
 ```json
 {
-  "basis": "actual_history",
-  "status": "pending_changes",
-  "summary": { "total_changes": 3, "additions": 2, "removals": 1, "drift_entries": 3 },
+  "status": "latest_diff",
+  "claim_kind": "history",
+  "state": "actual",
+  "ts_old": 1760000000000000,
+  "ts_new": 1760000001000000,
+  "summary": { "total_changes": 3, "additions": 2, "removals": 1 },
   "added": [
     { "kind": "context", "action": "add", "context": "", "name": "Notifications" },
     { "kind": "field", "action": "add", "context": "Catalog", "name": "sku", "owner_kind": "entity", "owner": "Product" }
@@ -447,7 +445,7 @@ actions instead of silently treating absence as proof.
   "removed": [
     { "kind": "entity", "action": "remove", "context": "Ordering", "name": "LegacyOrder" }
   ],
-  "proof": { "rule": "persisted drift is the temporal set difference between recent implemented graph snapshots" }
+  "proof": { "rule": "latest_diff compares the two most recent stored temporal snapshots" }
 }
 ```
 

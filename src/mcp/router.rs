@@ -319,8 +319,10 @@ mod tests {
         assert!(names.contains(&"rust_impact"));
         assert!(names.contains(&"rust_scan"));
         assert!(names.contains(&"rust_diagnose"));
-        assert!(names.contains(&"rust_diff"));
         assert!(names.contains(&"rust_history"));
+        for omitted in ["rust_resolve", "rust_health", "rust_path", "rust_diff"] {
+            assert!(!names.contains(&omitted));
+        }
         assert!(!names.contains(&"architecture"));
         assert!(!names.contains(&"define"));
     }
