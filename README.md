@@ -64,11 +64,34 @@ axon exposes the same live model through multiple adapters:
 
 | Adapter | Use case |
 |:--------|:---------|
-| MCP stdio | GitHub Copilot and other MCP-capable VS Code extensions |
+| MCP stdio | GitHub Copilot, Claude Code, Codex, and other MCP-capable agents |
 | CLI | Universal fallback for Claude Code, Codex, scripts, and terminals |
 | Local web UI/API | Human inspection and extension integrations that can call HTTP |
 
-### VS Code / VSCodium / GitHub Copilot
+### MCP config files by client
+
+Different agents use different MCP configuration files. The server command is
+the same, but the file location and top-level schema are not interchangeable.
+
+| Client | VS Code / VSCodium use | Project-shared config | Personal config | Top-level key |
+|:-------|:------------------------|:----------------------|:----------------|:--------------|
+| GitHub Copilot Chat in VS Code | Native VS Code MCP support | `.vscode/mcp.json` | VS Code user `mcp.json` | `servers` |
+| GitHub Copilot Chat in VSCodium | Only if your installed agent extension supports VS Code-style MCP | `.vscode/mcp.json` | Extension/user profile config | `servers` |
+| GitHub Copilot CLI | Terminal inside either editor | none | `~/.copilot/mcp-config.json` | `mcpServers` |
+| GitHub Copilot cloud agent / code review | GitHub.com, not the editor | Repository Settings > Copilot > MCP servers | none | `mcpServers` |
+| Claude Code | Terminal or extension inside either editor | `.mcp.json` | `~/.claude.json` | `mcpServers` |
+| Codex CLI / Codex IDE extension | Terminal or extension inside either editor | `.codex/config.toml` | `~/.codex/config.toml` | `mcp_servers` |
+
+Use one entry per client family. VS Code does not read `.mcp.json`, Claude Code
+does not read `.vscode/mcp.json`, and Codex does not read either JSON format.
+
+The examples below assume the Homebrew install above and the shared daemon is
+running. On Apple Silicon, the Homebrew binary is usually
+`/opt/homebrew/bin/axon`; on Intel Macs, use `/usr/local/bin/axon`. If the agent
+is launched from a shell where `axon` is already on `PATH`, `command = "axon"`
+or `"command": "axon"` is also fine.
+
+### VS Code / VSCodium / GitHub Copilot Chat
 
 Add to `.vscode/mcp.json` in your project:
 
@@ -77,14 +100,17 @@ Add to `.vscode/mcp.json` in your project:
   "servers": {
     "axon": {
       "type": "stdio",
-      "command": "axon",
+      "command": "/opt/homebrew/bin/axon",
       "args": ["serve", "--workspace", "${workspaceFolder}"]
     }
   }
 }
 ```
 
-Once the Homebrew service is running and this is configured, Copilot gains access to all axon tools, resources, and prompts automatically.
+Once the Homebrew service is running and this is configured, GitHub Copilot Chat
+in VS Code can discover axon tools, resources, and prompts automatically.
+VSCodium follows the same file shape only when the installed agent extension
+implements VS Code-style MCP support.
 
 For local axon development, build first and point VS Code at the workspace
 binary so MCP requests exercise your edited source:
@@ -105,37 +131,85 @@ The default `serve` command bridges to the shared daemon. Restarting the
 Homebrew service restarts that daemon, but it does not rebuild or reinstall a
 locally edited binary.
 
-VSCodium does not provide MCP by itself; MCP support comes from the installed agent extension or from an external CLI. The examples below assume the Homebrew install above, so `axon` is available on `PATH` and the daemon is already running.
+### GitHub Copilot CLI
+
+GitHub Copilot CLI uses its own user-level MCP file, not `.vscode/mcp.json`.
+Add axon to `~/.copilot/mcp-config.json`:
+
+```json
+{
+  "mcpServers": {
+    "axon": {
+      "type": "stdio",
+      "command": "/opt/homebrew/bin/axon",
+      "args": ["serve", "--workspace", "/absolute/path/to/rust/workspace"],
+      "tools": ["*"]
+    }
+  }
+}
+```
+
+For GitHub Copilot cloud agent or Copilot code review on GitHub.com, add the
+same kind of `mcpServers` entry in the repository's Copilot MCP settings instead
+of committing a file. Adapt the `command` and `args` for the cloud runner: a
+macOS Homebrew path such as `/opt/homebrew/bin/axon` is local-machine specific,
+so install axon in the agent setup workflow or use a command path already
+available in that environment.
 
 ### Claude Code
 
-After installing axon with Homebrew, register it as a stdio MCP server from a VS Code or VSCodium terminal:
+Claude Code can use a project-shared `.mcp.json` file:
 
-```bash
-claude mcp add axon -- axon serve --workspace "$PWD"
+```json
+{
+  "mcpServers": {
+    "axon": {
+      "type": "stdio",
+      "command": "/opt/homebrew/bin/axon",
+      "args": ["serve", "--workspace", "${CLAUDE_PROJECT_DIR:-.}"]
+    }
+  }
+}
 ```
 
-If a GUI-launched Claude Code extension does not inherit your shell `PATH`, point it at the Homebrew binary directly:
+You can also register the same server from a VS Code or VSCodium terminal:
+
+```bash
+claude mcp add --scope project --transport stdio axon -- \
+  /opt/homebrew/bin/axon serve --workspace '${CLAUDE_PROJECT_DIR:-.}'
+```
+
+For a private current-project config, omit `--scope project`; Claude Code stores
+that local-scoped entry in `~/.claude.json`. For a private all-projects config,
+use `--scope user`.
+
+If a GUI-launched Claude Code extension does not inherit your shell `PATH`, keep
+the full Homebrew binary path:
 
 ```bash
 claude mcp add axon -- /opt/homebrew/bin/axon serve --workspace /path/to/rust/workspace
 ```
 
-On Intel Macs, use `/usr/local/bin/axon` instead.
-
-Claude Code extensions that expose MCP settings can use the same command and args as the VS Code MCP JSON above.
+Claude Code extensions that expose MCP settings can use the same command and
+args as the `.mcp.json` example above.
 
 ### Codex
 
-After installing axon with Homebrew, add it to `~/.codex/config.toml`:
+Codex stores MCP servers in TOML. For a project-shared setup, add
+`.codex/config.toml`:
 
 ```toml
 [mcp_servers.axon]
-command = "axon"
-args = ["serve", "--workspace", "/absolute/path/to/rust/workspace"]
+command = "/opt/homebrew/bin/axon"
+cwd = ".."
+args = ["serve", "--workspace", "."]
 ```
 
-If Codex is launched from a GUI and cannot find `axon`, use the Homebrew binary path:
+The project config lives in `.codex/`, so `cwd = ".."` starts axon from the
+repository root before resolving `--workspace .`.
+
+For a private user-level setup shared by Codex CLI and the Codex IDE extension,
+put the same table in `~/.codex/config.toml` with an absolute workspace path:
 
 ```toml
 [mcp_servers.axon]
@@ -143,11 +217,20 @@ command = "/opt/homebrew/bin/axon"
 args = ["serve", "--workspace", "/absolute/path/to/rust/workspace"]
 ```
 
-On Intel Macs, use `/usr/local/bin/axon` instead. Codex extensions for VS Code or VSCodium should use the same MCP server command when they provide MCP configuration.
+Or add it with the Codex CLI:
+
+```bash
+codex mcp add axon -- /opt/homebrew/bin/axon serve --workspace "$PWD"
+```
+
+Codex project config is loaded only after Codex trusts the project. The Codex
+CLI and Codex IDE extension share the same `~/.codex/config.toml` and
+`.codex/config.toml` layers, whether they are launched from VS Code, VSCodium,
+or a standalone terminal.
 
 ## MCP tools
 
-The canonical tool names are Rust-native and actual-state first. Legacy names such as `architecture`, `query_blast_radius`, `scan_model`, and `set_model` remain callable for compatibility, but they are not advertised by `tools/list`.
+The canonical tool names are Rust-native and actual-state first. Older names such as `architecture`, `query_blast_radius`, `scan_model`, and `set_model` are neither advertised nor accepted as tool names; use the `rust_*` names below.
 
 ### Read tools
 
@@ -155,6 +238,7 @@ The canonical tool names are Rust-native and actual-state first. Legacy names su
 |:-----|:------------|
 | `rust_status` | Current actual-state Rust model: crates, modules, source files, symbols, imports, calls, semantic annotations, health, and snapshot freshness |
 | `rust_graph` | Bounded graph-database views over Rust modules, source files, symbols, imports, references, calls, AST edges, neighborhoods, paths, and relation counts; repeated facts are returned as compact `schema` + `cols` + `rows` JSON with `offset`/`next_offset` pagination and machine-readable exhaustiveness metadata |
+| `rust_resolve` | Manually refresh compiler-resolved call edges with embedded rust-analyzer libraries; `rust_scan` already attempts this during the unified scan, but this tool is useful when you only need to refresh `resolved_call` facts |
 | `rust_health` | Structured Datalog health report: score (0–100), cycles, violations, missing invariants, orphan modules/contexts, and graph analytics when available |
 | `rust_readiness` | Product-readiness report for agents: graph confidence, semantic call-resolution coverage, rust-analyzer availability, cargo metadata visibility, version/runtime identity, and remediation actions |
 | `rust_impact` | Blast-radius and shape analysis over modules, structs, symbols, dependencies, fields, methods, call graph reachability, optimization/refactor recommendations, and Rust practice findings |
@@ -185,6 +269,12 @@ The canonical tool names are Rust-native and actual-state first. Legacy names su
 | `axon://architecture/conventions` | Naming, structure, and testing conventions |
 | `axon://context/{name}` | Compatibility semantic-overlay details |
 
+### Prompts
+
+| Prompt | Description |
+|:-------|:------------|
+| `axon_guidelines` | Rust architecture workflow guidance enriched with live Datalog health, constraints, temporal drift, and semantic-overlay context |
+
 ## CLI
 
 ```
@@ -193,15 +283,16 @@ axon [command] [options]
 
 | Command | Description |
 |:--------|:------------|
-| `serve` | Start the MCP stdio bridge to the shared daemon; use `--standalone` for an in-process server |
-| `daemon` | Run the shared in-memory daemon, live watcher, and multi-workspace web graph |
-| `web` | Start only the background Rust watcher and local web graph |
-| `export <file>` | Export domain model to JSON (`--state actual`; legacy aliases are accepted) |
-| `list` | Show all crates and their model status |
-| `check` | Verify workspace semantics (layer violations, cycles) |
-| `scan` | AST-scan a workspace and populate the implemented model |
+| `serve` | Start the MCP stdio bridge to the shared daemon; accepts `--workspace <path>` (defaults to current directory). Use `--standalone` for an in-process server; `--web-port` only applies in standalone mode |
+| `daemon` | Run the shared in-memory daemon, Unix socket bridge, live watcher, and multi-workspace web graph; accepts `--socket <path>` and `--web-port <port>` |
+| `web` | Start the background Rust watcher and local web graph for one workspace; accepts `--workspace <path>` (defaults to current directory) and `--port <port>` |
+| `export <file>` | Export a workspace model to JSON; requires `--workspace <path>` and accepts `--state actual` or compatibility aliases |
+| `list` | Show all discovered crates and their model status; accepts `--workspace <path>` (defaults to current directory) |
+| `check` | Parse live imports and report imports that do not map to the current actual semantic overlays; requires `--workspace <path>` |
+| `scan` | Run the unified Rust scan, save actual facts, compute temporal drift, and attempt rust-analyzer resolved-call enrichment; requires `--workspace <path>` |
 
-All commands accept `--workspace <path>` (defaults to current directory).
+The daemon socket defaults to `$AXON_SOCKET` when set, otherwise
+`~/.axon/daemon.sock`.
 
 Examples:
 
@@ -269,14 +360,17 @@ Sub-structures (fields, methods, parameters, invariants) are stored as **indepen
 
 ### Proof-carrying results
 
-Every reasoning tool returns structured results with:
+Reasoning tools return structured results with:
 
-- **status** — `true`, `false`, or `unknown`
-- **proof** — Witness paths and supporting edges
-- **evidence** — Source files and line spans
-- **limitations** — Explicit uncertainty (dynamic dispatch, reflection, partial ingestion)
+- **status** — Tool-specific state such as `true`/`false`, `reachable`, `in_sync`, `pending_changes`, `ready`, or `not_scanned`
+- **proof** — Derivation rules and witness counts when the result comes from the reasoning kernel
+- **evidence** — Supporting facts, paths, relation counts, and source locations when available
+- **limitations** — Explicit uncertainty, such as dynamic dispatch, generated code, missing scans, or stale drift
+- **truth_maintenance** — Snapshot and drift context for persisted reasoning claims
 
-The system never guesses. If it can't prove a claim, it returns `unknown`.
+The system prefers bounded, evidence-backed answers. If the stored graph is
+missing or incomplete, tools surface that through status, limitations, and next
+actions instead of silently treating absence as proof.
 
 ## Example tool outputs
 
@@ -297,17 +391,22 @@ The system never guesses. If it can't prove a claim, it returns `unknown`.
 
 ```json
 {
-  "score": 85,
-  "circular_deps": [],
-  "layer_violations": [],
-  "missing_invariants": [["Catalog", "Category"]],
-  "orphan_contexts": ["Notifications"],
-  "god_contexts": [],
-  "unsourced_events": [],
-  "complexity": [
-    { "context": "Catalog", "entity_count": 3, "service_count": 2, "event_count": 2, "dep_count": 0 },
-    { "context": "Ordering", "entity_count": 2, "service_count": 1, "event_count": 1, "dep_count": 1 }
-  ]
+  "status": "ok",
+  "implemented_model": { "available": true, "context_count": 2 },
+  "model_health": {
+    "score": 85,
+    "circular_deps": [],
+    "module_cycles": [],
+    "layer_violations": [],
+    "missing_invariants": [["Catalog", "Category"]]
+  },
+  "graph_confidence": {
+    "status": "usable_with_warnings",
+    "score": 85,
+    "counts": { "source_files": 14, "symbols": 210, "resolved_call_edges": 198 }
+  },
+  "proof": { "rule": "model health is computed from persisted architecture relations" },
+  "evidence": { "score": 85, "context_count": 2 }
 }
 ```
 
@@ -315,15 +414,22 @@ The system never guesses. If it can't prove a claim, it returns `unknown`.
 
 ```json
 {
+  "status": "false",
+  "claim_kind": "safe_to_delete",
+  "context": "Billing",
+  "entity": "Order",
   "can_delete": false,
-  "aggregates_referencing": [],
-  "events_sourced": ["OrderPlaced", "OrderCancelled"],
-  "repositories_managing": ["OrderRepository"],
-  "import_references": [],
-  "ast_references": [],
-  "call_references": [
-    { "caller": "process_payment", "file": "src/billing/service.rs", "line": 42 }
-  ]
+  "result": {
+    "events_sourced": ["OrderPlaced", "OrderCancelled"],
+    "repositories_managing": ["OrderRepository"],
+    "import_references": [],
+    "ast_references": [],
+    "call_references": [
+      { "caller": "process_payment", "file": "src/billing/service.rs", "line": 42 }
+    ]
+  },
+  "proof": { "rule": "entity deletable IFF no inbound references are present in the stored implemented graph" },
+  "limitations": ["Dynamic dispatch, reflection, string-based lookups, and out-of-repository consumers are not tracked."]
 }
 ```
 
@@ -332,12 +438,16 @@ The system never guesses. If it can't prove a claim, it returns `unknown`.
 ```json
 {
   "basis": "actual_history",
-  "pending_changes": [
+  "status": "pending_changes",
+  "summary": { "total_changes": 3, "additions": 2, "removals": 1, "drift_entries": 3 },
+  "added": [
     { "kind": "context", "action": "add", "context": "", "name": "Notifications" },
-    { "kind": "field", "action": "add", "context": "Catalog", "name": "sku", "owner_kind": "entity", "owner": "Product" },
+    { "kind": "field", "action": "add", "context": "Catalog", "name": "sku", "owner_kind": "entity", "owner": "Product" }
+  ],
+  "removed": [
     { "kind": "entity", "action": "remove", "context": "Ordering", "name": "LegacyOrder" }
   ],
-  "pending_change_count": 3
+  "proof": { "rule": "persisted drift is the temporal set difference between recent implemented graph snapshots" }
 }
 ```
 
