@@ -193,7 +193,7 @@
     .workspace {
       min-height: 0;
       display: grid;
-      grid-template-columns: 260px minmax(0, 1fr) 340px;
+      grid-template-columns: 130px minmax(0, 1fr) 340px;
     }
 
     .rail,
@@ -217,7 +217,6 @@
     }
 
     .stat,
-    .crate-card,
     .details-card {
       border: 1px solid rgba(244, 239, 226, 0.12);
       border-radius: 8px;
@@ -227,11 +226,6 @@
     .stat { padding: 10px; }
     .stat strong { display: block; font-size: 22px; line-height: 1; }
     .stat span { display: block; margin-top: 5px; color: var(--quiet); font-size: 12px; }
-
-    .crate-list { display: grid; gap: 8px; margin-top: 10px; }
-    .crate-card { padding: 10px; }
-    .crate-card strong { display: block; }
-    .crate-card span { color: var(--quiet); font-size: 12px; }
 
     .legend {
       display: grid;
@@ -459,10 +453,6 @@
         <div id="stats" class="stat-grid"></div>
       </section>
       <section class="panel">
-        <h2>Crates</h2>
-        <div id="crates" class="crate-list"></div>
-      </section>
-      <section class="panel">
         <h2>Legend</h2>
         <div class="legend">
           <span><i class="swatch" style="background:var(--crate)"></i>Crate</span>
@@ -495,7 +485,6 @@
     // nest inside; imports/calls are the drawn edges. Data comes from /api/graph.
     const details = document.getElementById('details');
     const statsEl = document.getElementById('stats');
-    const cratesEl = document.getElementById('crates');
     const search = document.getElementById('search');
     const layoutMode = document.getElementById('layout-mode');
     const visibleCount = document.getElementById('visible-count');
@@ -558,7 +547,6 @@
       state.data = data;
       subtitle.textContent = data.nodes.length + ' nodes / ' + data.edges.length + ' edges';
       renderStats(data.stats || {});
-      renderCrates(data.crates || []);
       draw();
     }
 
@@ -577,21 +565,6 @@
         caption.textContent = label;
         card.append(value, caption);
         statsEl.appendChild(card);
-      }
-    }
-
-    function renderCrates(rows) {
-      clearElement(cratesEl);
-      if (!rows.length) { cratesEl.textContent = 'No crates indexed.'; return; }
-      for (const row of rows) {
-        const card = document.createElement('div');
-        card.className = 'crate-card';
-        const name = document.createElement('strong');
-        name.textContent = row.name;
-        const meta = document.createElement('span');
-        meta.textContent = (row.stats?.modules ?? 0) + ' modules / ' + (row.stats?.structs ?? 0) + ' structs';
-        card.append(name, meta);
-        cratesEl.appendChild(card);
       }
     }
 
