@@ -5209,6 +5209,8 @@ impl Store {
             .unwrap_or("");
         let from_filter = args["from"].as_str().unwrap_or("");
         let to_filter = args["to"].as_str().unwrap_or("");
+        let requested_scope =
+            RustFactScope::parse(args["scope"].as_str().unwrap_or("all"), RustFactScope::All)?;
         let limit = args["limit"].as_u64().unwrap_or(50).clamp(1, 200) as usize;
         let offset = args["offset"].as_u64().unwrap_or(0).min(10_000) as usize;
         let filter_context = context_filter.to_lowercase();
@@ -5225,6 +5227,7 @@ impl Store {
             "symbol": symbol_filter,
             "from": from_filter,
             "to": to_filter,
+            "scope": requested_scope.as_str(),
             "limit": limit,
             "offset": offset,
         });
@@ -5315,6 +5318,9 @@ impl Store {
                         let name = dv_str(&row[1]);
                         let path = dv_str(&row[2]);
                         let file_path = dv_str(&row[4]);
+                        if !rust_fact_allowed(requested_scope, &file_path, &name, "") {
+                            continue;
+                        }
                         if !filter_context.is_empty()
                             && !text_matches(&context, &filter_context)
                             && !text_matches(&name, &filter_context)
@@ -5350,6 +5356,9 @@ impl Store {
                     for row in &rows.rows {
                         let path = dv_str(&row[0]);
                         let context = dv_str(&row[1]);
+                        if !rust_fact_allowed(requested_scope, &path, "", "") {
+                            continue;
+                        }
                         if !filter_context.is_empty() && !text_matches(&context, &filter_context) {
                             continue;
                         }
@@ -5383,6 +5392,9 @@ impl Store {
                         let symbol_kind = dv_str(&row[1]);
                         let context = dv_str(&row[2]);
                         let file_path = dv_str(&row[3]);
+                        if !rust_fact_allowed(requested_scope, &file_path, &name, "") {
+                            continue;
+                        }
                         if kind != "all" && kind != "symbol" && kind != symbol_kind {
                             continue;
                         }
@@ -5500,6 +5512,9 @@ impl Store {
                         let from_file = dv_str(&row[0]);
                         let to_module = dv_str(&row[1]);
                         let context = dv_str(&row[2]);
+                        if !rust_fact_allowed(requested_scope, &from_file, "", &to_module) {
+                            continue;
+                        }
                         if !filter_context.is_empty() && !text_matches(&context, &filter_context) {
                             continue;
                         }
@@ -5550,6 +5565,14 @@ impl Store {
                         let to_path = dv_str(&row[1]);
                         let reference_kind = dv_str(&row[2]);
                         let context = dv_str(&row[4]);
+                        if !rust_fact_allowed(
+                            requested_scope,
+                            &from_file,
+                            &to_path,
+                            &reference_kind,
+                        ) {
+                            continue;
+                        }
                         if !filter_context.is_empty() && !text_matches(&context, &filter_context) {
                             continue;
                         }
@@ -5606,6 +5629,9 @@ impl Store {
                         let callee = dv_str(&row[1]);
                         let file_path = dv_str(&row[2]);
                         let context = dv_str(&row[4]);
+                        if !rust_fact_allowed(requested_scope, &file_path, &caller, &callee) {
+                            continue;
+                        }
                         if !filter_context.is_empty() && !text_matches(&context, &filter_context) {
                             continue;
                         }
@@ -5657,6 +5683,10 @@ impl Store {
                     for row in &rows.rows {
                         let from_node = dv_str(&row[0]);
                         let to_node = dv_str(&row[1]);
+                        let file_path = dv_str(&row[3]);
+                        if !rust_fact_allowed(requested_scope, &file_path, &from_node, &to_node) {
+                            continue;
+                        }
                         if !filter_symbol.is_empty()
                             && !text_matches(&from_node, &filter_symbol)
                             && !text_matches(&to_node, &filter_symbol)
@@ -5677,7 +5707,7 @@ impl Store {
                             "from_kind": "symbol",
                             "to_kind": "symbol",
                             "edge_type": dv_str(&row[2]),
-                            "file": dv_str(&row[3]),
+                            "file": file_path,
                             "line": dv_i64(&row[4]),
                         }));
                     }
@@ -5703,6 +5733,9 @@ impl Store {
                         let caller = dv_str(&row[0]);
                         let callee = dv_str(&row[1]);
                         let callee_file = dv_str(&row[2]);
+                        if !rust_fact_allowed(requested_scope, &callee_file, &caller, &callee) {
+                            continue;
+                        }
                         // `symbol`/`from` match the caller; `to` matches the resolved
                         // callee. So `from="Store::save"` lists what it actually calls.
                         if !filter_symbol.is_empty()
@@ -5767,6 +5800,7 @@ impl Store {
                         "context": context_filter,
                         "file": file_filter,
                         "symbol": symbol_filter,
+                        "scope": requested_scope.as_str(),
                         "limit": limit,
                         "offset": offset,
                     }),
@@ -5779,6 +5813,7 @@ impl Store {
                         "context": context_filter,
                         "file": file_filter,
                         "symbol": symbol_filter,
+                        "scope": requested_scope.as_str(),
                         "limit": limit,
                         "offset": offset,
                     }),
@@ -6565,6 +6600,15 @@ impl Store {
     /// identify coupling, fan-in/fan-out, and ambiguity, while runtime speedups still
     /// need profiling or benchmarks to confirm.
     pub fn optimization_recommendations(&self, workspace: &str) -> Result<serde_json::Value> {
+        self.optimization_recommendations_scoped(workspace, "all")
+    }
+
+    pub fn optimization_recommendations_scoped(
+        &self,
+        workspace: &str,
+        scope: &str,
+    ) -> Result<serde_json::Value> {
+        let requested_scope = RustFactScope::parse(scope, RustFactScope::All)?;
         let ws = canonicalize_path(workspace);
         let params = params_map(&[("ws", &ws)]);
 
@@ -6598,7 +6642,7 @@ impl Store {
             .map_err(|e| anyhow::anyhow!("optimization calls: {:?}", e))?;
         let ast_edges = self
             .run_script(
-                "?[from_node, to_node, edge_type] := *ast_edge{workspace: $ws, from_node, to_node, edge_type, state: 'actual' @ 'NOW'}",
+                "?[from_node, to_node, edge_type, file_path] := *ast_edge{workspace: $ws, from_node, to_node, edge_type, state: 'actual', file_path @ 'NOW'}",
                 params,
                 ScriptMutability::Immutable,
             )
@@ -6607,13 +6651,20 @@ impl Store {
         let mut known_modules: BTreeSet<String> = BTreeSet::new();
         for row in &source_files.rows {
             let path = dv_str(&row[0]);
+            if !rust_fact_allowed(requested_scope, &path, "", "") {
+                continue;
+            }
             let module = file_module_path(&path);
             if !module.is_empty() {
                 known_modules.insert(module);
             }
         }
         for row in &symbols.rows {
+            let name = dv_str(&row[0]);
             let file_path = dv_str(&row[3]);
+            if !rust_fact_allowed(requested_scope, &file_path, &name, "") {
+                continue;
+            }
             let module = file_module_path(&file_path);
             if !module.is_empty() {
                 known_modules.insert(module);
@@ -6626,6 +6677,9 @@ impl Store {
         let mut imports_by_target: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         for row in &imports.rows {
             let from_file = dv_str(&row[0]);
+            if !rust_fact_allowed(requested_scope, &from_file, "", &dv_str(&row[1])) {
+                continue;
+            }
             let from_module = file_module_path(&from_file);
             let to_module = dv_str(&row[1]);
             let Some(target_module) =
@@ -6670,6 +6724,9 @@ impl Store {
             let caller = dv_str(&row[0]);
             let callee = dv_str(&row[1]);
             let file_path = dv_str(&row[2]);
+            if !rust_fact_allowed(requested_scope, &file_path, &caller, &callee) {
+                continue;
+            }
             let context = dv_str(&row[3]);
             callers_by_callee
                 .entry(callee.clone())
@@ -6763,12 +6820,16 @@ impl Store {
         let mut symbols_by_short_name: BTreeMap<String, Vec<serde_json::Value>> = BTreeMap::new();
         for row in &symbols.rows {
             let name = dv_str(&row[0]);
+            let file_path = dv_str(&row[3]);
+            if !rust_fact_allowed(requested_scope, &file_path, &name, "") {
+                continue;
+            }
             let short = name.rsplit("::").next().unwrap_or(&name).to_string();
             symbols_by_short_name.entry(short).or_default().push(json!({
                 "name": name,
                 "kind": dv_str(&row[1]),
                 "context": dv_str(&row[2]),
-                "file": dv_str(&row[3]),
+                "file": file_path,
                 "visibility": dv_str(&row[4]),
             }));
         }
@@ -6805,6 +6866,9 @@ impl Store {
             let name = dv_str(&row[0]);
             let context = dv_str(&row[2]);
             let file = dv_str(&row[3]);
+            if !rust_fact_allowed(requested_scope, &file, &name, "") {
+                continue;
+            }
             for alias in symbol_lookup_aliases(&name) {
                 symbol_by_alias.entry(alias).or_default().push((
                     name.clone(),
@@ -6816,6 +6880,11 @@ impl Store {
         let mut incoming_contexts: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
         for row in &calls.rows {
             let callee = dv_str(&row[1]);
+            let caller = dv_str(&row[0]);
+            let file_path = dv_str(&row[2]);
+            if !rust_fact_allowed(requested_scope, &file_path, &caller, &callee) {
+                continue;
+            }
             let caller_context = dv_str(&row[3]);
             let Some(matches) = symbol_by_alias.get(&callee) else {
                 continue;
@@ -6833,6 +6902,10 @@ impl Store {
         for row in &symbols.rows {
             let symbol = dv_str(&row[0]);
             let declared_context = dv_str(&row[2]);
+            let file_path = dv_str(&row[3]);
+            if !rust_fact_allowed(requested_scope, &file_path, &symbol, "") {
+                continue;
+            }
             if declared_context.is_empty() {
                 continue;
             }
@@ -6873,7 +6946,13 @@ impl Store {
         let impl_edges = ast_edges
             .rows
             .iter()
-            .filter(|row| dv_str(&row[2]) == "implements")
+            .filter(|row| {
+                let from_node = dv_str(&row[0]);
+                let to_node = dv_str(&row[1]);
+                let file_path = dv_str(&row[3]);
+                dv_str(&row[2]) == "implements"
+                    && rust_fact_allowed(requested_scope, &file_path, &from_node, &to_node)
+            })
             .count();
         if impl_edges > 0 {
             recommendations.push(json!({
@@ -6910,14 +6989,15 @@ impl Store {
 
         Ok(json!({
             "analysis": "optimization_recommendations",
+            "scope": requested_scope.as_str(),
             "recommendations": recommendations,
             "count": recommendations.len(),
             "fact_counts": {
-                "source_files": source_files.rows.len(),
-                "symbols": symbols.rows.len(),
-                "import_edges": imports.rows.len(),
-                "call_edges": calls.rows.len(),
-                "ast_edges": ast_edges.rows.len(),
+                "source_files": source_files.rows.iter().filter(|row| rust_fact_allowed(requested_scope, &dv_str(&row[0]), "", "")).count(),
+                "symbols": symbols.rows.iter().filter(|row| rust_fact_allowed(requested_scope, &dv_str(&row[3]), &dv_str(&row[0]), "")).count(),
+                "import_edges": imports.rows.iter().filter(|row| rust_fact_allowed(requested_scope, &dv_str(&row[0]), "", &dv_str(&row[1]))).count(),
+                "call_edges": calls.rows.iter().filter(|row| rust_fact_allowed(requested_scope, &dv_str(&row[2]), &dv_str(&row[0]), &dv_str(&row[1]))).count(),
+                "ast_edges": ast_edges.rows.iter().filter(|row| rust_fact_allowed(requested_scope, &dv_str(&row[3]), &dv_str(&row[0]), &dv_str(&row[1]))).count(),
             },
             "note": "Static graph recommendations identify refactoring and optimization candidates; runtime wins require profiling or benchmarks.",
         }))
@@ -6928,22 +7008,17 @@ impl Store {
     /// These findings are triage signals, not lints: they are ranked with graph
     /// evidence so risky constructs near central symbols rise above local noise.
     pub fn practice_findings(&self, workspace: &str) -> Result<serde_json::Value> {
+        self.practice_findings_scoped(workspace, "all")
+    }
+
+    pub fn practice_findings_scoped(
+        &self,
+        workspace: &str,
+        scope: &str,
+    ) -> Result<serde_json::Value> {
+        let requested_scope = RustFactScope::parse(scope, RustFactScope::All)?;
         let ws = canonicalize_path(workspace);
         let params = params_map(&[("ws", &ws)]);
-        let practice_scope = |file_path: &str, symbol: &str| -> &'static str {
-            let path = file_path.replace('\\', "/");
-            if path.ends_with("_tests.rs")
-                || path.ends_with("_test.rs")
-                || path.starts_with("tests/")
-                || path.contains("/tests/")
-                || symbol.starts_with("test_")
-                || symbol.contains("::tests::")
-            {
-                "test"
-            } else {
-                "production"
-            }
-        };
         let scoped_priority = |priority_score: i64, scope: &str| -> i64 {
             if scope == "test" {
                 priority_score.clamp(10, 25)
@@ -6985,6 +7060,10 @@ impl Store {
         for row in &calls.rows {
             let caller = dv_str(&row[0]);
             let callee = dv_str(&row[1]);
+            let file_path = dv_str(&row[2]);
+            if !rust_fact_allowed(requested_scope, &file_path, &caller, &callee) {
+                continue;
+            }
             inbound_by_callee.entry(callee).or_default().insert(caller);
         }
 
@@ -7004,7 +7083,10 @@ impl Store {
             let stale_code_suppression =
                 directive.contains("dead_code") || directive.contains("unused");
             let file_path = dv_str(&row[3]);
-            let scope = practice_scope(&file_path, &from_node);
+            if !rust_fact_allowed(requested_scope, &file_path, &from_node, &directive) {
+                continue;
+            }
+            let scope = rust_fact_scope_label(&file_path, &from_node, &directive);
             let severity = if scope == "test" {
                 "info"
             } else if risky_suppression {
@@ -7063,7 +7145,10 @@ impl Store {
             };
             let inbound = inbound_by_callee.get(&callee).map_or(0, BTreeSet::len);
             let file_path = dv_str(&row[2]);
-            let scope = practice_scope(&file_path, &caller);
+            if !rust_fact_allowed(requested_scope, &file_path, &caller, &callee) {
+                continue;
+            }
+            let scope = rust_fact_scope_label(&file_path, &caller, &callee);
             let raw_priority = base_score + inbound.min(10) as i64;
             let remediation = if scope == "test" {
                 "Keep test unwraps when they express fixture setup or assertion intent; otherwise use expect with an intent-specific message."
@@ -7131,7 +7216,10 @@ impl Store {
                 continue;
             };
             let file_path = dv_str(&row[0]);
-            let scope = practice_scope(&file_path, &to_path);
+            if !rust_fact_allowed(requested_scope, &file_path, &to_path, &reference_kind) {
+                continue;
+            }
+            let scope = rust_fact_scope_label(&file_path, &to_path, &reference_kind);
             findings.push(json!({
                 "kind": kind,
                 "category": "control_flow_debt",
@@ -7158,6 +7246,9 @@ impl Store {
             let name = dv_str(&row[0]);
             let context = dv_str(&row[2]);
             let file_path = dv_str(&row[3]);
+            if !rust_fact_allowed(requested_scope, &file_path, &name, "") {
+                continue;
+            }
             let start_line = dv_i64(&row[4]);
             let visibility = dv_str(&row[6]);
             for alias in symbol_lookup_aliases(&name) {
@@ -7174,6 +7265,10 @@ impl Store {
         for row in &calls.rows {
             let caller = dv_str(&row[0]);
             let callee = dv_str(&row[1]);
+            let file_path = dv_str(&row[2]);
+            if !rust_fact_allowed(requested_scope, &file_path, &caller, &callee) {
+                continue;
+            }
             let Some(matches) = symbol_by_alias.get(&callee) else {
                 continue;
             };
@@ -7198,7 +7293,10 @@ impl Store {
                 continue;
             }
             let file_path = dv_str(&row[3]);
-            let scope = practice_scope(&file_path, &name);
+            if !rust_fact_allowed(requested_scope, &file_path, &name, "") {
+                continue;
+            }
+            let scope = rust_fact_scope_label(&file_path, &name, "");
             findings.push(json!({
                 "kind": "high_fan_in_private_symbol",
                 "category": "coupling",
@@ -7257,6 +7355,7 @@ impl Store {
 
         Ok(json!({
             "analysis": "practice_findings",
+            "scope": requested_scope.as_str(),
             "findings": findings,
             "count": findings.len(),
             "summary": {
@@ -8396,6 +8495,74 @@ fn text_matches(haystack: &str, needle_lowercase: &str) -> bool {
         .split(|c: char| !c.is_alphanumeric() && c != '_')
         .filter(|token| token.len() > 2)
         .any(|token| haystack.contains(token))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RustFactScope {
+    Production,
+    Test,
+    All,
+}
+
+impl RustFactScope {
+    fn parse(value: &str, default: Self) -> Result<Self> {
+        match value {
+            "" => Ok(default),
+            "production" => Ok(Self::Production),
+            "test" => Ok(Self::Test),
+            "all" => Ok(Self::All),
+            other => anyhow::bail!("invalid scope '{other}'; expected production, test, or all"),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Production => "production",
+            Self::Test => "test",
+            Self::All => "all",
+        }
+    }
+
+    fn allows(self, item_scope: Self) -> bool {
+        matches!(self, Self::All) || self == item_scope
+    }
+}
+
+fn rust_fact_scope(file_path: &str, symbol: &str, marker: &str) -> RustFactScope {
+    if is_test_fact(file_path, symbol, marker) {
+        RustFactScope::Test
+    } else {
+        RustFactScope::Production
+    }
+}
+
+fn rust_fact_scope_label(file_path: &str, symbol: &str, marker: &str) -> &'static str {
+    rust_fact_scope(file_path, symbol, marker).as_str()
+}
+
+fn rust_fact_allowed(
+    requested: RustFactScope,
+    file_path: &str,
+    symbol: &str,
+    marker: &str,
+) -> bool {
+    requested.allows(rust_fact_scope(file_path, symbol, marker))
+}
+
+fn is_test_fact(file_path: &str, symbol: &str, marker: &str) -> bool {
+    let path = file_path.replace('\\', "/");
+    let symbol = symbol.trim();
+    let marker = marker.trim();
+    path.ends_with("_tests.rs")
+        || path.ends_with("_test.rs")
+        || path.starts_with("tests/")
+        || path.contains("/tests/")
+        || symbol.starts_with("test_")
+        || symbol.contains("::tests::")
+        || marker == "test"
+        || marker == "cfg(test)"
+        || marker.starts_with("tokio::test")
+        || marker.starts_with("async_std::test")
 }
 
 /// True if `short` equals `long`, or `short` is a suffix of `long` at a

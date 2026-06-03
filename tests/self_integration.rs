@@ -22,7 +22,7 @@ use axon::domain::analyze::scan_actual_model;
 use axon::mcp::tools::call_tool;
 use axon::mcp::write_tools::call_write_tool;
 use axon::store::Store;
-use axon::store::cozo::canonicalize_path;
+use axon::store::canonicalize_path;
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -341,7 +341,7 @@ fn self_query_cross_cutting_insights() {
         .save_desired(&ws, &actual)
         .expect("save_desired failed");
 
-    let canonical = axon::store::cozo::canonicalize_path(&ws);
+    let canonical = axon::store::canonicalize_path(&ws);
 
     // ── Query 1: List all bounded contexts ─────────────────────────────
     let rows = store

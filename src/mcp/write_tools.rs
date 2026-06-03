@@ -5,8 +5,7 @@ use crate::domain::rust_facts::{RustFeatureSelection, RustScanOptions, RustScanS
 use crate::domain::to_snake;
 use crate::mcp::protocol::*;
 use crate::reasoning::ReasoningKernel;
-use crate::store::Store;
-use crate::store::cozo::{PersistedReasoningClaim, ReasoningFactRef};
+use crate::store::{PersistedReasoningClaim, ReasoningFactRef, Store};
 
 /// Returns the list of write tools the Axon server exposes.
 pub fn list_write_tools() -> Vec<ToolDefinition> {
@@ -1624,7 +1623,11 @@ fn invalidate_and_refresh_policy(store: &Store, workspace_path: &str) -> Result<
 }
 
 fn rust_scan_options_from_args(args: &Value) -> Result<RustScanOptions, String> {
-    let scope = match args.get("scope").and_then(Value::as_str).unwrap_or("production") {
+    let scope = match args
+        .get("scope")
+        .and_then(Value::as_str)
+        .unwrap_or("production")
+    {
         "" | "production" => RustScanScope::Production,
         "test" => RustScanScope::Test,
         "all" => RustScanScope::All,
@@ -2325,6 +2328,39 @@ mod tests {
         assert!(!names.contains(&"scan_model"));
         assert!(!names.contains(&"refactor_model"));
         assert!(!names.contains(&"assert_model"));
+
+        let rust_scan = tools
+            .iter()
+            .find(|tool| tool.name == "rust_scan")
+            .expect("rust_scan tool definition");
+        assert!(rust_scan.input_schema["properties"].get("scope").is_some());
+        assert!(
+            rust_scan.input_schema["properties"]
+                .get("features")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn rust_scan_options_parse_scope_and_selected_features() {
+        let options = rust_scan_options_from_args(&json!({
+            "scope": "all",
+            "features": {
+                "mode": "selected",
+                "selected": ["sqlite", "fixtures"],
+                "no_default_features": true
+            }
+        }))
+        .unwrap();
+
+        let profile = rust_scan_options_json(&options);
+        assert_eq!(profile["scope"], "all");
+        assert_eq!(profile["features"]["mode"], "selected");
+        assert_eq!(
+            profile["features"]["selected"],
+            json!(["sqlite", "fixtures"])
+        );
+        assert_eq!(profile["features"]["no_default_features"], true);
     }
 
     #[test]

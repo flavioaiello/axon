@@ -1,6 +1,13 @@
-pub mod cozo;
+mod cozo;
 
-pub use cozo::Store;
+pub use cozo::{
+    ContextComplexity, DriftFreshness, FactSnapshotSummary, LayerViolation, ModelHealth,
+    PersistedReasoningClaim, PolicyCoverage, ProjectInfo, ReasoningAssumption,
+    ReasoningDependency, ReasoningDerivation, ReasoningFactRef, ReasoningJustification,
+    ReasoningProvenance, ReasoningSupportEdge, Store, TruthMaintenanceReport, canonicalize_path,
+    default_layer_constraints,
+};
+pub(crate) use cozo::{ACTUAL_STATE, canonical_model_state};
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
@@ -25,7 +32,7 @@ pub struct CrateEntry {
 impl CrateEntry {
     /// The canonical workspace key for this crate's store operations.
     pub fn workspace_key(&self) -> String {
-        cozo::canonicalize_path(&self.root.to_string_lossy())
+        canonicalize_path(&self.root.to_string_lossy())
     }
 }
 

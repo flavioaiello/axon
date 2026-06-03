@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use axon::domain::model::*;
 use axon::store::Store;
-use axon::store::cozo::{canonicalize_path, default_layer_constraints};
+use axon::store::{canonicalize_path, default_layer_constraints};
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 

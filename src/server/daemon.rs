@@ -24,8 +24,7 @@ use super::WorkspaceRegistries as Registries;
 use super::watcher::ActualStateWatcher;
 use crate::mcp::handle_request_with_registry;
 use crate::mcp::protocol::{JsonRpcRequest, JsonRpcResponse};
-use crate::store::CrateRegistry;
-use crate::store::cozo::canonicalize_path;
+use crate::store::{CrateRegistry, canonicalize_path};
 
 #[derive(Deserialize)]
 struct Handshake {

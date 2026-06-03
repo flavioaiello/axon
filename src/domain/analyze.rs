@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use syn::spanned::Spanned;
+#[cfg(test)]
 use syn::visit::Visit;
 
 use super::model::DomainModel;
@@ -57,66 +58,6 @@ pub fn scan_actual_graph_with_options(
             },
         }),
     }
-}
-
-// ─── Live Import Extraction ────────────────────────────────────────────────
-
-struct ImportVisitor {
-    imports: Vec<String>,
-}
-
-impl<'ast> Visit<'ast> for ImportVisitor {
-    fn visit_use_tree(&mut self, node: &'ast syn::UseTree) {
-        fn extract_paths(tree: &syn::UseTree, prefix: &str) -> Vec<String> {
-            fn join(prefix: &str, segment: &str) -> String {
-                if prefix.is_empty() {
-                    segment.to_string()
-                } else {
-                    format!("{prefix}::{segment}")
-                }
-            }
-
-            match tree {
-                syn::UseTree::Path(path) => {
-                    extract_paths(&path.tree, &join(prefix, &path.ident.to_string()))
-                }
-                syn::UseTree::Name(name) => vec![join(prefix, &name.ident.to_string())],
-                syn::UseTree::Rename(rename) => vec![join(prefix, &rename.ident.to_string())],
-                syn::UseTree::Glob(_) => vec![join(prefix, "*")],
-                syn::UseTree::Group(group) => {
-                    let mut paths = vec![];
-                    for item in &group.items {
-                        paths.extend(extract_paths(item, prefix));
-                    }
-                    paths
-                }
-            }
-        }
-        self.imports.extend(extract_paths(node, ""));
-    }
-}
-
-pub fn extract_live_dependencies(
-    file_path: &Path,
-    source_code: &str,
-) -> Result<Vec<LiveDependency>> {
-    let syntax_tree = syn::parse_file(source_code)
-        .with_context(|| format!("Failed to parse rust file: {}", file_path.display()))?;
-
-    let mut visitor = ImportVisitor { imports: vec![] };
-    visitor.visit_file(&syntax_tree);
-
-    let from_file = file_path.to_string_lossy().to_string();
-    let deps = visitor
-        .imports
-        .into_iter()
-        .map(|to_module| LiveDependency {
-            from_file: from_file.clone(),
-            to_module,
-        })
-        .collect();
-
-    Ok(deps)
 }
 
 /// Return a scanner appropriate for the file's extension, or None if unsupported.
@@ -1652,7 +1593,9 @@ mod tests {
             use std::path::Path;
             use crate::domain::model::DomainModel;
         "#;
-        let deps = extract_live_dependencies(Path::new("test.rs"), code).unwrap();
+        let deps = RustSynScanner
+            .extract_live_dependencies(Path::new("test.rs"), code)
+            .unwrap();
         let modules: Vec<&str> = deps.iter().map(|dep| dep.to_module.as_str()).collect();
         assert_eq!(
             modules,

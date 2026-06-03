@@ -3,11 +3,10 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
 
 use crate::domain::model::DomainModel;
-use crate::store::Store;
-use crate::store::cozo::{
+use crate::store::{
     ACTUAL_STATE, ModelHealth, PersistedReasoningClaim, ReasoningAssumption, ReasoningDependency,
     ReasoningDerivation, ReasoningJustification, ReasoningProvenance, ReasoningSupportEdge,
-    canonical_model_state, canonicalize_path,
+    Store, canonical_model_state, canonicalize_path,
 };
 
 mod claims;
@@ -1212,10 +1211,14 @@ impl<'a> ReasoningKernel<'a> {
                     )
                 }
                 "optimization_recommendations" => {
-                    let result = self.store.optimization_recommendations(&canonical)?;
+                    let scope = scoped_impact_arg(args, "production");
+                    let result = self
+                        .store
+                        .optimization_recommendations_scoped(&canonical, &scope)?;
                     (
                         json!({
                             "analysis": analysis,
+                            "scope": scope,
                             "result": result,
                         }),
                         vec![
@@ -1235,10 +1238,12 @@ impl<'a> ReasoningKernel<'a> {
                     )
                 }
                 "practice_findings" => {
-                    let result = self.store.practice_findings(&canonical)?;
+                    let scope = scoped_impact_arg(args, "production");
+                    let result = self.store.practice_findings_scoped(&canonical, &scope)?;
                     (
                         json!({
                             "analysis": analysis,
+                            "scope": scope,
                             "result": result,
                         }),
                         vec![
@@ -3327,7 +3332,14 @@ fn impact_claim_id(args: &Value) -> Result<String> {
         CLAIM_IMPACT_PREFIX.to_string(),
         escape_claim_component(analysis),
     ];
-    for key in ["context", "entity", "symbol", "field_type", "method_name"] {
+    for key in [
+        "context",
+        "entity",
+        "symbol",
+        "field_type",
+        "method_name",
+        "scope",
+    ] {
         if let Some(value) = subject[key].as_str().filter(|value| !value.is_empty()) {
             parts.push(format!("{key}={}", escape_claim_component(value)));
         }
@@ -3368,14 +3380,24 @@ fn search_claim_id(query: &str, limit: usize) -> String {
 }
 
 fn normalized_impact_subject(args: &Value) -> Value {
+    let analysis = args["analysis"].as_str().unwrap_or("");
+    let default_scope = match analysis {
+        "optimization_recommendations" | "practice_findings" => "production",
+        _ => "",
+    };
     json!({
-        "analysis": args["analysis"].as_str().unwrap_or(""),
+        "analysis": analysis,
         "context": args["context"].as_str().or_else(|| args["module"].as_str()).unwrap_or(""),
         "entity": args["entity"].as_str().or_else(|| args["struct"].as_str()).unwrap_or(""),
         "symbol": args["symbol"].as_str().or_else(|| args["struct"].as_str()).unwrap_or(""),
         "field_type": args["field_type"].as_str().unwrap_or(""),
         "method_name": args["method_name"].as_str().unwrap_or(""),
+        "scope": args["scope"].as_str().unwrap_or(default_scope),
     })
+}
+
+fn scoped_impact_arg(args: &Value, default: &str) -> String {
+    args["scope"].as_str().unwrap_or(default).to_string()
 }
 
 fn required_arg(args: &Value, key: &str, analysis: &str) -> Result<String> {

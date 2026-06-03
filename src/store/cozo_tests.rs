@@ -635,22 +635,22 @@ fn optimization_recommendations_surface_shape_candidates() {
     model.import_edges = vec![
         ImportEdge {
             from_file: "src/mcp/tools.rs".into(),
-            to_module: "crate::store::cozo::Store".into(),
+            to_module: "crate::store::Store".into(),
             context: "mcp".into(),
         },
         ImportEdge {
             from_file: "src/mcp/resources.rs".into(),
-            to_module: "crate::store::cozo::Store".into(),
+            to_module: "crate::store::Store".into(),
             context: "mcp".into(),
         },
         ImportEdge {
             from_file: "src/mcp/write_tools.rs".into(),
-            to_module: "crate::store::cozo::Store".into(),
+            to_module: "crate::store::Store".into(),
             context: "mcp".into(),
         },
         ImportEdge {
             from_file: "src/server/web.rs".into(),
-            to_module: "crate::store::cozo::Store".into(),
+            to_module: "crate::store::Store".into(),
             context: "server".into(),
         },
     ];
@@ -682,6 +682,34 @@ fn optimization_recommendations_surface_shape_candidates() {
             file_path: "src/server/web.rs".into(),
             line: 13,
             context: "server".into(),
+        },
+        CallEdge {
+            caller: "test_save_desired_a".into(),
+            callee: "save_desired".into(),
+            file_path: "src/store/cozo_tests.rs".into(),
+            line: 20,
+            context: "store".into(),
+        },
+        CallEdge {
+            caller: "test_save_desired_b".into(),
+            callee: "save_desired".into(),
+            file_path: "src/store/cozo_tests.rs".into(),
+            line: 21,
+            context: "store".into(),
+        },
+        CallEdge {
+            caller: "test_save_desired_c".into(),
+            callee: "save_desired".into(),
+            file_path: "src/store/cozo_tests.rs".into(),
+            line: 22,
+            context: "store".into(),
+        },
+        CallEdge {
+            caller: "test_save_desired_d".into(),
+            callee: "save_desired".into(),
+            file_path: "src/store/cozo_tests.rs".into(),
+            line: 23,
+            context: "store".into(),
         },
     ];
     model.ast_edges = vec![ASTEdge {
@@ -723,6 +751,25 @@ fn optimization_recommendations_surface_shape_candidates() {
     assert!(
         kinds.contains("port_adapter_review"),
         "expected port/adapter candidate: {result}"
+    );
+
+    assert!(
+        recommendations
+            .iter()
+            .any(|recommendation| recommendation["target"] == "save_desired"),
+        "all-scope recommendations should include test-only fan-in: {result}"
+    );
+
+    let production_result = store
+        .optimization_recommendations_scoped(ws, "production")
+        .unwrap();
+    let production_recommendations = production_result["recommendations"].as_array().unwrap();
+    assert_eq!(production_result["scope"], "production");
+    assert!(
+        production_recommendations
+            .iter()
+            .all(|recommendation| recommendation["target"] != "save_desired"),
+        "production-scope recommendations should exclude test-only fan-in: {production_result}"
     );
 }
 
@@ -784,13 +831,22 @@ fn practice_findings_rank_rust_best_practice_signals() {
             context: "store".into(),
         },
     ];
-    model.ast_edges = vec![ASTEdge {
-        from_node: "Store::legacy".into(),
-        to_node: "allow(dead_code)".into(),
-        edge_type: "decorators".into(),
-        file_path: "src/store/cozo.rs".into(),
-        line: 8,
-    }];
+    model.ast_edges = vec![
+        ASTEdge {
+            from_node: "Store::legacy".into(),
+            to_node: "allow(dead_code)".into(),
+            edge_type: "decorators".into(),
+            file_path: "src/store/cozo.rs".into(),
+            line: 8,
+        },
+        ASTEdge {
+            from_node: "test_load_fixture".into(),
+            to_node: "test".into(),
+            edge_type: "decorators".into(),
+            file_path: "src/store/cozo_tests.rs".into(),
+            line: 29,
+        },
+    ];
     model.reference_edges = vec![ReferenceEdge {
         from_file: "src/store/cozo.rs".into(),
         to_path: "panic".into(),
@@ -850,6 +906,33 @@ fn practice_findings_rank_rust_best_practice_signals() {
             > test_unwrap["priority_score"].as_i64().unwrap(),
         "test-only findings should not outrank production findings: {result}"
     );
+
+    let production_result = store.practice_findings_scoped(ws, "production").unwrap();
+    let production_findings = production_result["findings"].as_array().unwrap();
+    assert_eq!(production_result["scope"], "production");
+    assert_eq!(production_result["summary"]["test_count"], 0);
+    assert!(
+        production_findings
+            .iter()
+            .all(|finding| finding["scope"] == "production"),
+        "production-scope findings should exclude tests: {production_result}"
+    );
+
+    let all_test_edges = store
+        .query_rust_graph(
+            ws,
+            &json!({ "view": "edges", "relation": "ast_edge", "to": "test", "scope": "all" }),
+        )
+        .unwrap();
+    assert_eq!(all_test_edges["count"], 1);
+
+    let production_test_edges = store
+        .query_rust_graph(
+            ws,
+            &json!({ "view": "edges", "relation": "ast_edge", "to": "test", "scope": "production" }),
+        )
+        .unwrap();
+    assert_eq!(production_test_edges["count"], 0);
 }
 
 #[test]

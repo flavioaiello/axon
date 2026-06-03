@@ -7,8 +7,7 @@ use std::process::Command;
 use crate::domain::model::DomainModel;
 use crate::mcp::protocol::*;
 use crate::reasoning::ReasoningKernel;
-use crate::store::Store;
-use crate::store::cozo::PersistedReasoningClaim;
+use crate::store::{PersistedReasoningClaim, Store};
 
 /// Returns the list of tools the Axon server exposes.
 pub fn list_tools() -> Vec<ToolDefinition> {
@@ -97,6 +96,11 @@ fn read_tool_specs() -> Vec<ReadToolSpec> {
                     "struct": { "type": "string", "description": "Rust struct-name alias for symbol" },
                     "from": { "type": "string", "description": "Source node for paths or edge filtering" },
                     "to": { "type": "string", "description": "Target node for paths or edge filtering" },
+                    "scope": {
+                        "type": "string",
+                        "enum": ["production", "test", "all"],
+                        "description": "Filter row-returning graph views by fact scope (default: all)."
+                    },
                     "limit": { "type": "integer", "description": "Max returned rows per collection (default: 50, max: 200)", "default": 50 },
                     "offset": { "type": "integer", "description": "Zero-based row offset for paginating nodes, edges, and neighborhoods (default: 0)", "default": 0 }
                 },
@@ -132,7 +136,12 @@ fn read_tool_specs() -> Vec<ReadToolSpec> {
                     "struct": { "type": "string", "description": "Rust struct name for struct/entity or call graph analyses" },
                     "symbol": { "type": "string", "description": "Rust symbol name" },
                     "field_type": { "type": "string", "description": "Field type to search (required for field_usage)" },
-                    "method_name": { "type": "string", "description": "Method name to search (required for method_search)" }
+                    "method_name": { "type": "string", "description": "Method name to search (required for method_search)" },
+                    "scope": {
+                        "type": "string",
+                        "enum": ["production", "test", "all"],
+                        "description": "Fact scope for advice analyses. practice_findings and optimization_recommendations default to production; pass all to include tests."
+                    }
                 },
                 "required": ["analysis"]
             }),
@@ -2140,17 +2149,17 @@ mod tests {
         model.import_edges = vec![
             ImportEdge {
                 from_file: "src/mcp/tools.rs".into(),
-                to_module: "crate::store::cozo::Store".into(),
+                to_module: "crate::store::Store".into(),
                 context: "mcp".into(),
             },
             ImportEdge {
                 from_file: "src/mcp/resources.rs".into(),
-                to_module: "crate::store::cozo::Store".into(),
+                to_module: "crate::store::Store".into(),
                 context: "mcp".into(),
             },
             ImportEdge {
                 from_file: "src/server/web.rs".into(),
-                to_module: "crate::store::cozo::Store".into(),
+                to_module: "crate::store::Store".into(),
                 context: "server".into(),
             },
         ];

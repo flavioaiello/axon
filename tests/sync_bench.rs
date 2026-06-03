@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use axon::domain::analyze::scan_actual_model;
 use axon::store::Store;
-use axon::store::cozo::canonicalize_path;
+use axon::store::canonicalize_path;
 
 #[test]
 #[ignore = "benchmark; run with --ignored --nocapture"]

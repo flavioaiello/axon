@@ -700,7 +700,7 @@ fn invariant_coverage_with_first_class_invariants() {
     let store = temp_store();
     let ws = ws();
     store.save_desired(&ws, &ecommerce_model()).unwrap();
-    let canonical = axon::store::cozo::canonicalize_path(&ws);
+    let canonical = axon::store::canonicalize_path(&ws);
 
     let missing = store
         .aggregate_roots_without_invariants(&canonical)
