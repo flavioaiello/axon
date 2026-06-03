@@ -211,7 +211,7 @@
 
     .stat-grid {
       display: grid;
-      grid-template-columns: 1fr 1fr;
+      grid-template-columns: 1fr;
       gap: 8px;
       margin-top: 10px;
     }
@@ -226,27 +226,6 @@
     .stat { padding: 10px; }
     .stat strong { display: block; font-size: 22px; line-height: 1; }
     .stat span { display: block; margin-top: 5px; color: var(--quiet); font-size: 12px; }
-
-    .legend {
-      display: grid;
-      gap: 9px;
-      margin-top: 12px;
-      color: var(--muted);
-    }
-
-    .legend span {
-      display: flex;
-      align-items: center;
-      gap: 9px;
-    }
-
-    .swatch {
-      width: 13px;
-      height: 13px;
-      border-radius: 99px;
-      display: inline-block;
-      box-shadow: 0 0 0 1px rgba(16, 18, 17, 0.9), 0 0 18px rgba(255, 255, 255, 0.08);
-    }
 
     .stage {
       position: relative;
@@ -451,16 +430,6 @@
       <section class="panel">
         <h2>Inventory</h2>
         <div id="stats" class="stat-grid"></div>
-      </section>
-      <section class="panel">
-        <h2>Legend</h2>
-        <div class="legend">
-          <span><i class="swatch" style="background:var(--crate)"></i>Crate</span>
-          <span><i class="swatch" style="background:var(--module)"></i>Module / submodule</span>
-          <span><i class="swatch" style="background:var(--struct)"></i>Struct</span>
-          <span><i class="swatch" style="background:var(--imports)"></i>Imports</span>
-          <span><i class="swatch" style="background:var(--calls)"></i>Calls</span>
-        </div>
       </section>
     </aside>
 
