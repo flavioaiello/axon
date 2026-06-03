@@ -6670,6 +6670,17 @@ impl Store {
                 known_modules.insert(module);
             }
         }
+        let mut project_call_aliases: BTreeSet<String> = BTreeSet::new();
+        for row in &symbols.rows {
+            let name = dv_str(&row[0]);
+            let file_path = dv_str(&row[3]);
+            if !rust_fact_allowed(requested_scope, &file_path, &name, "") {
+                continue;
+            }
+            for alias in symbol_lookup_aliases(&name) {
+                project_call_aliases.insert(alias);
+            }
+        }
 
         let mut recommendations = Vec::new();
 
@@ -6687,6 +6698,9 @@ impl Store {
             else {
                 continue;
             };
+            if is_root_facade_import(&to_module, &target_module) {
+                continue;
+            }
             if target_module == from_module
                 || is_ancestor(&target_module, &from_module)
                 || is_ancestor(&from_module, &target_module)
@@ -6702,15 +6716,17 @@ impl Store {
             if importers.len() < 3 {
                 continue;
             }
+            let public_api_like = public_api_like_module(&target);
             recommendations.push(json!({
-                "kind": "facade",
+                "kind": if public_api_like { "public_api_surface" } else { "facade" },
                 "target": target,
-                "score": importers.len() as i64,
-                "confidence": if importers.len() >= 5 { "high" } else { "medium" },
-                "rationale": "Several outside files import this internal module directly; a stable facade can reduce downstream churn.",
-                "proposed_shape": "Expose a narrow module facade or port and route external imports through it.",
+                "score": if public_api_like { (importers.len() as i64).max(1) / 2 } else { importers.len() as i64 },
+                "confidence": if public_api_like { "medium" } else if importers.len() >= 5 { "high" } else { "medium" },
+                "rationale": if public_api_like { "Several files import a shared public API-shaped module; keep the surface deliberate and avoid broad wildcard coupling." } else { "Several outside files import this internal module directly; a stable facade can reduce downstream churn." },
+                "proposed_shape": if public_api_like { "Keep the module as an explicit public API, and tighten imports or split exports if the surface becomes too broad." } else { "Expose a narrow module facade or port and route external imports through it." },
                 "evidence": {
                     "importing_files": importers.into_iter().collect::<Vec<_>>(),
+                    "public_api_like": public_api_like,
                 },
                 "validation": ["Run rust_graph neighborhood for the target", "Apply the import rewrite", "Run cargo test and compare rust_history mode=latest_diff"],
             }));
@@ -6752,6 +6768,11 @@ impl Store {
                 .collect();
             let contexts = contexts_by_callee.get(callee).cloned().unwrap_or_default();
             let callee_lower = callee.to_lowercase();
+            let project_owned_callee = project_call_aliases.contains(callee);
+            let qualified_callee = callee.contains("::");
+            if common_non_project_callee(callee) && !project_owned_callee && !qualified_callee {
+                continue;
+            }
             let is_reduce_like = [
                 "collect",
                 "merge",
@@ -8660,6 +8681,72 @@ fn is_ancestor(ancestor: &str, descendant: &str) -> bool {
         return !descendant.is_empty();
     }
     descendant.starts_with(&format!("{ancestor}::"))
+}
+
+fn is_root_facade_import(to_module: &str, target_module: &str) -> bool {
+    let segs: Vec<&str> = to_module.split("::").filter(|s| !s.is_empty()).collect();
+    if segs.len() < 3 || segs.first() != Some(&"crate") {
+        return false;
+    }
+    target_module == segs[1] && !target_module.contains("::")
+}
+
+fn public_api_like_module(module: &str) -> bool {
+    let last = module.rsplit("::").next().unwrap_or(module);
+    matches!(
+        last,
+        "api"
+            | "contract"
+            | "contracts"
+            | "interface"
+            | "interfaces"
+            | "model"
+            | "ports"
+            | "prelude"
+            | "protocol"
+            | "types"
+    )
+}
+
+fn common_non_project_callee(callee: &str) -> bool {
+    matches!(
+        callee,
+        "and_then"
+            | "as_ref"
+            | "as_str"
+            | "clone"
+            | "collect"
+            | "copied"
+            | "default"
+            | "entry"
+            | "Err"
+            | "expect"
+            | "extend"
+            | "filter"
+            | "filter_map"
+            | "fmt"
+            | "get"
+            | "insert"
+            | "is_empty"
+            | "iter"
+            | "len"
+            | "map"
+            | "map_err"
+            | "max"
+            | "min"
+            | "None"
+            | "Ok"
+            | "or_default"
+            | "or_else"
+            | "or_insert"
+            | "push"
+            | "Some"
+            | "to_owned"
+            | "to_string"
+            | "unwrap"
+            | "unwrap_or"
+            | "unwrap_or_default"
+    )
 }
 
 fn import_references_symbol(to_module: &str, symbol: &str) -> bool {

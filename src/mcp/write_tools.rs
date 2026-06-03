@@ -1,5 +1,7 @@
 use serde_json::{Value, json};
+use std::collections::{BTreeMap, BTreeSet};
 
+use crate::domain::analyze::{ActualScan, SemanticResolution};
 use crate::domain::model::*;
 use crate::domain::rust_facts::{RustFeatureSelection, RustScanOptions, RustScanScope};
 use crate::domain::to_snake;
@@ -10,6 +12,38 @@ use crate::store::{PersistedReasoningClaim, ReasoningFactRef, Store};
 /// Returns the list of write tools the Axon server exposes.
 pub fn list_write_tools() -> Vec<ToolDefinition> {
     rust_native_write_tools()
+}
+
+fn feature_selector_schema(description: &str) -> Value {
+    json!({
+        "oneOf": [
+            {
+                "type": "string",
+                "enum": ["default", "none", "all"],
+                "description": "Cargo feature mode."
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "mode": {
+                        "type": "string",
+                        "enum": ["default", "none", "all", "selected"]
+                    },
+                    "selected": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Feature names for mode=selected."
+                    },
+                    "no_default_features": {
+                        "type": "boolean",
+                        "description": "Disable default features when mode=selected."
+                    }
+                },
+                "required": ["mode"]
+            }
+        ],
+        "description": description,
+    })
 }
 
 fn rust_native_write_tools() -> Vec<ToolDefinition> {
@@ -54,6 +88,23 @@ fn rust_native_write_tools() -> Vec<ToolDefinition> {
                         ],
                         "description": "Cargo feature selection for semantic resolution (default: default features)."
                     }
+                },
+                "required": []
+            }),
+        },
+        ToolDefinition {
+            name: "rust_feature_diff".into(),
+            description: "Compare two Rust scan profiles with different Cargo feature selections without persisting either scan as actual state. Reports fact-set differences for source files, symbols, imports, references, calls, AST edges, and compiler-resolved calls.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "scope": {
+                        "type": "string",
+                        "enum": ["production", "test", "all"],
+                        "description": "Scan profile for test-aware semantic resolution (default: production)."
+                    },
+                    "base_features": feature_selector_schema("Baseline Cargo feature selection (default: default features)."),
+                    "compare_features": feature_selector_schema("Comparison Cargo feature selection (default: all features).")
                 },
                 "required": []
             }),
@@ -152,7 +203,11 @@ fn dispatch_write_tool(
     // Only the canonical rust-native write tools are accepted.
     if !matches!(
         name,
-        "rust_scan" | "rust_annotations" | "rust_diagnose" | "rust_constraints"
+        "rust_scan"
+            | "rust_feature_diff"
+            | "rust_annotations"
+            | "rust_diagnose"
+            | "rust_constraints"
     ) {
         return error_result(format!("Unknown write tool: {name}"));
     }
@@ -240,8 +295,78 @@ fn dispatch_write_tool(
             }
         }
 
+        "feature_diff" => {
+            use crate::domain::analyze::scan_actual_graph_with_options;
+
+            let workspace_root = std::path::Path::new(workspace_path);
+            let previous = store.load_actual(workspace_path).ok().flatten();
+            let (base_options, compare_options) = match rust_feature_diff_options_from_args(args) {
+                Ok(options) => options,
+                Err(error) => return error_result(error),
+            };
+
+            let base_scan = match scan_actual_graph_with_options(
+                workspace_root,
+                previous.as_ref(),
+                &base_options,
+            ) {
+                Ok(scan) => scan,
+                Err(error) => {
+                    return error_result(format!("Baseline feature scan failed: {error}"));
+                }
+            };
+            let compare_scan = match scan_actual_graph_with_options(
+                workspace_root,
+                previous.as_ref(),
+                &compare_options,
+            ) {
+                Ok(scan) => scan,
+                Err(error) => {
+                    return error_result(format!("Comparison feature scan failed: {error}"));
+                }
+            };
+
+            let (differences, summary) = feature_diff_summary(&base_scan, &compare_scan);
+            let mut payload = json!({
+                "status": "compared",
+                "analysis": "feature_diff",
+                "scope": base_options.scope.as_str(),
+                "base_profile": rust_scan_options_json(&base_options),
+                "compare_profile": rust_scan_options_json(&compare_options),
+                "base_counts": scan_counts_json(&base_scan),
+                "compare_counts": scan_counts_json(&compare_scan),
+                "differences": differences,
+                "summary": summary,
+                "implemented_state_saved": false,
+            });
+            crate::mcp::tools::attach_graph_confidence(&mut payload, store, workspace_path);
+            let proof = json!({
+                "rule": "feature diff compares two in-memory scan profiles without persisting either profile as actual state",
+                "derived_from": ["scan_actual_graph", "resolve_calls"],
+                "witness_count": summary["changed_relations"].as_array().map(|items| items.len()).unwrap_or(0),
+            });
+            let evidence = json!({
+                "base_profile": rust_scan_options_json(&base_options),
+                "compare_profile": rust_scan_options_json(&compare_options),
+                "base_semantic_resolution": semantic_resolution_json(&base_scan.semantic_resolution),
+                "compare_semantic_resolution": semantic_resolution_json(&compare_scan.semantic_resolution),
+            });
+            reasoning_result(
+                store,
+                workspace_path,
+                payload,
+                Some(proof),
+                Some(evidence),
+                vec![
+                    "Feature diff scans are transient and do not update the persisted actual graph, drift, or history.".into(),
+                    "Source-extracted facts are syntax-level and not Cargo cfg-pruned yet; feature-specific differences primarily appear in compiler-resolved call edges until cfg-aware slicing is modeled.".into(),
+                ],
+                json!({"source": "feature_diff", "state": "transient"}),
+            )
+        }
+
         "sync" => {
-            use crate::domain::analyze::{SemanticResolution, scan_actual_graph_with_options};
+            use crate::domain::analyze::scan_actual_graph_with_options;
 
             let workspace_root = std::path::Path::new(workspace_path);
             let previous = store.load_actual(workspace_path).ok().flatten();
@@ -789,6 +914,7 @@ fn canonical_write_tool_name(name: &str) -> &str {
     match name {
         "rust_annotations" => "define",
         "rust_scan" => "sync",
+        "rust_feature_diff" => "feature_diff",
         "rust_diagnose" => "refactor",
         "rust_constraints" => "constrain",
         other => other,
@@ -1623,40 +1749,77 @@ fn invalidate_and_refresh_policy(store: &Store, workspace_path: &str) -> Result<
 }
 
 fn rust_scan_options_from_args(args: &Value) -> Result<RustScanOptions, String> {
-    let scope = match args
+    let scope = rust_scan_scope_from_args(args)?;
+    let features = rust_feature_selection_from_value(args.get("features"))?;
+
+    Ok(RustScanOptions { scope, features })
+}
+
+fn rust_scan_scope_from_args(args: &Value) -> Result<RustScanScope, String> {
+    match args
         .get("scope")
         .and_then(Value::as_str)
         .unwrap_or("production")
     {
-        "" | "production" => RustScanScope::Production,
-        "test" => RustScanScope::Test,
-        "all" => RustScanScope::All,
+        "" | "production" => Ok(RustScanScope::Production),
+        "test" => Ok(RustScanScope::Test),
+        "all" => Ok(RustScanScope::All),
         other => {
             return Err(format!(
                 "Invalid rust_scan scope '{other}'. Expected production, test, or all."
             ));
         }
-    };
+    }
+}
 
-    let features = match args.get("features") {
-        None | Some(Value::Null) => RustFeatureSelection::Default,
-        Some(Value::String(mode)) => rust_feature_selection_from_mode(mode, None)?,
-        Some(Value::Object(_)) => {
-            let feature_args = args.get("features").expect("features exists");
+fn rust_feature_selection_from_value(
+    value: Option<&Value>,
+) -> Result<RustFeatureSelection, String> {
+    match value {
+        None | Some(Value::Null) => Ok(RustFeatureSelection::Default),
+        Some(Value::String(mode)) => rust_feature_selection_from_mode(mode, None),
+        Some(feature_args @ Value::Object(_)) => {
             let mode = feature_args
                 .get("mode")
                 .and_then(Value::as_str)
                 .unwrap_or("default");
-            rust_feature_selection_from_mode(mode, Some(feature_args))?
+            rust_feature_selection_from_mode(mode, Some(feature_args))
         }
         Some(other) => {
             return Err(format!(
                 "Invalid rust_scan features value {other}. Expected string or object."
             ));
         }
+    }
+}
+
+fn rust_feature_diff_options_from_args(
+    args: &Value,
+) -> Result<(RustScanOptions, RustScanOptions), String> {
+    let scope = rust_scan_scope_from_args(args)?;
+    let base_features = rust_feature_selection_from_value(
+        args.get("base_features")
+            .or_else(|| args.get("baseline_features"))
+            .or_else(|| args.get("from_features")),
+    )?;
+    let compare_features = match args
+        .get("compare_features")
+        .or_else(|| args.get("to_features"))
+    {
+        Some(value) => rust_feature_selection_from_value(Some(value))?,
+        None => RustFeatureSelection::All,
     };
 
-    Ok(RustScanOptions { scope, features })
+    Ok((
+        RustScanOptions {
+            scope: scope.clone(),
+            features: base_features,
+        },
+        RustScanOptions {
+            scope,
+            features: compare_features,
+        },
+    ))
 }
 
 fn rust_feature_selection_from_mode(
@@ -1704,6 +1867,204 @@ fn rust_scan_options_json(options: &RustScanOptions) -> Value {
             "no_default_features": options.features.no_default_features(),
         }
     })
+}
+
+fn scan_counts_json(scan: &ActualScan) -> Value {
+    let model = &scan.model;
+    let entity_count: usize = model
+        .bounded_contexts
+        .iter()
+        .map(|bc| bc.entities.len())
+        .sum();
+    let value_object_count: usize = model
+        .bounded_contexts
+        .iter()
+        .map(|bc| bc.value_objects.len())
+        .sum();
+    let service_count: usize = model
+        .bounded_contexts
+        .iter()
+        .map(|bc| bc.services.len())
+        .sum();
+    let repository_count: usize = model
+        .bounded_contexts
+        .iter()
+        .map(|bc| bc.repositories.len())
+        .sum();
+    let event_count: usize = model
+        .bounded_contexts
+        .iter()
+        .map(|bc| bc.events.len())
+        .sum();
+
+    json!({
+        "contexts": model.bounded_contexts.len(),
+        "entities": entity_count,
+        "value_objects": value_object_count,
+        "services": service_count,
+        "repositories": repository_count,
+        "events": event_count,
+        "source_files": model.source_files.len(),
+        "symbols": model.symbols.len(),
+        "import_edges": model.import_edges.len(),
+        "reference_edges": model.reference_edges.len(),
+        "call_edges": model.call_edges.len(),
+        "ast_edges": model.ast_edges.len(),
+        "resolved_call_edges": scan.resolved_calls.len(),
+        "semantic_resolution": semantic_resolution_json(&scan.semantic_resolution),
+    })
+}
+
+fn semantic_resolution_json(resolution: &SemanticResolution) -> Value {
+    match resolution {
+        SemanticResolution::Resolved => json!({ "status": "resolved" }),
+        SemanticResolution::Failed { error } => json!({
+            "status": "failed",
+            "error": error,
+        }),
+    }
+}
+
+fn feature_diff_summary(base: &ActualScan, compare: &ActualScan) -> (Value, Value) {
+    const LIMIT: usize = 100;
+
+    let base_sets = scan_fact_sets(base);
+    let compare_sets = scan_fact_sets(compare);
+    let mut differences = serde_json::Map::new();
+    let mut changed_relations = Vec::new();
+    let mut total_added = 0usize;
+    let mut total_removed = 0usize;
+
+    for (relation, base_set) in &base_sets {
+        let compare_set = compare_sets.get(relation).cloned().unwrap_or_default();
+        let added_count = compare_set.difference(base_set).count();
+        let removed_count = base_set.difference(&compare_set).count();
+        let added: Vec<String> = compare_set
+            .difference(base_set)
+            .take(LIMIT)
+            .cloned()
+            .collect();
+        let removed: Vec<String> = base_set
+            .difference(&compare_set)
+            .take(LIMIT)
+            .cloned()
+            .collect();
+        if added_count > 0 || removed_count > 0 {
+            changed_relations.push(relation.clone());
+        }
+        total_added += added_count;
+        total_removed += removed_count;
+        differences.insert(
+            relation.clone(),
+            json!({
+                "added_count": added_count,
+                "removed_count": removed_count,
+                "added": added,
+                "removed": removed,
+                "truncated": added_count > LIMIT || removed_count > LIMIT,
+            }),
+        );
+    }
+
+    (
+        Value::Object(differences),
+        json!({
+            "changed": total_added > 0 || total_removed > 0,
+            "total_added": total_added,
+            "total_removed": total_removed,
+            "changed_relations": changed_relations,
+        }),
+    )
+}
+
+fn scan_fact_sets(scan: &ActualScan) -> BTreeMap<String, BTreeSet<String>> {
+    let model = &scan.model;
+    BTreeMap::from([
+        (
+            "source_file".into(),
+            model
+                .source_files
+                .iter()
+                .map(|file| format!("{}|{}|{}", file.path, file.context, file.language))
+                .collect(),
+        ),
+        (
+            "symbol".into(),
+            model
+                .symbols
+                .iter()
+                .map(|symbol| {
+                    format!(
+                        "{}|{}|{}|{}|{}",
+                        symbol.name,
+                        symbol.kind,
+                        symbol.context,
+                        symbol.file_path,
+                        symbol.visibility
+                    )
+                })
+                .collect(),
+        ),
+        (
+            "import_edge".into(),
+            model
+                .import_edges
+                .iter()
+                .map(|edge| format!("{}->{}|{}", edge.from_file, edge.to_module, edge.context))
+                .collect(),
+        ),
+        (
+            "reference_edge".into(),
+            model
+                .reference_edges
+                .iter()
+                .map(|edge| {
+                    format!(
+                        "{}->{}|{}|{}|{}",
+                        edge.from_file, edge.to_path, edge.reference_kind, edge.line, edge.context
+                    )
+                })
+                .collect(),
+        ),
+        (
+            "calls_symbol".into(),
+            model
+                .call_edges
+                .iter()
+                .map(|edge| {
+                    format!(
+                        "{}->{}|{}|{}|{}",
+                        edge.caller, edge.callee, edge.file_path, edge.line, edge.context
+                    )
+                })
+                .collect(),
+        ),
+        (
+            "ast_edge".into(),
+            model
+                .ast_edges
+                .iter()
+                .map(|edge| {
+                    format!(
+                        "{}->{}|{}|{}|{}",
+                        edge.from_node, edge.to_node, edge.edge_type, edge.file_path, edge.line
+                    )
+                })
+                .collect(),
+        ),
+        (
+            "resolved_call".into(),
+            scan.resolved_calls
+                .iter()
+                .map(|edge| {
+                    format!(
+                        "{}->{}|{}|{}",
+                        edge.caller, edge.callee, edge.callee_file, edge.callee_line
+                    )
+                })
+                .collect(),
+        ),
+    ])
 }
 
 fn eager_refresh_dependencies(
@@ -2318,9 +2679,10 @@ mod tests {
     #[test]
     fn test_list_write_tools_count() {
         let tools = list_write_tools();
-        assert_eq!(tools.len(), 4);
+        assert_eq!(tools.len(), 5);
         let names: Vec<_> = tools.iter().map(|tool| tool.name.as_str()).collect();
         assert!(names.contains(&"rust_scan"));
+        assert!(names.contains(&"rust_feature_diff"));
         assert!(names.contains(&"rust_annotations"));
         assert!(names.contains(&"rust_diagnose"));
         assert!(names.contains(&"rust_constraints"));
@@ -2337,6 +2699,26 @@ mod tests {
         assert!(
             rust_scan.input_schema["properties"]
                 .get("features")
+                .is_some()
+        );
+
+        let feature_diff = tools
+            .iter()
+            .find(|tool| tool.name == "rust_feature_diff")
+            .expect("rust_feature_diff tool definition");
+        assert!(
+            feature_diff.input_schema["properties"]
+                .get("scope")
+                .is_some()
+        );
+        assert!(
+            feature_diff.input_schema["properties"]
+                .get("base_features")
+                .is_some()
+        );
+        assert!(
+            feature_diff.input_schema["properties"]
+                .get("compare_features")
                 .is_some()
         );
     }
@@ -2361,6 +2743,40 @@ mod tests {
             json!(["sqlite", "fixtures"])
         );
         assert_eq!(profile["features"]["no_default_features"], true);
+    }
+
+    #[test]
+    fn rust_feature_diff_options_default_to_default_vs_all_features() {
+        let (base, compare) = rust_feature_diff_options_from_args(&json!({
+            "scope": "test"
+        }))
+        .unwrap();
+
+        assert_eq!(base.scope.as_str(), "test");
+        assert_eq!(base.features.mode(), "default");
+        assert_eq!(compare.scope.as_str(), "test");
+        assert_eq!(compare.features.mode(), "all");
+    }
+
+    #[test]
+    fn rust_feature_diff_options_parse_selected_profiles() {
+        let (base, compare) = rust_feature_diff_options_from_args(&json!({
+            "base_features": "none",
+            "compare_features": {
+                "mode": "selected",
+                "selected": ["sqlite"],
+                "no_default_features": true
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(base.features.mode(), "none");
+        assert_eq!(compare.features.mode(), "selected");
+        assert_eq!(
+            compare.features.selected_features(),
+            &["sqlite".to_string()]
+        );
+        assert!(compare.features.no_default_features());
     }
 
     #[test]

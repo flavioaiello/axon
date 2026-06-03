@@ -658,6 +658,21 @@ fn optimization_recommendations_surface_shape_candidates() {
             to_module: "crate::domain::rust_syn::RustSynScanner".into(),
             context: "server".into(),
         },
+        ImportEdge {
+            from_file: "src/mcp/tools.rs".into(),
+            to_module: "crate::store::Store".into(),
+            context: "mcp".into(),
+        },
+        ImportEdge {
+            from_file: "src/mcp/resources.rs".into(),
+            to_module: "crate::store::Store".into(),
+            context: "mcp".into(),
+        },
+        ImportEdge {
+            from_file: "src/server/web.rs".into(),
+            to_module: "crate::store::Store".into(),
+            context: "server".into(),
+        },
     ];
     model.call_edges = vec![
         CallEdge {
@@ -686,6 +701,34 @@ fn optimization_recommendations_surface_shape_candidates() {
             callee: "save_state".into(),
             file_path: "src/server/web.rs".into(),
             line: 13,
+            context: "server".into(),
+        },
+        CallEdge {
+            caller: "Tools::render".into(),
+            callee: "collect".into(),
+            file_path: "src/mcp/tools.rs".into(),
+            line: 14,
+            context: "mcp".into(),
+        },
+        CallEdge {
+            caller: "Resources::list".into(),
+            callee: "collect".into(),
+            file_path: "src/mcp/resources.rs".into(),
+            line: 15,
+            context: "mcp".into(),
+        },
+        CallEdge {
+            caller: "WriteTools::schema".into(),
+            callee: "collect".into(),
+            file_path: "src/mcp/write_tools.rs".into(),
+            line: 16,
+            context: "mcp".into(),
+        },
+        CallEdge {
+            caller: "Web::nodes".into(),
+            callee: "collect".into(),
+            file_path: "src/server/web.rs".into(),
+            line: 17,
             context: "server".into(),
         },
         CallEdge {
@@ -763,6 +806,18 @@ fn optimization_recommendations_surface_shape_candidates() {
             .iter()
             .any(|recommendation| recommendation["target"] == "save_desired"),
         "all-scope recommendations should include test-only fan-in: {result}"
+    );
+    assert!(
+        recommendations
+            .iter()
+            .all(|recommendation| recommendation["target"] != "collect"),
+        "bare std collection calls should not become map/reduce recommendations: {result}"
+    );
+    assert!(
+        recommendations.iter().all(|recommendation| {
+            recommendation["kind"] != "facade" || recommendation["target"] != "store"
+        }),
+        "root facade imports through crate::store should not be flagged as leaks: {result}"
     );
 
     let production_result = store
