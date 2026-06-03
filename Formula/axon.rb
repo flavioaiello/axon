@@ -1,7 +1,7 @@
 class Axon < Formula
   desc "Domain Model Context Protocol server for Rust architecture reasoning"
   homepage "https://github.com/flavioaiello/axon"
-  url "https://github.com/flavioaiello/axon/archive/refs/heads/main.tar.gz"
+  url "https://github.com/flavioaiello/axon.git", branch: "main"
   version "main"
   license "MIT"
 

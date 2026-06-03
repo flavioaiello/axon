@@ -742,7 +742,7 @@ fn build_readiness_report(store: &Store, workspace_path: &str) -> Value {
         "status": status,
         "workspace": workspace_path,
         "runtime": {
-            "axon_version": env!("CARGO_PKG_VERSION"),
+            "axon_version": crate::VERSION,
             "process_binary": std::env::current_exe()
                 .ok()
                 .map(|path| path.to_string_lossy().to_string()),
@@ -1744,7 +1744,7 @@ mod tests {
         let ContentBlock::Text { text } = &result.content[0];
         let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
         assert_eq!(parsed["status"], "not_scanned");
-        assert_eq!(parsed["runtime"]["axon_version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(parsed["runtime"]["axon_version"], crate::VERSION);
         assert!(parsed["environment"]["rust_analyzer"].is_object());
         assert!(parsed["environment"]["cargo_metadata"].is_object());
         assert_eq!(parsed["graph_confidence"]["status"], "not_scanned");

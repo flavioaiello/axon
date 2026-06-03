@@ -151,7 +151,7 @@ fn handle_request(workspace_path: &str, store: &Store, req: &JsonRpcRequest) -> 
                 },
                 server_info: ServerInfo {
                     name: format!("axon ({})", load_actual_model(store, workspace_path).name),
-                    version: env!("CARGO_PKG_VERSION").into(),
+                    version: crate::VERSION.into(),
                 },
             };
             success_response(req, result)

@@ -6,8 +6,14 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
+const AXON_VERSION: &str = axon::VERSION;
+
 #[derive(Parser)]
-#[command(name = "axon", version, about = "Domain Model Context Protocol Server")]
+#[command(
+    name = "axon",
+    version = AXON_VERSION,
+    about = "Domain Model Context Protocol Server"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
