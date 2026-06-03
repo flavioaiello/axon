@@ -7242,10 +7242,30 @@ impl Store {
         });
         findings.truncate(50);
 
+        let actionable_count = findings
+            .iter()
+            .filter(|finding| finding["scope"].as_str() != Some("test"))
+            .count();
+        let test_count = findings
+            .iter()
+            .filter(|finding| finding["scope"].as_str() == Some("test"))
+            .count();
+        let production_count = findings
+            .iter()
+            .filter(|finding| finding["scope"].as_str() == Some("production"))
+            .count();
+
         Ok(json!({
             "analysis": "practice_findings",
             "findings": findings,
             "count": findings.len(),
+            "summary": {
+                "returned_count": findings.len(),
+                "actionable_count": actionable_count,
+                "informational_count": findings.len().saturating_sub(actionable_count),
+                "production_count": production_count,
+                "test_count": test_count,
+            },
             "fact_counts": {
                 "symbols": symbols.rows.len(),
                 "call_edges": calls.rows.len(),

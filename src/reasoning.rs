@@ -2133,10 +2133,24 @@ impl<'a> ReasoningKernel<'a> {
             .store
             .practice_findings(workspace_path)
             .unwrap_or_else(|_| json!({ "findings": [], "count": 0 }));
-        let top_practice_findings = practice_findings["findings"]
+        let practice_findings_vec = practice_findings["findings"]
             .as_array()
-            .map(|findings| findings.iter().take(3).cloned().collect::<Vec<_>>())
+            .cloned()
             .unwrap_or_default();
+        let top_practice_findings = practice_findings_vec
+            .iter()
+            .take(3)
+            .cloned()
+            .collect::<Vec<_>>();
+        let top_actionable_practice_findings = practice_findings_vec
+            .iter()
+            .filter(|finding| finding["scope"].as_str() != Some("test"))
+            .take(3)
+            .cloned()
+            .collect::<Vec<_>>();
+        let actionable_practice_count = practice_findings["summary"]["actionable_count"]
+            .as_u64()
+            .unwrap_or(top_actionable_practice_findings.len() as u64);
         let invariants = json!({
             "circular_deps": {
                 "status": if data.circular_deps.is_empty() { "pass" } else { "fail" },
@@ -2287,16 +2301,16 @@ impl<'a> ReasoningKernel<'a> {
                 ),
             }));
         }
-        if !top_practice_findings.is_empty() {
+        if actionable_practice_count > 0 && !top_actionable_practice_findings.is_empty() {
             next_actions.push(json!({
                 "priority": priority,
                 "tool": "rust_impact",
                 "action": "practice_findings",
                 "reason": format!(
-                    "{} Rust practice finding(s) ranked by graph evidence. Inspect top findings before broad refactors.",
-                    practice_findings["count"].as_u64().unwrap_or(top_practice_findings.len() as u64)
+                    "{} actionable Rust practice finding(s) ranked by graph evidence. Inspect top findings before broad refactors.",
+                    actionable_practice_count
                 ),
-                "evidence": top_practice_findings.clone(),
+                "evidence": top_actionable_practice_findings.clone(),
             }));
         }
         if next_actions.is_empty() && data.has_actual {
@@ -2346,7 +2360,9 @@ impl<'a> ReasoningKernel<'a> {
                 "ast_edges": data.ast_stats,
                 "practice_findings": {
                     "count": practice_findings["count"],
+                    "summary": practice_findings["summary"],
                     "top": top_practice_findings,
+                    "top_actionable": top_actionable_practice_findings,
                 },
                 "has_implemented_model": data.has_actual,
                 "next_actions": next_actions,

@@ -842,6 +842,9 @@ fn practice_findings_rank_rust_best_practice_signals() {
     assert_eq!(production_unwrap["scope"], "production");
     assert_eq!(test_unwrap["scope"], "test");
     assert_eq!(test_unwrap["severity"], "info");
+    assert_eq!(result["summary"]["actionable_count"], 4);
+    assert_eq!(result["summary"]["test_count"], 1);
+    assert_eq!(result["summary"]["production_count"], 4);
     assert!(
         production_unwrap["priority_score"].as_i64().unwrap()
             > test_unwrap["priority_score"].as_i64().unwrap(),

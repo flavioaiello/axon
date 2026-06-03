@@ -63,7 +63,8 @@
     }
 
     .topbar > .brand { flex: 0 1 auto; }
-    .topbar > #workspace-field { flex: 0 0 auto; }
+    .topbar > #workspace-field,
+    .topbar > #layout-field { flex: 0 0 auto; }
     .topbar > label.search:not(#workspace-field) { flex: 1 1 240px; }
     .topbar > .toolbar { flex: 0 0 auto; margin-left: auto; }
 
@@ -183,6 +184,11 @@
     button:hover,
     .toggle:hover,
     .search:focus-within { border-color: rgba(240, 195, 90, 0.7); }
+
+    button:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+    }
 
     .workspace {
       min-height: 0;
@@ -428,10 +434,22 @@
       <span>Search</span>
       <input id="search" type="search" autocomplete="off" placeholder="crate, module, struct, path" />
     </label>
+    <label class="search" id="layout-field">
+      <span>Layout</span>
+      <select id="layout-mode" aria-label="Graph layout">
+        <option value="auto">Auto</option>
+        <option value="force">Force</option>
+        <option value="breadthfirst">Hierarchy</option>
+        <option value="concentric">Rings</option>
+        <option value="grid">Grid</option>
+      </select>
+    </label>
     <div class="toolbar" aria-label="Graph filters">
       <label class="toggle"><input id="toggle-structs" type="checkbox" /> Show structs</label>
       <label class="toggle"><input id="toggle-imports" type="checkbox" checked /> Imports</label>
       <label class="toggle"><input id="toggle-calls" type="checkbox" checked /> Calls</label>
+      <button id="focus-selection" type="button" disabled>Focus</button>
+      <button id="show-all" type="button" disabled>All</button>
       <button id="fit" type="button">Fit</button>
     </div>
   </header>
@@ -481,9 +499,12 @@
     const statsEl = document.getElementById('stats');
     const cratesEl = document.getElementById('crates');
     const search = document.getElementById('search');
+    const layoutMode = document.getElementById('layout-mode');
     const visibleCount = document.getElementById('visible-count');
     const hoverReadout = document.getElementById('hover-readout');
     const fitButton = document.getElementById('fit');
+    const focusButton = document.getElementById('focus-selection');
+    const showAllButton = document.getElementById('show-all');
     const subtitle = document.getElementById('subtitle');
     const toggles = {
       structs: document.getElementById('toggle-structs'),
@@ -501,9 +522,12 @@
 
     if (window.cytoscapeFcose) cytoscape.use(window.cytoscapeFcose);
 
-    const state = { data: null, cy: null, selectedId: null };
+    const state = { data: null, cy: null, selectedId: null, focusId: null };
 
     function loadGraph(workspace) {
+      state.selectedId = null;
+      state.focusId = null;
+      updateFocusControls();
       const url = workspace ? '/api/graph?workspace=' + encodeURIComponent(workspace) : '/api/graph';
       fetch(url).then(r => r.json()).then(render).catch(err => {
         details.textContent = String(err);
@@ -582,6 +606,8 @@
         showStructs: toggles.structs.checked,
         showImports: toggles.imports.checked,
         showCalls: toggles.calls.checked,
+        layoutMode: layoutMode.value,
+        focusId: state.focusId,
       };
     }
 
@@ -591,7 +617,7 @@
     function buildElements(data, options) {
       const parentOf = new Map();
       for (const e of data.edges) {
-        if (e.label === 'contains' || e.label === 'declares') parentOf.set(e.to, e.from);
+        if (isContainmentEdge(e)) parentOf.set(e.to, e.from);
       }
       const visible = new Set();
       for (const n of data.nodes) {
@@ -599,14 +625,17 @@
         if (n.kind === 'struct' && !options.showStructs) continue;
         visible.add(n.id);
       }
+      const scopedVisible = options.focusId && visible.has(options.focusId)
+        ? focusVisibleSet(data, visible, parentOf, options)
+        : visible;
       function resolveParent(id) {
         let p = parentOf.get(id);
-        while (p && !visible.has(p)) p = parentOf.get(p);
-        return p && visible.has(p) ? p : undefined;
+        while (p && !scopedVisible.has(p)) p = parentOf.get(p);
+        return p && scopedVisible.has(p) ? p : undefined;
       }
       const els = [];
       for (const n of data.nodes) {
-        if (!visible.has(n.id)) continue;
+        if (!scopedVisible.has(n.id)) continue;
         els.push({ data: {
           id: n.id, label: n.label, kind: n.kind, parent: resolveParent(n.id),
           method_count: n.method_count, visibility: n.visibility,
@@ -616,10 +645,9 @@
         }});
       }
       for (const e of data.edges) {
-        if (e.label === 'contains' || e.label === 'declares') continue;
-        if (e.label === 'imports' && !options.showImports) continue;
-        if (e.label === 'calls' && !options.showCalls) continue;
-        if (!visible.has(e.from) || !visible.has(e.to)) continue;
+        if (isContainmentEdge(e)) continue;
+        if (!edgeVisible(e, options)) continue;
+        if (!scopedVisible.has(e.from) || !scopedVisible.has(e.to)) continue;
         els.push({ data: {
           id: 'e:' + e.from + '|' + e.to + '|' + e.label,
           source: e.from, target: e.to, kind: e.label,
@@ -627,6 +655,43 @@
         }});
       }
       return els;
+    }
+
+    function isContainmentEdge(edge) {
+      return edge.label === 'contains' || edge.label === 'declares';
+    }
+
+    function edgeVisible(edge, options) {
+      if (edge.label === 'imports') return options.showImports;
+      if (edge.label === 'calls') return options.showCalls;
+      return true;
+    }
+
+    function focusVisibleSet(data, baseVisible, parentOf, options) {
+      const keep = new Set([options.focusId]);
+      for (const e of data.edges) {
+        if (isContainmentEdge(e) || !edgeVisible(e, options)) continue;
+        if (!baseVisible.has(e.from) || !baseVisible.has(e.to)) continue;
+        if (e.from === options.focusId || e.to === options.focusId) {
+          keep.add(e.from);
+          keep.add(e.to);
+        }
+      }
+      for (const [child, parent] of parentOf) {
+        if (parent === options.focusId && baseVisible.has(child)) keep.add(child);
+      }
+      Array.from(keep).forEach(id => addVisibleAncestors(id, parentOf, baseVisible, keep));
+      return keep;
+    }
+
+    function addVisibleAncestors(id, parentOf, baseVisible, keep) {
+      let parent = parentOf.get(id);
+      let guard = 0;
+      while (parent && guard < 64) {
+        if (baseVisible.has(parent)) keep.add(parent);
+        parent = parentOf.get(parent);
+        guard += 1;
+      }
     }
 
     function cyStyle() {
@@ -671,7 +736,19 @@
       ];
     }
 
-    function layoutOptions() {
+    function layoutOptions(mode) {
+      if (mode === 'breadthfirst') {
+        return { name: 'breadthfirst', directed: true, animate: false, padding: 32,
+          spacingFactor: 1.35, avoidOverlap: true };
+      }
+      if (mode === 'concentric') {
+        return { name: 'concentric', animate: false, padding: 34, minNodeSpacing: 48,
+          concentric: node => ({ crate: 4, module: 3, struct: 1 }[node.data('kind')] || 2),
+          levelWidth: () => 1 };
+      }
+      if (mode === 'grid') {
+        return { name: 'grid', animate: false, padding: 34, avoidOverlap: true };
+      }
       if (window.cytoscapeFcose) {
         return { name: 'fcose', quality: 'default', animate: false, randomize: true,
           packComponents: true, nodeSeparation: 80, idealEdgeLength: 80,
@@ -683,20 +760,22 @@
 
     function draw() {
       if (!state.data) return;
-      const els = buildElements(state.data, currentOptions());
+      const options = currentOptions();
+      const els = buildElements(state.data, options);
       const edgeCount = els.filter(e => e.data.source).length;
       const nodeCount = els.length - edgeCount;
-      visibleCount.textContent = nodeCount + ' nodes / ' + edgeCount + ' edges';
+      visibleCount.textContent = (state.focusId ? 'Focused: ' : '') + nodeCount + ' nodes / ' + edgeCount + ' edges';
 
       if (state.cy) { state.cy.destroy(); state.cy = null; }
       const cy = cytoscape({
         container: document.getElementById('cy'),
         elements: els,
         style: cyStyle(),
-        layout: layoutOptions(),
+        layout: layoutOptions(options.layoutMode),
         wheelSensitivity: 0.2, minZoom: 0.08, maxZoom: 3,
       });
       state.cy = cy;
+      if (state.focusId && cy.getElementById(state.focusId).empty()) state.focusId = null;
 
       cy.on('tap', 'node', evt => selectNode(evt.target));
       cy.on('tap', evt => { if (evt.target === cy) clearSelection(); });
@@ -709,6 +788,7 @@
         showEmptyDetails();
       }
       applySearch();
+      updateFocusControls();
     }
 
     function selectNode(node) {
@@ -718,12 +798,31 @@
       node.select();
       node.closedNeighborhood().addClass('hl');
       showDetails(node);
+      updateFocusControls();
     }
 
     function clearSelection() {
       state.selectedId = null;
       if (state.cy) state.cy.elements().removeClass('hl').unselect();
       showEmptyDetails();
+      updateFocusControls();
+    }
+
+    function focusSelection() {
+      if (!state.selectedId) return;
+      state.focusId = state.selectedId;
+      draw();
+    }
+
+    function clearFocus() {
+      state.focusId = null;
+      draw();
+    }
+
+    function updateFocusControls() {
+      const hasSelectedNode = !!(state.cy && state.selectedId && state.cy.getElementById(state.selectedId).nonempty());
+      focusButton.disabled = !hasSelectedNode;
+      showAllButton.disabled = !state.focusId;
     }
 
     function applySearch() {
@@ -821,6 +920,9 @@
 
     search.addEventListener('input', debounce(applySearch, 120));
     Object.values(toggles).forEach(t => t.addEventListener('change', draw));
+    layoutMode.addEventListener('change', draw);
+    focusButton.addEventListener('click', focusSelection);
+    showAllButton.addEventListener('click', clearFocus);
     fitButton.addEventListener('click', () => { if (state.cy) state.cy.fit(undefined, 30); });
     window.addEventListener('resize', debounce(() => { if (state.cy) state.cy.resize(); }, 150));
 

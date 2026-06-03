@@ -2253,6 +2253,44 @@ mod tests {
     }
 
     #[test]
+    fn test_diagnose_does_not_promote_test_only_practice_findings() {
+        let ws = "/tmp/test-diagnose-test-only-practice";
+        let store = setup(ws);
+        let mut model = store.load_actual(ws).unwrap().unwrap();
+        model.call_edges = vec![CallEdge {
+            caller: "test_load_fixture".into(),
+            callee: "unwrap".into(),
+            file_path: "src/store/cozo_tests.rs".into(),
+            line: 31,
+            context: "store".into(),
+        }];
+        store.save_actual(ws, &model).unwrap();
+
+        let result = call_write_tool(ws, &store, "rust_diagnose", &json!({"action": "diagnose"}));
+        assert!(result.is_error.is_none() || result.is_error == Some(false));
+
+        let text = match &result.content[0] {
+            ContentBlock::Text { text } => text,
+        };
+        let report: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(
+            report["practice_findings"]["summary"]["actionable_count"],
+            0
+        );
+        assert_eq!(report["practice_findings"]["summary"]["test_count"], 1);
+        assert!(
+            report["practice_findings"]["top_actionable"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let actions = report["next_actions"].as_array().unwrap();
+        assert!(actions.iter().all(|action| {
+            action["tool"] != "rust_impact" || action["action"] != "practice_findings"
+        }));
+    }
+
+    #[test]
     fn test_diagnose_readiness_degrades_healthy_payload() {
         let store = test_store();
         let ws = format!("/tmp/test-diagnose-readiness-{}", std::process::id());
