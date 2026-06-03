@@ -53,7 +53,7 @@
       position: relative;
       z-index: 3;
       display: flex;
-      flex-wrap: wrap;
+      flex-wrap: nowrap;
       align-items: center;
       gap: 12px 16px;
       padding: 14px 18px;
@@ -408,7 +408,7 @@
       #subtitle { display: none; }
       .search { padding: 7px 10px; }
       .toolbar { gap: 6px; justify-content: flex-start; overflow-x: auto; padding-bottom: 2px; }
-      .topbar > .toolbar { flex: 1 0 100%; margin-left: 0; }
+      .topbar > .toolbar { flex: 0 0 auto; margin-left: auto; }
       .toggle,
       button { flex: 0 0 auto; min-height: 31px; padding: 5px 8px; }
       .workspace { grid-template-columns: 1fr; grid-template-rows: minmax(320px, calc(100vh - 112px)) auto auto; }
@@ -448,8 +448,6 @@
       <label class="toggle"><input id="toggle-structs" type="checkbox" /> Show structs</label>
       <label class="toggle"><input id="toggle-imports" type="checkbox" checked /> Imports</label>
       <label class="toggle"><input id="toggle-calls" type="checkbox" checked /> Calls</label>
-      <button id="focus-selection" type="button" disabled>Focus</button>
-      <button id="show-all" type="button" disabled>All</button>
       <button id="fit" type="button">Fit</button>
     </div>
   </header>
@@ -503,8 +501,6 @@
     const visibleCount = document.getElementById('visible-count');
     const hoverReadout = document.getElementById('hover-readout');
     const fitButton = document.getElementById('fit');
-    const focusButton = document.getElementById('focus-selection');
-    const showAllButton = document.getElementById('show-all');
     const subtitle = document.getElementById('subtitle');
     const toggles = {
       structs: document.getElementById('toggle-structs'),
@@ -522,12 +518,10 @@
 
     if (window.cytoscapeFcose) cytoscape.use(window.cytoscapeFcose);
 
-    const state = { data: null, cy: null, selectedId: null, focusId: null };
+    const state = { data: null, cy: null, selectedId: null };
 
     function loadGraph(workspace) {
       state.selectedId = null;
-      state.focusId = null;
-      updateFocusControls();
       const url = workspace ? '/api/graph?workspace=' + encodeURIComponent(workspace) : '/api/graph';
       fetch(url).then(r => r.json()).then(render).catch(err => {
         details.textContent = String(err);
@@ -607,7 +601,6 @@
         showImports: toggles.imports.checked,
         showCalls: toggles.calls.checked,
         layoutMode: layoutMode.value,
-        focusId: state.focusId,
       };
     }
 
@@ -625,17 +618,14 @@
         if (n.kind === 'struct' && !options.showStructs) continue;
         visible.add(n.id);
       }
-      const scopedVisible = options.focusId && visible.has(options.focusId)
-        ? focusVisibleSet(data, visible, parentOf, options)
-        : visible;
       function resolveParent(id) {
         let p = parentOf.get(id);
-        while (p && !scopedVisible.has(p)) p = parentOf.get(p);
-        return p && scopedVisible.has(p) ? p : undefined;
+        while (p && !visible.has(p)) p = parentOf.get(p);
+        return p && visible.has(p) ? p : undefined;
       }
       const els = [];
       for (const n of data.nodes) {
-        if (!scopedVisible.has(n.id)) continue;
+        if (!visible.has(n.id)) continue;
         els.push({ data: {
           id: n.id, label: n.label, kind: n.kind, parent: resolveParent(n.id),
           method_count: n.method_count, visibility: n.visibility,
@@ -647,7 +637,7 @@
       for (const e of data.edges) {
         if (isContainmentEdge(e)) continue;
         if (!edgeVisible(e, options)) continue;
-        if (!scopedVisible.has(e.from) || !scopedVisible.has(e.to)) continue;
+        if (!visible.has(e.from) || !visible.has(e.to)) continue;
         els.push({ data: {
           id: 'e:' + e.from + '|' + e.to + '|' + e.label,
           source: e.from, target: e.to, kind: e.label,
@@ -665,33 +655,6 @@
       if (edge.label === 'imports') return options.showImports;
       if (edge.label === 'calls') return options.showCalls;
       return true;
-    }
-
-    function focusVisibleSet(data, baseVisible, parentOf, options) {
-      const keep = new Set([options.focusId]);
-      for (const e of data.edges) {
-        if (isContainmentEdge(e) || !edgeVisible(e, options)) continue;
-        if (!baseVisible.has(e.from) || !baseVisible.has(e.to)) continue;
-        if (e.from === options.focusId || e.to === options.focusId) {
-          keep.add(e.from);
-          keep.add(e.to);
-        }
-      }
-      for (const [child, parent] of parentOf) {
-        if (parent === options.focusId && baseVisible.has(child)) keep.add(child);
-      }
-      Array.from(keep).forEach(id => addVisibleAncestors(id, parentOf, baseVisible, keep));
-      return keep;
-    }
-
-    function addVisibleAncestors(id, parentOf, baseVisible, keep) {
-      let parent = parentOf.get(id);
-      let guard = 0;
-      while (parent && guard < 64) {
-        if (baseVisible.has(parent)) keep.add(parent);
-        parent = parentOf.get(parent);
-        guard += 1;
-      }
     }
 
     function cyStyle() {
@@ -764,7 +727,7 @@
       const els = buildElements(state.data, options);
       const edgeCount = els.filter(e => e.data.source).length;
       const nodeCount = els.length - edgeCount;
-      visibleCount.textContent = (state.focusId ? 'Focused: ' : '') + nodeCount + ' nodes / ' + edgeCount + ' edges';
+      visibleCount.textContent = nodeCount + ' nodes / ' + edgeCount + ' edges';
 
       if (state.cy) { state.cy.destroy(); state.cy = null; }
       const cy = cytoscape({
@@ -775,7 +738,6 @@
         wheelSensitivity: 0.2, minZoom: 0.08, maxZoom: 3,
       });
       state.cy = cy;
-      if (state.focusId && cy.getElementById(state.focusId).empty()) state.focusId = null;
 
       cy.on('tap', 'node', evt => selectNode(evt.target));
       cy.on('tap', evt => { if (evt.target === cy) clearSelection(); });
@@ -788,7 +750,6 @@
         showEmptyDetails();
       }
       applySearch();
-      updateFocusControls();
     }
 
     function selectNode(node) {
@@ -798,31 +759,12 @@
       node.select();
       node.closedNeighborhood().addClass('hl');
       showDetails(node);
-      updateFocusControls();
     }
 
     function clearSelection() {
       state.selectedId = null;
       if (state.cy) state.cy.elements().removeClass('hl').unselect();
       showEmptyDetails();
-      updateFocusControls();
-    }
-
-    function focusSelection() {
-      if (!state.selectedId) return;
-      state.focusId = state.selectedId;
-      draw();
-    }
-
-    function clearFocus() {
-      state.focusId = null;
-      draw();
-    }
-
-    function updateFocusControls() {
-      const hasSelectedNode = !!(state.cy && state.selectedId && state.cy.getElementById(state.selectedId).nonempty());
-      focusButton.disabled = !hasSelectedNode;
-      showAllButton.disabled = !state.focusId;
     }
 
     function applySearch() {
@@ -921,8 +863,6 @@
     search.addEventListener('input', debounce(applySearch, 120));
     Object.values(toggles).forEach(t => t.addEventListener('change', draw));
     layoutMode.addEventListener('change', draw);
-    focusButton.addEventListener('click', focusSelection);
-    showAllButton.addEventListener('click', clearFocus);
     fitButton.addEventListener('click', () => { if (state.cy) state.cy.fit(undefined, 30); });
     window.addEventListener('resize', debounce(() => { if (state.cy) state.cy.resize(); }, 150));
 
