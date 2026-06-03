@@ -1057,9 +1057,9 @@ mod tests {
         assert!(WEB_HTML.contains("cytoscape"));
         assert!(WEB_HTML.contains("/cytoscape.bundle.js"));
         assert!(WEB_HTML.contains("id=\"layout-mode\""));
-        assert!(WEB_HTML.contains("id=\"focus-selection\""));
-        assert!(WEB_HTML.contains("focusVisibleSet"));
-        assert!(WEB_HTML.contains("Module / submodule"));
+        assert!(WEB_HTML.contains("grid-template-columns: 1fr;"));
+        assert!(!WEB_HTML.contains("<h2>Legend</h2>"));
+        assert!(!WEB_HTML.contains("class=\"legend\""));
         assert!(!WEB_HTML.contains("Source file"));
         assert!(WEB_CYTOSCAPE.contains("cytoscape"));
     }
