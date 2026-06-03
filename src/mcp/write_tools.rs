@@ -1,6 +1,7 @@
 use serde_json::{Value, json};
 
 use crate::domain::model::*;
+use crate::domain::rust_facts::{RustFeatureSelection, RustScanOptions, RustScanScope};
 use crate::domain::to_snake;
 use crate::mcp::protocol::*;
 use crate::reasoning::ReasoningKernel;
@@ -16,10 +17,45 @@ fn rust_native_write_tools() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: "rust_scan".into(),
-            description: "Scan the workspace source code through the unified Rust fact pipeline and refresh the actual graph from implementation ground truth. Extracts modules, structs, functions, methods, imports, code references, syntactic calls, and compiler-resolved calls when rust-analyzer can resolve the workspace.".into(),
+            description: "Scan the workspace source code through the unified Rust fact pipeline and refresh the actual graph from implementation ground truth. Extracts modules, structs, functions, methods, imports, code references, syntactic calls, and compiler-resolved calls when rust-analyzer can resolve the workspace. Optional scope and feature arguments select the Cargo/rust-analyzer scan profile.".into(),
             input_schema: json!({
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    "scope": {
+                        "type": "string",
+                        "enum": ["production", "test", "all"],
+                        "description": "Scan profile for test-aware semantic resolution (default: production)."
+                    },
+                    "features": {
+                        "oneOf": [
+                            {
+                                "type": "string",
+                                "enum": ["default", "none", "all"],
+                                "description": "Cargo feature mode."
+                            },
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "mode": {
+                                        "type": "string",
+                                        "enum": ["default", "none", "all", "selected"]
+                                    },
+                                    "selected": {
+                                        "type": "array",
+                                        "items": { "type": "string" },
+                                        "description": "Feature names for mode=selected."
+                                    },
+                                    "no_default_features": {
+                                        "type": "boolean",
+                                        "description": "Disable default features when mode=selected."
+                                    }
+                                },
+                                "required": ["mode"]
+                            }
+                        ],
+                        "description": "Cargo feature selection for semantic resolution (default: default features)."
+                    }
+                },
                 "required": []
             }),
         },
@@ -206,12 +242,16 @@ fn dispatch_write_tool(
         }
 
         "sync" => {
-            use crate::domain::analyze::{SemanticResolution, scan_actual_graph};
+            use crate::domain::analyze::{SemanticResolution, scan_actual_graph_with_options};
 
             let workspace_root = std::path::Path::new(workspace_path);
             let previous = store.load_actual(workspace_path).ok().flatten();
+            let scan_options = match rust_scan_options_from_args(args) {
+                Ok(options) => options,
+                Err(error) => return error_result(error),
+            };
 
-            match scan_actual_graph(workspace_root, previous.as_ref()) {
+            match scan_actual_graph_with_options(workspace_root, previous.as_ref(), &scan_options) {
                 Ok(scan) => {
                     let actual = &scan.model;
                     let entity_count: usize = actual
@@ -309,6 +349,7 @@ fn dispatch_write_tool(
                                 drift_entry_count,
                                 &follow_on_failures,
                             );
+                            payload["scan_profile"] = rust_scan_options_json(&scan_options);
                             if let Some(error) = &semantic_resolution_error {
                                 payload["semantic_resolution_error"] = json!(error);
                             }
@@ -348,6 +389,7 @@ fn dispatch_write_tool(
                                 },
                                 "follow_on_failures": follow_on_failures,
                                 "semantic_resolution_error": semantic_resolution_error,
+                                "scan_profile": rust_scan_options_json(&scan_options),
                             });
                             let limitations = sync_limitations(
                                 drift_entry_count.is_none(),
@@ -1579,6 +1621,86 @@ fn invalidate_and_refresh_policy(store: &Store, workspace_path: &str) -> Result<
         .eager_refresh_stale_claims(workspace_path)
         .map_err(|e| format!("reasoning eager refresh failed after policy invalidation: {e}"))?;
     Ok(())
+}
+
+fn rust_scan_options_from_args(args: &Value) -> Result<RustScanOptions, String> {
+    let scope = match args.get("scope").and_then(Value::as_str).unwrap_or("production") {
+        "" | "production" => RustScanScope::Production,
+        "test" => RustScanScope::Test,
+        "all" => RustScanScope::All,
+        other => {
+            return Err(format!(
+                "Invalid rust_scan scope '{other}'. Expected production, test, or all."
+            ));
+        }
+    };
+
+    let features = match args.get("features") {
+        None | Some(Value::Null) => RustFeatureSelection::Default,
+        Some(Value::String(mode)) => rust_feature_selection_from_mode(mode, None)?,
+        Some(Value::Object(_)) => {
+            let feature_args = args.get("features").expect("features exists");
+            let mode = feature_args
+                .get("mode")
+                .and_then(Value::as_str)
+                .unwrap_or("default");
+            rust_feature_selection_from_mode(mode, Some(feature_args))?
+        }
+        Some(other) => {
+            return Err(format!(
+                "Invalid rust_scan features value {other}. Expected string or object."
+            ));
+        }
+    };
+
+    Ok(RustScanOptions { scope, features })
+}
+
+fn rust_feature_selection_from_mode(
+    mode: &str,
+    object_value: Option<&Value>,
+) -> Result<RustFeatureSelection, String> {
+    match mode {
+        "" | "default" => Ok(RustFeatureSelection::Default),
+        "none" => Ok(RustFeatureSelection::None),
+        "all" => Ok(RustFeatureSelection::All),
+        "selected" => {
+            let features = object_value
+                .and_then(|value| value.get("selected"))
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .filter(|feature| !feature.is_empty())
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let no_default_features = object_value
+                .and_then(|value| value.get("no_default_features"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            Ok(RustFeatureSelection::Selected {
+                features,
+                no_default_features,
+            })
+        }
+        other => Err(format!(
+            "Invalid rust_scan feature mode '{other}'. Expected default, none, all, or selected."
+        )),
+    }
+}
+
+fn rust_scan_options_json(options: &RustScanOptions) -> Value {
+    json!({
+        "scope": options.scope.as_str(),
+        "features": {
+            "mode": options.features.mode(),
+            "selected": options.features.selected_features(),
+            "no_default_features": options.features.no_default_features(),
+        }
+    })
 }
 
 fn eager_refresh_dependencies(

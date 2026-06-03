@@ -34,8 +34,16 @@ pub fn scan_actual_graph(
     workspace_root: &Path,
     desired: Option<&DomainModel>,
 ) -> Result<ActualScan> {
+    scan_actual_graph_with_options(workspace_root, desired, &RustScanOptions::default())
+}
+
+pub fn scan_actual_graph_with_options(
+    workspace_root: &Path,
+    desired: Option<&DomainModel>,
+    options: &RustScanOptions,
+) -> Result<ActualScan> {
     let model = scan_actual_model(workspace_root, desired)?;
-    match rust_analyzer::resolve_calls(workspace_root) {
+    match rust_analyzer::resolve_calls_with_options(workspace_root, options) {
         Ok(resolved_calls) => Ok(ActualScan {
             model,
             resolved_calls,

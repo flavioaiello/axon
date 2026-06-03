@@ -15,10 +15,12 @@ use ra_ap_ide::{
     TextSize,
 };
 use ra_ap_load_cargo::{LoadCargoConfig, ProcMacroServerChoice, load_workspace_at};
-use ra_ap_project_model::CargoConfig;
+use ra_ap_project_model::{CargoConfig, CargoFeatures};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use syn::parse::Parser;
+
+use super::rust_facts::{RustFeatureSelection, RustScanOptions};
 
 /// A call site resolved to the concrete function it targets.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,6 +55,13 @@ struct Callable {
 ///    `Analysis::outgoing_calls` resolves each callable's outgoing calls to
 ///    concrete workspace definitions.
 pub fn resolve_calls(workspace_root: &Path) -> Result<Vec<ResolvedCall>> {
+    resolve_calls_with_options(workspace_root, &RustScanOptions::default())
+}
+
+pub fn resolve_calls_with_options(
+    workspace_root: &Path,
+    options: &RustScanOptions,
+) -> Result<Vec<ResolvedCall>> {
     let root = std::fs::canonicalize(workspace_root).with_context(|| {
         format!(
             "workspace path does not exist: {}",
@@ -78,8 +87,9 @@ pub fn resolve_calls(workspace_root: &Path) -> Result<Vec<ResolvedCall>> {
     }
 
     let cargo_config = CargoConfig {
-        all_targets: true,
-        set_test: true,
+        all_targets: options.scope.includes_tests(),
+        features: cargo_features(&options.features),
+        set_test: options.scope.includes_tests(),
         ..CargoConfig::default()
     };
     let load_config = LoadCargoConfig {
@@ -104,7 +114,7 @@ pub fn resolve_calls(workspace_root: &Path) -> Result<Vec<ResolvedCall>> {
         })
         .collect();
     let config = CallHierarchyConfig {
-        exclude_tests: false,
+        exclude_tests: !options.scope.includes_tests(),
         ra_fixture: RaFixtureConfig::default(),
     };
 
@@ -155,6 +165,24 @@ pub fn resolve_calls(workspace_root: &Path) -> Result<Vec<ResolvedCall>> {
         (&a.caller, &a.callee, &a.callee_file).cmp(&(&b.caller, &b.callee, &b.callee_file))
     });
     Ok(out)
+}
+
+fn cargo_features(selection: &RustFeatureSelection) -> CargoFeatures {
+    match selection {
+        RustFeatureSelection::Default => CargoFeatures::default(),
+        RustFeatureSelection::None => CargoFeatures::Selected {
+            features: vec![],
+            no_default_features: true,
+        },
+        RustFeatureSelection::All => CargoFeatures::All,
+        RustFeatureSelection::Selected {
+            features,
+            no_default_features,
+        } => CargoFeatures::Selected {
+            features: features.clone(),
+            no_default_features: *no_default_features,
+        },
+    }
 }
 
 /// Collect `*.rs` files under `<root>/src` (falling back to the whole root),
