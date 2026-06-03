@@ -2126,8 +2126,8 @@ mod tests {
         let mut model = DomainModel::empty(&ws);
         model.source_files = vec![
             SourceFile {
-                path: "src/store/cozo.rs".into(),
-                context: "store".into(),
+                path: "src/domain/rust_syn.rs".into(),
+                context: "domain".into(),
                 language: "rust".into(),
             },
             SourceFile {
@@ -2149,17 +2149,17 @@ mod tests {
         model.import_edges = vec![
             ImportEdge {
                 from_file: "src/mcp/tools.rs".into(),
-                to_module: "crate::store::Store".into(),
+                to_module: "crate::domain::rust_syn::RustSynScanner".into(),
                 context: "mcp".into(),
             },
             ImportEdge {
                 from_file: "src/mcp/resources.rs".into(),
-                to_module: "crate::store::Store".into(),
+                to_module: "crate::domain::rust_syn::RustSynScanner".into(),
                 context: "mcp".into(),
             },
             ImportEdge {
                 from_file: "src/server/web.rs".into(),
-                to_module: "crate::store::Store".into(),
+                to_module: "crate::domain::rust_syn::RustSynScanner".into(),
                 context: "server".into(),
             },
         ];

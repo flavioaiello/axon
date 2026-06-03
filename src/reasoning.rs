@@ -5,8 +5,8 @@ use std::collections::{BTreeMap, HashMap};
 use crate::domain::model::DomainModel;
 use crate::store::{
     ACTUAL_STATE, ModelHealth, PersistedReasoningClaim, ReasoningAssumption, ReasoningDependency,
-    ReasoningDerivation, ReasoningJustification, ReasoningProvenance, ReasoningSupportEdge,
-    Store, canonical_model_state, canonicalize_path,
+    ReasoningDerivation, ReasoningJustification, ReasoningProvenance, ReasoningSupportEdge, Store,
+    canonical_model_state, canonicalize_path,
 };
 
 mod claims;

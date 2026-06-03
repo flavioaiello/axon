@@ -578,6 +578,11 @@ fn optimization_recommendations_surface_shape_candidates() {
             language: "rust".into(),
         },
         SourceFile {
+            path: "src/domain/rust_syn.rs".into(),
+            context: "domain".into(),
+            language: "rust".into(),
+        },
+        SourceFile {
             path: "src/mcp/tools.rs".into(),
             context: "mcp".into(),
             language: "rust".into(),
@@ -635,22 +640,22 @@ fn optimization_recommendations_surface_shape_candidates() {
     model.import_edges = vec![
         ImportEdge {
             from_file: "src/mcp/tools.rs".into(),
-            to_module: "crate::store::Store".into(),
+            to_module: "crate::domain::rust_syn::RustSynScanner".into(),
             context: "mcp".into(),
         },
         ImportEdge {
             from_file: "src/mcp/resources.rs".into(),
-            to_module: "crate::store::Store".into(),
+            to_module: "crate::domain::rust_syn::RustSynScanner".into(),
             context: "mcp".into(),
         },
         ImportEdge {
             from_file: "src/mcp/write_tools.rs".into(),
-            to_module: "crate::store::Store".into(),
+            to_module: "crate::domain::rust_syn::RustSynScanner".into(),
             context: "mcp".into(),
         },
         ImportEdge {
             from_file: "src/server/web.rs".into(),
-            to_module: "crate::store::Store".into(),
+            to_module: "crate::domain::rust_syn::RustSynScanner".into(),
             context: "server".into(),
         },
     ];

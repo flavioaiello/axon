@@ -1,13 +1,13 @@
 mod cozo;
 
+pub(crate) use cozo::{ACTUAL_STATE, canonical_model_state};
 pub use cozo::{
     ContextComplexity, DriftFreshness, FactSnapshotSummary, LayerViolation, ModelHealth,
-    PersistedReasoningClaim, PolicyCoverage, ProjectInfo, ReasoningAssumption,
-    ReasoningDependency, ReasoningDerivation, ReasoningFactRef, ReasoningJustification,
-    ReasoningProvenance, ReasoningSupportEdge, Store, TruthMaintenanceReport, canonicalize_path,
+    PersistedReasoningClaim, PolicyCoverage, ProjectInfo, ReasoningAssumption, ReasoningDependency,
+    ReasoningDerivation, ReasoningFactRef, ReasoningJustification, ReasoningProvenance,
+    ReasoningSupportEdge, Store, TruthMaintenanceReport, canonicalize_path,
     default_layer_constraints,
 };
-pub(crate) use cozo::{ACTUAL_STATE, canonical_model_state};
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};

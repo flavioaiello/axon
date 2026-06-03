@@ -1158,6 +1158,22 @@ mod tests {
             .expect("scan should succeed")
     }
 
+    #[test]
+    fn extract_live_dependencies_collects_use_paths() {
+        let code = r#"
+            use std::path::Path;
+            use crate::domain::model::DomainModel;
+        "#;
+        let deps = RustSynScanner
+            .extract_live_dependencies(Path::new("test.rs"), code)
+            .unwrap();
+        let modules: Vec<&str> = deps.iter().map(|dep| dep.to_module.as_str()).collect();
+        assert_eq!(
+            modules,
+            vec!["std::path::Path", "crate::domain::model::DomainModel"]
+        );
+    }
+
     /// Directive strings recorded for a given owner.
     fn directives_for<'a>(ds: &'a [DiscoveredDirective], owner: &str) -> Vec<&'a str> {
         ds.iter()

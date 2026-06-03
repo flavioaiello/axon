@@ -1588,22 +1588,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_extract_live_deps() {
-        let code = r#"
-            use std::path::Path;
-            use crate::domain::model::DomainModel;
-        "#;
-        let deps = RustSynScanner
-            .extract_live_dependencies(Path::new("test.rs"), code)
-            .unwrap();
-        let modules: Vec<&str> = deps.iter().map(|dep| dep.to_module.as_str()).collect();
-        assert_eq!(
-            modules,
-            vec!["std::path::Path", "crate::domain::model::DomainModel"]
-        );
-    }
-
-    #[test]
     fn test_scan_file_struct_fields() {
         let code = r#"
             pub struct User {
