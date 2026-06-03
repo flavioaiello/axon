@@ -109,15 +109,6 @@ fn read_context_from_store(
     workspace_path: &str,
     ctx_name: &str,
 ) -> (&'static str, String) {
-    // Check if context exists
-    let ctx_rows = store.run_datalog(
-        "?[name, description] := *context{workspace: $ws, name, description, state: 'actual'}, \
-         name = to_lowercase($ctx)",
-        workspace_path,
-    );
-
-    // We need a custom query with ctx_name bound. Use build_model_overview which already
-    // gathers everything, then extract the specific context.
     let overview = build_model_overview(store, workspace_path, "actual");
     if let Some(contexts) = overview.get("bounded_contexts").and_then(|v| v.as_array()) {
         for ctx in contexts {
@@ -132,8 +123,6 @@ fn read_context_from_store(
         }
     }
 
-    // Also check by exact query
-    let _ = ctx_rows;
     (
         "text/plain",
         format!("Bounded context '{}' not found", ctx_name),
@@ -237,6 +226,13 @@ mod tests {
     fn test_read_resource_context() {
         let (store, ws) = test_store_with_model();
         let result = read_resource(&store, &ws, "axon://context/identity");
+        assert!(result.contents[0].text.contains("Identity"));
+    }
+
+    #[test]
+    fn test_read_resource_context_accepts_equivalent_workspace_path() {
+        let (store, ws) = test_store_with_model();
+        let result = read_resource(&store, &format!("{ws}/"), "axon://context/identity");
         assert!(result.contents[0].text.contains("Identity"));
     }
 

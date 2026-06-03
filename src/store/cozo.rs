@@ -4504,7 +4504,8 @@ impl Store {
 
     /// Run an arbitrary Datalog query with `$ws` parameter.
     pub fn run_datalog(&self, script: &str, workspace: &str) -> Result<Vec<Vec<String>>> {
-        let params = params_map(&[("ws", workspace)]);
+        let ws = canonicalize_path(workspace);
+        let params = params_map(&[("ws", &ws)]);
         let script = normalize_query_state_aliases(script);
         let result = self
             .run_script(&script, params, ScriptMutability::Immutable)
@@ -4522,7 +4523,8 @@ impl Store {
         script: &str,
         workspace: &str,
     ) -> Result<(Vec<String>, Vec<Vec<String>>)> {
-        let params = params_map(&[("ws", workspace)]);
+        let ws = canonicalize_path(workspace);
+        let params = params_map(&[("ws", &ws)]);
         let script = normalize_query_state_aliases(script);
         let result = self
             .run_script(&script, params, ScriptMutability::Immutable)
