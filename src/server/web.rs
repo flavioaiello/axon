@@ -1051,6 +1051,49 @@ mod tests {
     }
 
     #[test]
+    fn graph_json_does_not_duplicate_root_modules_for_lib_and_main() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = temp_dir().join(format!("axon_web_lib_main_test_{unique}"));
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='lib_main_web_test'\nversion='0.1.0'\nedition='2024'\n",
+        )
+        .unwrap();
+        fs::write(root.join("src/lib.rs"), "pub mod app;\n").unwrap();
+        fs::write(root.join("src/main.rs"), "mod app;\nfn main() {}\n").unwrap();
+        fs::write(root.join("src/app.rs"), "pub struct App;\n").unwrap();
+
+        let registry = CrateRegistry::open(&root).unwrap();
+        let entry = registry.primary();
+        let ws = entry.workspace_key();
+        let actual = crate::domain::analyze::scan_actual_model(&root, None).unwrap();
+        entry.store.save_actual(&ws, &actual).unwrap();
+
+        let graph = build_graph_json(&registry);
+        let module_paths = graph["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|node| node["kind"] == "module")
+            .filter_map(|node| node["path"].as_str())
+            .collect::<Vec<_>>();
+
+        assert!(module_paths.contains(&"app"));
+        assert!(
+            !module_paths
+                .iter()
+                .any(|path| *path != "app" && path.ends_with("::app")),
+            "root module should appear once as app, got {module_paths:?}"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn web_page_contains_graph_bootstrap() {
         assert!(WEB_HTML.contains("/api/graph"));
         assert!(WEB_HTML.contains("Live Rust architecture overview"));

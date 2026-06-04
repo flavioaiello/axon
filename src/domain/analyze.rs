@@ -864,11 +864,11 @@ pub fn scan_actual_model(
                 modules: discovered_modules
                     .iter()
                     .map(|dm| {
-                        let mod_path = format!("{}::{}", ctx_name, dm.name);
                         let file_path = std::path::Path::new(&dm.file_path)
                             .strip_prefix(workspace_root)
                             .map(|p| p.to_string_lossy().to_string())
                             .unwrap_or_else(|_| dm.file_path.clone());
+                        let mod_path = module_path_for_declaration(&file_path, &dm.name);
                         let desired_mod = desired_bc.and_then(|dbc| {
                             dbc.modules
                                 .iter()
@@ -1498,6 +1498,44 @@ pub fn scan_actual_model(
     }
 
     Ok(actual)
+}
+
+fn module_path_for_declaration(file_path: &str, module_name: &str) -> String {
+    let parent = rust_module_path_from_file_path(file_path);
+    if parent.is_empty() {
+        module_name.to_string()
+    } else {
+        format!("{parent}::{module_name}")
+    }
+}
+
+fn rust_module_path_from_file_path(file_path: &str) -> String {
+    let normalized = file_path.replace('\\', "/");
+    let parts: Vec<&str> = normalized
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect();
+    let start = parts
+        .iter()
+        .position(|part| *part == "src")
+        .map_or(0, |index| index + 1);
+    let relative = &parts[start..];
+    let Some(file_name) = relative.last() else {
+        return String::new();
+    };
+    if !file_name.ends_with(".rs") {
+        return String::new();
+    }
+
+    let mut segments: Vec<String> = relative[..relative.len().saturating_sub(1)]
+        .iter()
+        .map(|segment| segment.to_string())
+        .collect();
+    let stem = file_name.trim_end_matches(".rs");
+    if stem != "mod" && !((stem == "lib" || stem == "main") && segments.is_empty()) {
+        segments.push(stem.to_string());
+    }
+    segments.join("::")
 }
 
 // ─── Helpers (test-only: used by inline StructMethodVisitor) ───────────────
