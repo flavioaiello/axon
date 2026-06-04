@@ -2099,6 +2099,17 @@ mod tests {
             context: "reasoning".into(),
         }];
         store.save_actual(&ws, &model).unwrap();
+        store
+            .save_resolved_calls(
+                &ws,
+                &[crate::domain::rust_analyzer::ResolvedCall {
+                    caller: "ReasoningKernel::architecture".into(),
+                    callee: "Store::load_actual".into(),
+                    callee_file: "src/store/cozo.rs".into(),
+                    callee_line: 1,
+                }],
+            )
+            .unwrap();
 
         let result = call_tool(
             &store,
@@ -2111,9 +2122,23 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
         let derived_from = parsed["proof"]["derived_from"].as_array().unwrap();
         assert!(derived_from.iter().any(|item| item == "calls_symbol"));
+        assert!(derived_from.iter().any(|item| item == "resolved_call"));
         assert!(derived_from.iter().any(|item| item == "symbol"));
         assert_eq!(parsed["proof"]["witness_count"], 1);
         assert_eq!(parsed["result"]["project_callee_edges"], 1);
+        assert_eq!(parsed["result"]["resolved_project_callee_edges"], 1);
+        assert_eq!(
+            parsed["result"]["hottest_project_callees"][0]["call_graph_relation"],
+            "calls_symbol"
+        );
+        assert_eq!(
+            parsed["result"]["hottest_resolved_project_callees"][0]["callee"],
+            "Store::load_actual"
+        );
+        assert_eq!(
+            parsed["result"]["hottest_resolved_project_callees"][0]["call_graph_relation"],
+            "resolved_call"
+        );
     }
 
     #[test]

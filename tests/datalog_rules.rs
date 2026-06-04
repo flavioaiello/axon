@@ -12,6 +12,7 @@ use std::fs;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use axon::domain::model::*;
+use axon::domain::rust_analyzer::ResolvedCall;
 use axon::store::Store;
 use axon::store::{canonicalize_path, default_layer_constraints};
 
@@ -1571,6 +1572,25 @@ fn call_graph_stats_summary() {
         visibility: "private".into(),
     }];
     store.save_actual(&ws, &model).unwrap();
+    store
+        .save_resolved_calls(
+            &ws,
+            &[
+                ResolvedCall {
+                    caller: "a".into(),
+                    callee: "Project::c".into(),
+                    callee_file: "src/lib.rs".into(),
+                    callee_line: 1,
+                },
+                ResolvedCall {
+                    caller: "b".into(),
+                    callee: "Project::c".into(),
+                    callee_file: "src/lib.rs".into(),
+                    callee_line: 1,
+                },
+            ],
+        )
+        .unwrap();
 
     let stats = store.call_graph_stats(&canonicalize(&ws)).unwrap();
     assert_eq!(stats["total_edges"], 3);
@@ -1578,8 +1598,47 @@ fn call_graph_stats_summary() {
     assert_eq!(stats["unique_callees"], 2); // b, c
     assert_eq!(stats["project_callee_edges"], 2);
     assert_eq!(stats["unique_project_callees"], 1);
+    assert_eq!(
+        stats["project_callee_stats"]["call_graph_relation"],
+        "calls_symbol"
+    );
+    assert_eq!(stats["project_callee_stats"]["ambiguity"], "name_based");
     assert_eq!(stats["hottest_project_callees"][0]["callee"], "c");
     assert_eq!(stats["hottest_project_callees"][0]["call_count"], 2);
+    assert_eq!(
+        stats["hottest_project_callees"][0]["call_graph_relation"],
+        "calls_symbol"
+    );
+    assert_eq!(
+        stats["hottest_project_callees"][0]["ambiguity"],
+        "name_based"
+    );
+    assert_eq!(stats["resolved_project_callee_edges"], 2);
+    assert_eq!(stats["unique_resolved_project_callees"], 1);
+    assert_eq!(
+        stats["resolved_project_callee_stats"]["call_graph_relation"],
+        "resolved_call"
+    );
+    assert_eq!(
+        stats["resolved_project_callee_stats"]["ambiguity"],
+        "compiler_resolved"
+    );
+    assert_eq!(
+        stats["hottest_resolved_project_callees"][0]["callee"],
+        "Project::c"
+    );
+    assert_eq!(
+        stats["hottest_resolved_project_callees"][0]["callee_file"],
+        "src/lib.rs"
+    );
+    assert_eq!(
+        stats["hottest_resolved_project_callees"][0]["callee_line"],
+        1
+    );
+    assert_eq!(
+        stats["hottest_resolved_project_callees"][0]["call_count"],
+        2
+    );
 }
 
 #[test]

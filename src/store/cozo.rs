@@ -6542,14 +6542,23 @@ impl Store {
         let symbols = self
             .run_script(
                 "?[name] := *symbol{workspace: $ws, name, state: 'actual' @ 'NOW'}",
-                params,
+                params.clone(),
                 ScriptMutability::Immutable,
             )
             .map_err(|e| anyhow::anyhow!("call_graph_stats symbols: {:?}", e))?;
+        let resolved_call_callees = self
+            .run_script(
+                "?[caller, callee, callee_file, callee_line] := *resolved_call{workspace: $ws, caller, callee, callee_file, state: 'actual', callee_line @ 'NOW'}",
+                params,
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| anyhow::anyhow!("call_graph_stats resolved callees: {:?}", e))?;
 
         let mut symbol_aliases: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut symbol_names = BTreeSet::new();
         for row in &symbols.rows {
             let symbol = dv_str(&row[0]);
+            symbol_names.insert(symbol.clone());
             for alias in symbol_lookup_aliases(&symbol) {
                 symbol_aliases
                     .entry(alias)
@@ -6578,6 +6587,34 @@ impl Store {
             .sort_by(|left, right| right.1.0.cmp(&left.1.0).then_with(|| left.0.cmp(&right.0)));
         hot_project_callees.truncate(10);
 
+        let mut resolved_project_callee_counts: BTreeMap<(String, String, i64), i64> =
+            BTreeMap::new();
+        for row in &resolved_call_callees.rows {
+            let callee = dv_str(&row[1]);
+            if !symbol_names.contains(&callee) {
+                continue;
+            }
+            let callee_file = dv_str(&row[2]);
+            let callee_line = dv_i64(&row[3]);
+            *resolved_project_callee_counts
+                .entry((callee, callee_file, callee_line))
+                .or_default() += 1;
+        }
+        let resolved_project_callee_edges = resolved_project_callee_counts.values().sum::<i64>();
+        let unique_resolved_project_callees = resolved_project_callee_counts.len();
+        let mut hot_resolved_project_callees = resolved_project_callee_counts
+            .into_iter()
+            .collect::<Vec<_>>();
+        hot_resolved_project_callees.sort_by(|left, right| {
+            right
+                .1
+                .cmp(&left.1)
+                .then_with(|| left.0.0.cmp(&right.0.0))
+                .then_with(|| left.0.1.cmp(&right.0.1))
+                .then_with(|| left.0.2.cmp(&right.0.2))
+        });
+        hot_resolved_project_callees.truncate(10);
+
         Ok(json!({
             "total_edges": if total.rows.is_empty() { 0 } else { dv_i64(&total.rows[0][0]) },
             "unique_callers": if unique_callers.rows.is_empty() { 0 } else { dv_i64(&unique_callers.rows[0][0]) },
@@ -6588,10 +6625,29 @@ impl Store {
             })).collect::<Vec<_>>(),
             "project_callee_edges": project_callee_edges,
             "unique_project_callees": unique_project_callees,
+            "project_callee_stats": {
+                "call_graph_relation": "calls_symbol",
+                "ambiguity": "name_based",
+            },
             "hottest_project_callees": hot_project_callees.into_iter().map(|(callee, (count, matched_symbols))| json!({
                 "callee": callee,
                 "call_count": count,
+                "call_graph_relation": "calls_symbol",
+                "ambiguity": "name_based",
                 "matched_symbols": matched_symbols.into_iter().collect::<Vec<_>>(),
+            })).collect::<Vec<_>>(),
+            "resolved_project_callee_edges": resolved_project_callee_edges,
+            "unique_resolved_project_callees": unique_resolved_project_callees,
+            "resolved_project_callee_stats": {
+                "call_graph_relation": "resolved_call",
+                "ambiguity": "compiler_resolved",
+            },
+            "hottest_resolved_project_callees": hot_resolved_project_callees.into_iter().map(|((callee, callee_file, callee_line), count)| json!({
+                "callee": callee,
+                "callee_file": callee_file,
+                "callee_line": callee_line,
+                "call_count": count,
+                "call_graph_relation": "resolved_call",
             })).collect::<Vec<_>>(),
         }))
     }
