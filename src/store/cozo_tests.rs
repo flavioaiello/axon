@@ -834,6 +834,232 @@ fn optimization_recommendations_surface_shape_candidates() {
 }
 
 #[test]
+fn optimization_recommendations_prefer_resolved_calls_for_move_candidates() {
+    let store = temp_store();
+    let ws = "/tmp/resolved_shape_ws";
+    let mut model = DomainModel::empty(ws);
+    model.source_files = vec![
+        SourceFile {
+            path: "src/domain/rust_facts.rs".into(),
+            context: "domain".into(),
+            language: "rust".into(),
+        },
+        SourceFile {
+            path: "src/mcp/tools.rs".into(),
+            context: "mcp".into(),
+            language: "rust".into(),
+        },
+        SourceFile {
+            path: "src/store/cozo.rs".into(),
+            context: "store".into(),
+            language: "rust".into(),
+        },
+    ];
+    model.symbols = vec![
+        SymbolDef {
+            name: "RustScanScope::as_str".into(),
+            kind: "method".into(),
+            context: "domain".into(),
+            file_path: "src/domain/rust_facts.rs".into(),
+            start_line: 28,
+            end_line: 34,
+            visibility: "public".into(),
+        },
+        SymbolDef {
+            name: "Value::as_str".into(),
+            kind: "method".into(),
+            context: "mcp".into(),
+            file_path: "src/mcp/tools.rs".into(),
+            start_line: 10,
+            end_line: 12,
+            visibility: "public".into(),
+        },
+        SymbolDef {
+            name: "Tools::parse_scope".into(),
+            kind: "method".into(),
+            context: "mcp".into(),
+            file_path: "src/mcp/tools.rs".into(),
+            start_line: 20,
+            end_line: 30,
+            visibility: "private".into(),
+        },
+        SymbolDef {
+            name: "Store::render_scope".into(),
+            kind: "method".into(),
+            context: "store".into(),
+            file_path: "src/store/cozo.rs".into(),
+            start_line: 40,
+            end_line: 50,
+            visibility: "private".into(),
+        },
+        SymbolDef {
+            name: "Store::save_state".into(),
+            kind: "method".into(),
+            context: "store".into(),
+            file_path: "src/store/cozo.rs".into(),
+            start_line: 60,
+            end_line: 70,
+            visibility: "private".into(),
+        },
+        SymbolDef {
+            name: "Tools::sync_a".into(),
+            kind: "method".into(),
+            context: "mcp".into(),
+            file_path: "src/mcp/tools.rs".into(),
+            start_line: 80,
+            end_line: 90,
+            visibility: "private".into(),
+        },
+        SymbolDef {
+            name: "Tools::sync_b".into(),
+            kind: "method".into(),
+            context: "mcp".into(),
+            file_path: "src/mcp/tools.rs".into(),
+            start_line: 91,
+            end_line: 100,
+            visibility: "private".into(),
+        },
+        SymbolDef {
+            name: "Tools::sync_c".into(),
+            kind: "method".into(),
+            context: "mcp".into(),
+            file_path: "src/mcp/tools.rs".into(),
+            start_line: 101,
+            end_line: 110,
+            visibility: "private".into(),
+        },
+        SymbolDef {
+            name: "test_save_state_a".into(),
+            kind: "function".into(),
+            context: "store".into(),
+            file_path: "src/store/cozo_tests.rs".into(),
+            start_line: 120,
+            end_line: 130,
+            visibility: "private".into(),
+        },
+        SymbolDef {
+            name: "test_save_state_b".into(),
+            kind: "function".into(),
+            context: "store".into(),
+            file_path: "src/store/cozo_tests.rs".into(),
+            start_line: 131,
+            end_line: 140,
+            visibility: "private".into(),
+        },
+        SymbolDef {
+            name: "test_save_state_c".into(),
+            kind: "function".into(),
+            context: "store".into(),
+            file_path: "src/store/cozo_tests.rs".into(),
+            start_line: 141,
+            end_line: 150,
+            visibility: "private".into(),
+        },
+    ];
+    model.call_edges = vec![
+        CallEdge {
+            caller: "Tools::parse_scope".into(),
+            callee: "as_str".into(),
+            file_path: "src/mcp/tools.rs".into(),
+            line: 24,
+            context: "mcp".into(),
+        },
+        CallEdge {
+            caller: "Tools::parse_scope".into(),
+            callee: "as_str".into(),
+            file_path: "src/mcp/tools.rs".into(),
+            line: 25,
+            context: "mcp".into(),
+        },
+        CallEdge {
+            caller: "Store::render_scope".into(),
+            callee: "as_str".into(),
+            file_path: "src/store/cozo.rs".into(),
+            line: 44,
+            context: "store".into(),
+        },
+    ];
+    store.save_actual(ws, &model).unwrap();
+    store
+        .save_resolved_calls(
+            ws,
+            &[
+                crate::domain::rust_analyzer::ResolvedCall {
+                    caller: "Tools::parse_scope".into(),
+                    callee: "Value::as_str".into(),
+                    callee_file: "src/mcp/tools.rs".into(),
+                    callee_line: 10,
+                },
+                crate::domain::rust_analyzer::ResolvedCall {
+                    caller: "Store::render_scope".into(),
+                    callee: "RustScanScope::as_str".into(),
+                    callee_file: "src/domain/rust_facts.rs".into(),
+                    callee_line: 28,
+                },
+                crate::domain::rust_analyzer::ResolvedCall {
+                    caller: "Tools::sync_a".into(),
+                    callee: "Store::save_state".into(),
+                    callee_file: "src/store/cozo.rs".into(),
+                    callee_line: 60,
+                },
+                crate::domain::rust_analyzer::ResolvedCall {
+                    caller: "Tools::sync_b".into(),
+                    callee: "Store::save_state".into(),
+                    callee_file: "src/store/cozo.rs".into(),
+                    callee_line: 60,
+                },
+                crate::domain::rust_analyzer::ResolvedCall {
+                    caller: "Tools::sync_c".into(),
+                    callee: "Store::save_state".into(),
+                    callee_file: "src/store/cozo.rs".into(),
+                    callee_line: 60,
+                },
+                crate::domain::rust_analyzer::ResolvedCall {
+                    caller: "test_save_state_a".into(),
+                    callee: "Store::save_state".into(),
+                    callee_file: "src/store/cozo.rs".into(),
+                    callee_line: 60,
+                },
+                crate::domain::rust_analyzer::ResolvedCall {
+                    caller: "test_save_state_b".into(),
+                    callee: "Store::save_state".into(),
+                    callee_file: "src/store/cozo.rs".into(),
+                    callee_line: 60,
+                },
+                crate::domain::rust_analyzer::ResolvedCall {
+                    caller: "test_save_state_c".into(),
+                    callee: "Store::save_state".into(),
+                    callee_file: "src/store/cozo.rs".into(),
+                    callee_line: 60,
+                },
+            ],
+        )
+        .unwrap();
+
+    let result = store
+        .optimization_recommendations_scoped(ws, "production")
+        .unwrap();
+    let recommendations = result["recommendations"].as_array().unwrap();
+
+    assert!(
+        recommendations.iter().all(|recommendation| {
+            recommendation["kind"] != "move_or_facade"
+                || recommendation["target"] != "RustScanScope::as_str"
+        }),
+        "resolved calls should prevent noisy short-name as_str fan-in: {result}"
+    );
+    assert!(
+        recommendations
+            .iter()
+            .any(|recommendation| recommendation["kind"] == "move_or_facade"
+                && recommendation["target"] == "Store::save_state"
+                && recommendation["evidence"]["caller_context_counts"]["mcp"] == 3
+                && recommendation["evidence"]["call_graph_relation"] == "resolved_call"),
+        "move/facade recommendations should disclose resolved-call evidence and exclude test callers in production scope: {result}"
+    );
+}
+
+#[test]
 fn practice_findings_rank_rust_best_practice_signals() {
     let store = temp_store();
     let ws = "/tmp/practice_ws";

@@ -1764,11 +1764,9 @@ fn rust_scan_scope_from_args(args: &Value) -> Result<RustScanScope, String> {
         "" | "production" => Ok(RustScanScope::Production),
         "test" => Ok(RustScanScope::Test),
         "all" => Ok(RustScanScope::All),
-        other => {
-            return Err(format!(
-                "Invalid rust_scan scope '{other}'. Expected production, test, or all."
-            ));
-        }
+        other => Err(format!(
+            "Invalid rust_scan scope '{other}'. Expected production, test, or all."
+        )),
     }
 }
 
@@ -1785,11 +1783,9 @@ fn rust_feature_selection_from_value(
                 .unwrap_or("default");
             rust_feature_selection_from_mode(mode, Some(feature_args))
         }
-        Some(other) => {
-            return Err(format!(
-                "Invalid rust_scan features value {other}. Expected string or object."
-            ));
-        }
+        Some(other) => Err(format!(
+            "Invalid rust_scan features value {other}. Expected string or object."
+        )),
     }
 }
 
@@ -2877,7 +2873,7 @@ mod tests {
 
         assert_eq!(payload["status"], "healthy_with_readiness_warnings");
         assert_eq!(payload["graph_confidence"]["status"], "not_scanned");
-        assert!(payload["readiness_warnings"].as_array().unwrap().len() >= 1);
+        assert!(!payload["readiness_warnings"].as_array().unwrap().is_empty());
         assert!(payload["next_action_count"].as_u64().unwrap() >= 1);
     }
 

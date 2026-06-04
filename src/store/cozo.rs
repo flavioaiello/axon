@@ -299,6 +299,8 @@ type PolicySnapshot = (
     BTreeSet<(String, String, String, String)>,
 );
 
+type PracticeSymbolAlias = (String, String, String, i64, String);
+
 pub type SharedField = (String, String, String, String, String);
 
 impl Store {
@@ -6640,6 +6642,13 @@ impl Store {
                 ScriptMutability::Immutable,
             )
             .map_err(|e| anyhow::anyhow!("optimization calls: {:?}", e))?;
+        let resolved_calls = self
+            .run_script(
+                "?[caller, callee, callee_file] := *resolved_call{workspace: $ws, caller, callee, callee_file, state: 'actual' @ 'NOW'}",
+                params.clone(),
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| anyhow::anyhow!("optimization resolved_calls: {:?}", e))?;
         let ast_edges = self
             .run_script(
                 "?[from_node, to_node, edge_type, file_path] := *ast_edge{workspace: $ws, from_node, to_node, edge_type, state: 'actual', file_path @ 'NOW'}",
@@ -6882,6 +6891,23 @@ impl Store {
         }
 
         // Move/facade candidates: callers/importers mostly live in another context.
+        let mut symbol_context_by_name = BTreeMap::new();
+        let mut symbol_file_by_name = BTreeMap::new();
+        for row in &symbols.rows {
+            let name = dv_str(&row[0]);
+            let context = dv_str(&row[2]);
+            let file = dv_str(&row[3]);
+            if rust_fact_allowed(requested_scope, &file, &name, "") {
+                symbol_context_by_name.insert(name.clone(), context);
+                symbol_file_by_name.insert(name, file);
+            }
+        }
+        let use_resolved_move_calls = !resolved_calls.rows.is_empty();
+        let move_facade_relation = if use_resolved_move_calls {
+            "resolved_call"
+        } else {
+            "calls_symbol"
+        };
         let mut symbol_by_alias: BTreeMap<String, Vec<(String, String, String)>> = BTreeMap::new();
         for row in &symbols.rows {
             let name = dv_str(&row[0]);
@@ -6899,24 +6925,54 @@ impl Store {
             }
         }
         let mut incoming_contexts: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
-        for row in &calls.rows {
-            let callee = dv_str(&row[1]);
-            let caller = dv_str(&row[0]);
-            let file_path = dv_str(&row[2]);
-            if !rust_fact_allowed(requested_scope, &file_path, &caller, &callee) {
-                continue;
-            }
-            let caller_context = dv_str(&row[3]);
-            let Some(matches) = symbol_by_alias.get(&callee) else {
-                continue;
-            };
-            for (symbol, _, _) in matches {
+        if use_resolved_move_calls {
+            for row in &resolved_calls.rows {
+                let caller = dv_str(&row[0]);
+                let callee = dv_str(&row[1]);
+                let callee_file = dv_str(&row[2]);
+                if !symbol_context_by_name.contains_key(&callee) {
+                    continue;
+                }
+                let Some(caller_file) = symbol_file_by_name.get(&caller) else {
+                    continue;
+                };
+                if !rust_fact_allowed(requested_scope, caller_file, &caller, &callee) {
+                    continue;
+                }
+                if !rust_fact_allowed(requested_scope, &callee_file, &callee, "") {
+                    continue;
+                }
+                let Some(caller_context) = symbol_context_by_name.get(&caller) else {
+                    continue;
+                };
                 if !caller_context.is_empty() {
                     *incoming_contexts
-                        .entry(symbol.clone())
+                        .entry(callee)
                         .or_default()
                         .entry(caller_context.clone())
                         .or_default() += 1;
+                }
+            }
+        } else {
+            for row in &calls.rows {
+                let callee = dv_str(&row[1]);
+                let caller = dv_str(&row[0]);
+                let file_path = dv_str(&row[2]);
+                if !rust_fact_allowed(requested_scope, &file_path, &caller, &callee) {
+                    continue;
+                }
+                let caller_context = dv_str(&row[3]);
+                let Some(matches) = symbol_by_alias.get(&callee) else {
+                    continue;
+                };
+                for (symbol, _, _) in matches {
+                    if !caller_context.is_empty() {
+                        *incoming_contexts
+                            .entry(symbol.clone())
+                            .or_default()
+                            .entry(caller_context.clone())
+                            .or_default() += 1;
+                    }
                 }
             }
         }
@@ -6957,6 +7013,7 @@ impl Store {
                     "declared_context": declared_context,
                     "dominant_caller_context": dominant_context,
                     "caller_context_counts": counts,
+                    "call_graph_relation": move_facade_relation,
                     "total_inbound_calls": total,
                 },
                 "validation": ["Check ownership semantics before moving", "Use rust_impact on the symbol", "Run cargo test and rust_history mode=latest_diff"],
@@ -7018,6 +7075,7 @@ impl Store {
                 "symbols": symbols.rows.iter().filter(|row| rust_fact_allowed(requested_scope, &dv_str(&row[3]), &dv_str(&row[0]), "")).count(),
                 "import_edges": imports.rows.iter().filter(|row| rust_fact_allowed(requested_scope, &dv_str(&row[0]), "", &dv_str(&row[1]))).count(),
                 "call_edges": calls.rows.iter().filter(|row| rust_fact_allowed(requested_scope, &dv_str(&row[2]), &dv_str(&row[0]), &dv_str(&row[1]))).count(),
+                "resolved_call_edges": resolved_calls.rows.iter().filter(|row| rust_fact_allowed(requested_scope, &dv_str(&row[2]), &dv_str(&row[0]), &dv_str(&row[1]))).count(),
                 "ast_edges": ast_edges.rows.iter().filter(|row| rust_fact_allowed(requested_scope, &dv_str(&row[3]), &dv_str(&row[0]), &dv_str(&row[1]))).count(),
             },
             "note": "Static graph recommendations identify refactoring and optimization candidates; runtime wins require profiling or benchmarks.",
@@ -7261,8 +7319,7 @@ impl Store {
             }));
         }
 
-        let mut symbol_by_alias: BTreeMap<String, Vec<(String, String, String, i64, String)>> =
-            BTreeMap::new();
+        let mut symbol_by_alias: BTreeMap<String, Vec<PracticeSymbolAlias>> = BTreeMap::new();
         for row in &symbols.rows {
             let name = dv_str(&row[0]);
             let context = dv_str(&row[2]);

@@ -11,17 +11,12 @@ pub use super::ast::{
 };
 pub use super::model::{ASTEdge, CallEdge, ImportEdge, ReferenceEdge, SourceFile, SymbolDef};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum RustScanScope {
+    #[default]
     Production,
     Test,
     All,
-}
-
-impl Default for RustScanScope {
-    fn default() -> Self {
-        Self::Production
-    }
 }
 
 impl RustScanScope {
@@ -38,8 +33,9 @@ impl RustScanScope {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum RustFeatureSelection {
+    #[default]
     Default,
     None,
     All,
@@ -47,12 +43,6 @@ pub enum RustFeatureSelection {
         features: Vec<String>,
         no_default_features: bool,
     },
-}
-
-impl Default for RustFeatureSelection {
-    fn default() -> Self {
-        Self::Default
-    }
 }
 
 impl RustFeatureSelection {
