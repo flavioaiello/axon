@@ -511,6 +511,7 @@ fn dispatch_write_tool(
                                     "persisted_resolved_call_edges": counts.persisted_resolved_call_edges,
                                     "semantic_resolution": if counts.semantic_resolution_succeeded { "resolved" } else { "failed" },
                                 },
+                                "reasoning_cache_warnings": follow_on_failures,
                                 "follow_on_failures": follow_on_failures,
                                 "semantic_resolution_error": semantic_resolution_error,
                                 "scan_profile": rust_scan_options_json(&scan_options),
@@ -520,27 +521,15 @@ fn dispatch_write_tool(
                                 !counts.semantic_resolution_succeeded,
                             );
 
-                            if payload["status"] == "partial_failure" {
-                                reasoning_error_result(
-                                    store,
-                                    workspace_path,
-                                    payload,
-                                    Some(proof),
-                                    Some(evidence),
-                                    limitations,
-                                    json!({"source": "scan_pipeline", "state": "actual"}),
-                                )
-                            } else {
-                                reasoning_result(
-                                    store,
-                                    workspace_path,
-                                    payload,
-                                    Some(proof),
-                                    Some(evidence),
-                                    limitations,
-                                    json!({"source": "scan_pipeline", "state": "actual"}),
-                                )
-                            }
+                            reasoning_result(
+                                store,
+                                workspace_path,
+                                payload,
+                                Some(proof),
+                                Some(evidence),
+                                limitations,
+                                json!({"source": "scan_pipeline", "state": "actual"}),
+                            )
                         }
                         Err(e) => {
                             error_result(format!("Scan succeeded but save/drift failed: {e}"))
@@ -2444,7 +2433,7 @@ fn build_sync_report(
     let status = if follow_on_failures.is_empty() {
         "scanned"
     } else {
-        "partial_failure"
+        "scanned_with_warnings"
     };
     let drift_recomputed = drift_entry_count.is_some();
     let persisted_import_edges = counts.persisted_import_edges.unwrap_or(counts.import_edges);
@@ -2479,7 +2468,7 @@ fn build_sync_report(
         }
     } else {
         format!(
-            "Scanned {} contexts -> {} entities, {} VOs, {} services, {} repos, {} events. Implemented model updated, but {} follow-on synchronization step(s) failed.",
+            "Scanned {} contexts -> {} entities, {} VOs, {} services, {} repos, {} events. Implemented model updated; {} reasoning cache warning(s) recorded.",
             counts.contexts_scanned,
             counts.entities,
             counts.value_objects,
@@ -2518,6 +2507,7 @@ fn build_sync_report(
         "had_previous_snapshot": had_previous,
         "drift_recomputed": drift_recomputed,
         "drift_entry_count": drift_entry_count,
+        "reasoning_cache_warnings": follow_on_failures,
         "follow_on_failures": follow_on_failures,
     })
 }
@@ -2905,11 +2895,15 @@ mod tests {
             &failures,
         );
 
-        assert_eq!(report["status"], "partial_failure");
+        assert_eq!(report["status"], "scanned_with_warnings");
         assert_eq!(report["implemented_state_saved"], true);
         assert_eq!(report["had_previous_snapshot"], false);
         assert_eq!(report["drift_recomputed"], false);
         assert_eq!(report["drift_entry_count"], serde_json::Value::Null);
+        assert_eq!(
+            report["reasoning_cache_warnings"].as_array().unwrap().len(),
+            1
+        );
         assert_eq!(report["follow_on_failures"].as_array().unwrap().len(), 1);
     }
 

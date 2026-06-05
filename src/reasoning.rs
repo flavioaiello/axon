@@ -2814,6 +2814,28 @@ fn parse_json_subject(subject: &str) -> Value {
     serde_json::from_str(subject).unwrap_or_else(|_| json!({}))
 }
 
+fn safe_to_delete_subject(claim: &PersistedReasoningClaim) -> Option<(String, String)> {
+    let subject = parse_json_subject(&claim.subject);
+    let context = subject["context"].as_str().unwrap_or("");
+    let entity = subject["entity"].as_str().unwrap_or("");
+    if !entity.is_empty() {
+        return Some((context.to_string(), entity.to_string()));
+    }
+
+    let legacy_subject = claim
+        .claim_id
+        .strip_prefix(CLAIM_SAFE_TO_DELETE_PREFIX)?
+        .strip_prefix(':')?;
+    let (context, entity) = legacy_subject
+        .split_once(':')
+        .unwrap_or(("", legacy_subject));
+    if entity.is_empty() {
+        None
+    } else {
+        Some((context.to_string(), entity.to_string()))
+    }
+}
+
 fn witness_count_from_value(result: &Value) -> usize {
     let direct = [
         "aggregates_referencing",
@@ -3257,16 +3279,13 @@ fn rebuild_safe_to_delete_rule(
     data: &MaterializedReasoningData,
     computed_at_us: i64,
 ) -> Result<PersistedReasoningClaim> {
-    let subject = parse_json_subject(&claim.subject);
-    let context = subject["context"].as_str().unwrap_or("");
-    let entity = subject["entity"].as_str().unwrap_or("");
-    if context.is_empty() || entity.is_empty() {
-        anyhow::bail!(
+    let (context, entity) = safe_to_delete_subject(claim).with_context(|| {
+        format!(
             "reasoning claim '{}' is missing safe_to_delete subject metadata",
             claim.claim_id
-        );
-    }
-    kernel.safe_to_delete_claim(workspace_path, context, entity, data, computed_at_us)
+        )
+    })?;
+    kernel.safe_to_delete_claim(workspace_path, &context, &entity, data, computed_at_us)
 }
 
 fn rebuild_how_connected_rule(
@@ -4560,5 +4579,53 @@ mod tests {
         assert!(!rebuilt.stale);
         assert_eq!(rebuilt.payload["reachable"], false);
         assert_eq!(rebuilt.status, "disconnected");
+    }
+
+    #[test]
+    fn test_legacy_safe_to_delete_claim_eager_refreshes_without_subject_metadata() {
+        let store = test_store();
+        let ws = "/tmp/test-reasoning-legacy-safe-to-delete-refresh";
+        let model = simple_model();
+        store.save_actual(ws, &model).unwrap();
+        store.compute_drift(ws).unwrap();
+
+        let mut legacy_claim = build_claim(
+            "safe_to_delete::CryptoError",
+            "safe_to_delete",
+            "",
+            "unknown",
+            "Legacy deletion-safety claim missing subject metadata.".into(),
+            json!({ "status": "unknown" }),
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![dependency("snapshot", "actual", 0)],
+            now_us(),
+            "deletion_safety",
+            "actual",
+        );
+        legacy_claim.stale = true;
+        store
+            .upsert_reasoning_claims(ws, std::slice::from_ref(&legacy_claim))
+            .unwrap();
+
+        let kernel = ReasoningKernel::new(&store);
+        let refreshed = kernel.eager_refresh_for_dependency(ws, "actual").unwrap();
+        assert!(
+            refreshed
+                .iter()
+                .any(|claim| claim.claim_id == legacy_claim.claim_id)
+        );
+
+        let rebuilt = store
+            .load_reasoning_claim(ws, &legacy_claim.claim_id)
+            .unwrap()
+            .unwrap();
+        let subject = parse_json_subject(&rebuilt.subject);
+        assert!(!rebuilt.stale);
+        assert_eq!(subject["context"], "");
+        assert_eq!(subject["entity"], "CryptoError");
+        assert_eq!(rebuilt.claim_kind, "safe_to_delete");
     }
 }
