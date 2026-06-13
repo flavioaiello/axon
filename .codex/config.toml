@@ -1,0 +1,5 @@
+[mcp_servers.axon]
+enabled = true
+command = "/opt/homebrew/bin/axon"
+cwd = ".."
+args = ["serve", "--workspace", "."]
