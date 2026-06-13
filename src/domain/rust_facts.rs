@@ -74,8 +74,28 @@ impl RustFeatureSelection {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RustScanOptions {
     pub scope: RustScanScope,
     pub features: RustFeatureSelection,
+    pub resolve_semantic_calls: bool,
+}
+
+impl Default for RustScanOptions {
+    fn default() -> Self {
+        Self {
+            scope: RustScanScope::default(),
+            features: RustFeatureSelection::default(),
+            resolve_semantic_calls: true,
+        }
+    }
+}
+
+impl RustScanOptions {
+    pub fn syntax_only() -> Self {
+        Self {
+            resolve_semantic_calls: false,
+            ..Self::default()
+        }
+    }
 }

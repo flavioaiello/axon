@@ -418,6 +418,60 @@ fn resolved_calls_are_queryable_via_graph() {
 }
 
 #[test]
+fn skipped_semantic_scan_preserves_previous_resolved_calls() {
+    use crate::domain::analyze::{ActualScan, SemanticResolution};
+    use crate::domain::rust_analyzer::ResolvedCall;
+
+    let store = temp_store();
+    let ws = "/tmp/skipped_semantic_ws";
+    let calls = vec![ResolvedCall {
+        caller: "Store::save_actual".into(),
+        callee: "Store::save_state".into(),
+        callee_file: "src/store/cozo.rs".into(),
+        callee_line: 410,
+    }];
+    assert_eq!(store.save_resolved_calls(ws, &calls).unwrap(), 1);
+
+    let skipped = ActualScan {
+        model: test_model("SkippedSemantic"),
+        resolved_calls: vec![],
+        semantic_resolution: SemanticResolution::Skipped {
+            reason: "startup syntax-only scan".into(),
+        },
+    };
+    store
+        .save_actual_scan_and_compute_drift(ws, &skipped)
+        .unwrap();
+    let q = store
+        .query_rust_graph(ws, &json!({ "view": "edges", "relation": "resolved_call" }))
+        .unwrap();
+    assert_eq!(
+        q["edges"].as_array().unwrap().len(),
+        1,
+        "syntax-only startup scans must preserve the last semantic generation"
+    );
+
+    let failed = ActualScan {
+        model: test_model("FailedSemantic"),
+        resolved_calls: vec![],
+        semantic_resolution: SemanticResolution::Failed {
+            error: "rust-analyzer failed".into(),
+        },
+    };
+    store
+        .save_actual_scan_and_compute_drift(ws, &failed)
+        .unwrap();
+    let q = store
+        .query_rust_graph(ws, &json!({ "view": "edges", "relation": "resolved_call" }))
+        .unwrap();
+    assert_eq!(
+        q["edges"].as_array().unwrap().len(),
+        0,
+        "failed semantic scans must clear stale resolved_call edges"
+    );
+}
+
+#[test]
 fn text_matches_is_precise_for_paths_but_fuzzy_for_symbols() {
     // Path/namespace-qualified needles require a full-substring match: a shared
     // segment like "src"/"domain" must NOT match an unrelated file (the bug).
