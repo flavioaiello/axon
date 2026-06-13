@@ -12,7 +12,7 @@ use std::path::Path;
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
-use super::transport;
+use super::stdio;
 
 /// Forward this process's stdio MCP session to the daemon at `socket_path`,
 /// scoped to `workspace`.
@@ -38,7 +38,7 @@ pub async fn try_bridge(socket_path: &Path, workspace: &str) -> Result<bool> {
     // Pump editor stdin → daemon and daemon → editor stdout concurrently.
     let stdin_to_daemon = async move {
         let mut stdin = BufReader::new(io::stdin());
-        while let Some(message) = transport::read_message(&mut stdin).await? {
+        while let Some(message) = stdio::read_message(&mut stdin).await? {
             let line = match serde_json::from_str::<serde_json::Value>(&message) {
                 Ok(value) => serde_json::to_string(&value)?,
                 Err(_) => message.trim().to_string(),
@@ -53,7 +53,7 @@ pub async fn try_bridge(socket_path: &Path, workspace: &str) -> Result<bool> {
         let mut stdout = io::stdout();
         let mut lines = BufReader::new(read_half).lines();
         while let Some(line) = lines.next_line().await? {
-            transport::write_message(&mut stdout, &line).await?;
+            stdio::write_message(&mut stdout, &line).await?;
         }
         Ok::<(), anyhow::Error>(())
     };
