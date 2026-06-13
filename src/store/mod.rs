@@ -126,6 +126,13 @@ impl CrateRegistry {
 fn discover_crate_roots(workspace_root: &Path) -> Vec<(String, PathBuf)> {
     let mut roots = Vec::new();
 
+    // Never scan from the filesystem root. GUI-launched MCP hosts can start
+    // children with cwd=/; walking from there can discover an unrelated Rust
+    // crate elsewhere on the machine and silently bind the session to it.
+    if workspace_root.parent().is_none() {
+        return roots;
+    }
+
     let root_cargo = workspace_root.join("Cargo.toml");
     let root_src = workspace_root.join("src");
 
@@ -171,4 +178,21 @@ fn discover_crate_roots(workspace_root: &Path) -> Vec<(String, PathBuf)> {
     }
 
     roots
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn crate_registry_rejects_filesystem_root_workspace() {
+        let err = match CrateRegistry::open(Path::new("/")) {
+            Ok(_) => panic!("root must not be a workspace"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("No crates found in workspace: /"),
+            "unexpected error: {err:#}"
+        );
+    }
 }

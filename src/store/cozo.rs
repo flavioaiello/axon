@@ -8567,7 +8567,12 @@ fn summarize_fact_snapshot(
 
 /// Normalize workspace path for consistent keying.
 pub fn canonicalize_path(path: &str) -> String {
-    let normalized = path.trim_end_matches('/');
+    let trimmed = path.trim_end_matches('/');
+    let normalized = if trimmed.is_empty() && path.starts_with('/') {
+        "/"
+    } else {
+        trimmed
+    };
     match std::fs::canonicalize(normalized) {
         Ok(p) => p.to_string_lossy().to_string(),
         Err(_) => normalized.to_string(),

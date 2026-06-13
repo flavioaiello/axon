@@ -328,6 +328,12 @@ fn temp_store() -> Store {
 }
 
 #[test]
+fn canonicalize_path_preserves_filesystem_root() {
+    assert_eq!(canonicalize_path("/"), "/");
+    assert_eq!(canonicalize_path("////"), "/");
+}
+
+#[test]
 fn resolved_calls_are_queryable_via_graph() {
     use crate::domain::rust_analyzer::ResolvedCall;
     let store = temp_store();

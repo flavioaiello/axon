@@ -87,7 +87,19 @@ async fn handle_connection(stream: UnixStream, registries: Registries) -> Result
     };
     let handshake: Handshake = serde_json::from_str(first.trim())
         .context("daemon: first line must be a {\"workspace\": ...} handshake")?;
-    let registry = ensure_registry(&registries, &handshake.workspace).await?;
+    let registry = match ensure_registry(&registries, &handshake.workspace).await {
+        Ok(registry) => registry,
+        Err(error) => {
+            serve_workspace_registration_error(
+                &mut lines,
+                &mut write_half,
+                &handshake.workspace,
+                &error,
+            )
+            .await?;
+            return Ok(());
+        }
+    };
 
     while let Some(line) = lines.next_line().await? {
         let line = line.trim();
@@ -109,6 +121,40 @@ async fn handle_connection(stream: UnixStream, registries: Registries) -> Result
             send_line(&mut write_half, &response).await?;
         }
     }
+    Ok(())
+}
+
+async fn serve_workspace_registration_error(
+    lines: &mut tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
+    write_half: &mut tokio::net::unix::OwnedWriteHalf,
+    workspace: &str,
+    error: &anyhow::Error,
+) -> Result<()> {
+    let message = format!(
+        "Workspace registration failed for '{}': {error:#}. Configure axon serve with \
+         `--workspace /path/to/rust/workspace` or set the MCP server cwd to a Rust workspace.",
+        workspace
+    );
+
+    while let Some(line) = lines.next_line().await? {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let request: JsonRpcRequest = match serde_json::from_str(line) {
+            Ok(r) => r,
+            Err(e) => {
+                let resp = JsonRpcResponse::error(None, -32700, format!("Parse error: {e}"));
+                send_line(write_half, &resp).await?;
+                continue;
+            }
+        };
+        if request.id.is_some() {
+            let resp = JsonRpcResponse::error(request.id, -32000, message.clone());
+            send_line(write_half, &resp).await?;
+        }
+    }
+
     Ok(())
 }
 
@@ -257,6 +303,67 @@ mod tests {
             1
         );
         assert_eq!(status["truth_maintenance"]["drift"]["entry_count"], 0);
+
+        let _ = std::fs::remove_file(&socket);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn daemon_invalid_workspace_returns_json_rpc_error() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        let root = std::env::temp_dir().join(format!("axon_empty_workspace_{unique}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let socket = std::path::PathBuf::from(format!("/tmp/axon_daemon_invalid_{unique}.sock"));
+        let socket_run = socket.clone();
+        tokio::spawn(async move {
+            if let Err(e) = run(&socket_run, 0).await {
+                eprintln!("daemon invalid-workspace test server failed: {e:#}");
+            }
+        });
+
+        let mut stream = None;
+        for _ in 0..100 {
+            match UnixStream::connect(&socket).await {
+                Ok(connected) => {
+                    stream = Some(connected);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+            }
+        }
+        let stream = stream.expect("connect daemon");
+        let (read_half, mut write_half) = stream.into_split();
+        let mut lines = BufReader::new(read_half).lines();
+
+        let handshake = serde_json::json!({ "workspace": root.to_string_lossy() }).to_string();
+        write_half.write_all(handshake.as_bytes()).await.unwrap();
+        write_half.write_all(b"\n").await.unwrap();
+        write_half
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n")
+            .await
+            .unwrap();
+        write_half.flush().await.unwrap();
+
+        let line = tokio::time::timeout(Duration::from_secs(5), lines.next_line())
+            .await
+            .expect("daemon error response timed out")
+            .unwrap()
+            .expect("daemon closed without error response");
+        let resp: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(resp["jsonrpc"], "2.0");
+        assert_eq!(resp["id"], 1);
+        assert_eq!(resp["error"]["code"], -32000);
+        assert!(
+            resp["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("--workspace"),
+            "error should explain how to configure a workspace: {line}"
+        );
 
         let _ = std::fs::remove_file(&socket);
         let _ = std::fs::remove_dir_all(&root);
