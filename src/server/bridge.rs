@@ -9,8 +9,10 @@
 use anyhow::Result;
 use serde_json::json;
 use std::path::Path;
+use std::sync::Arc;
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
+use tokio::sync::Mutex;
 
 use super::stdio;
 
@@ -35,13 +37,17 @@ pub async fn try_bridge(socket_path: &Path, workspace: &str) -> Result<bool> {
     write_half.write_all(b"\n").await?;
     write_half.flush().await?;
 
+    let client_format = Arc::new(Mutex::new(stdio::StdioFormat::Framed));
+
     // Pump editor stdin → daemon and daemon → editor stdout concurrently.
+    let stdin_client_format = Arc::clone(&client_format);
     let stdin_to_daemon = async move {
         let mut stdin = BufReader::new(io::stdin());
         while let Some(message) = stdio::read_message(&mut stdin).await? {
-            let line = match serde_json::from_str::<serde_json::Value>(&message) {
+            *stdin_client_format.lock().await = message.format;
+            let line = match serde_json::from_str::<serde_json::Value>(&message.body) {
                 Ok(value) => serde_json::to_string(&value)?,
-                Err(_) => message.trim().to_string(),
+                Err(_) => message.body.trim().to_string(),
             };
             write_half.write_all(line.as_bytes()).await?;
             write_half.write_all(b"\n").await?;
@@ -49,11 +55,13 @@ pub async fn try_bridge(socket_path: &Path, workspace: &str) -> Result<bool> {
         }
         Ok::<(), anyhow::Error>(())
     };
+    let stdout_client_format = Arc::clone(&client_format);
     let daemon_to_stdout = async move {
         let mut stdout = io::stdout();
         let mut lines = BufReader::new(read_half).lines();
         while let Some(line) = lines.next_line().await? {
-            stdio::write_message(&mut stdout, &line).await?;
+            let format = *stdout_client_format.lock().await;
+            stdio::write_message(&mut stdout, &line, format).await?;
         }
         Ok::<(), anyhow::Error>(())
     };

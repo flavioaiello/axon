@@ -8,11 +8,23 @@ use crate::mcp::handle_request_with_registry;
 use crate::mcp::protocol::{JsonRpcRequest, JsonRpcResponse};
 use crate::store::CrateRegistry;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StdioFormat {
+    Framed,
+    LineDelimited,
+}
+
+pub struct StdioMessage {
+    pub body: String,
+    pub format: StdioFormat,
+}
+
 /// Read one MCP stdio message.
 ///
 /// MCP clients use `Content-Length` frames. Older Axon tests and scripts used
-/// newline-delimited JSON, so this accepts both on input.
-pub async fn read_message<R>(reader: &mut R) -> Result<Option<String>>
+/// newline-delimited JSON, so this accepts both and records the input format so
+/// responses can use the same transport style.
+pub async fn read_message<R>(reader: &mut R) -> Result<Option<StdioMessage>>
 where
     R: AsyncBufRead + Unpin,
 {
@@ -28,10 +40,17 @@ where
         }
 
         if is_header_line(first) {
-            return read_framed_message(reader, first).await.map(Some);
+            let body = read_framed_message(reader, first).await?;
+            return Ok(Some(StdioMessage {
+                body,
+                format: StdioFormat::Framed,
+            }));
         }
 
-        return Ok(Some(first.to_string()));
+        return Ok(Some(StdioMessage {
+            body: first.to_string(),
+            format: StdioFormat::LineDelimited,
+        }));
     }
 }
 
@@ -41,16 +60,24 @@ where
     T: Serialize,
 {
     let message = serde_json::to_string(value)?;
-    write_message(writer, &message).await
+    write_message(writer, &message, StdioFormat::Framed).await
 }
 
-pub async fn write_message<W>(writer: &mut W, message: &str) -> Result<()>
+pub async fn write_message<W>(writer: &mut W, message: &str, format: StdioFormat) -> Result<()>
 where
     W: AsyncWrite + Unpin,
 {
-    let header = format!("Content-Length: {}\r\n\r\n", message.len());
-    writer.write_all(header.as_bytes()).await?;
-    writer.write_all(message.as_bytes()).await?;
+    match format {
+        StdioFormat::Framed => {
+            let header = format!("Content-Length: {}\r\n\r\n", message.len());
+            writer.write_all(header.as_bytes()).await?;
+            writer.write_all(message.as_bytes()).await?;
+        }
+        StdioFormat::LineDelimited => {
+            writer.write_all(message.as_bytes()).await?;
+            writer.write_all(b"\n").await?;
+        }
+    }
     writer.flush().await?;
     Ok(())
 }
@@ -68,18 +95,18 @@ pub async fn run(registry: std::sync::Arc<CrateRegistry>) -> Result<()> {
     tracing::info!("Axon stdio transport ready");
 
     while let Some(message) = read_message(&mut messages).await? {
-        let message = message.trim().to_string();
-        if message.is_empty() {
+        let body = message.body.trim().to_string();
+        if body.is_empty() {
             continue;
         }
 
-        tracing::debug!("← {}", message);
+        tracing::debug!("← {}", body);
 
-        let request: JsonRpcRequest = match serde_json::from_str(&message) {
+        let request: JsonRpcRequest = match serde_json::from_str(&body) {
             Ok(r) => r,
             Err(e) => {
                 let resp = JsonRpcResponse::error(None, -32700, format!("Parse error: {e}"));
-                send(&mut stdout, &resp).await?;
+                send(&mut stdout, &resp, message.format).await?;
                 continue;
             }
         };
@@ -88,16 +115,17 @@ pub async fn run(registry: std::sync::Arc<CrateRegistry>) -> Result<()> {
 
         // Notifications (no id) don't get a response
         if request.id.is_some() {
-            send(&mut stdout, &response).await?;
+            send(&mut stdout, &response, message.format).await?;
         }
     }
 
     Ok(())
 }
 
-async fn send(stdout: &mut io::Stdout, resp: &JsonRpcResponse) -> Result<()> {
+async fn send(stdout: &mut io::Stdout, resp: &JsonRpcResponse, format: StdioFormat) -> Result<()> {
     tracing::debug!("→ {}", serde_json::to_string(resp)?);
-    write_json(stdout, resp).await
+    let message = serde_json::to_string(resp)?;
+    write_message(stdout, &message, format).await
 }
 
 async fn read_framed_message<R>(reader: &mut R, first: &str) -> Result<String>
@@ -168,7 +196,8 @@ mod tests {
 
         let message = read_message(&mut reader).await.unwrap().expect("message");
 
-        assert_eq!(message, body);
+        assert_eq!(message.body, body);
+        assert_eq!(message.format, StdioFormat::Framed);
     }
 
     #[tokio::test]
@@ -179,18 +208,32 @@ mod tests {
 
         let message = read_message(&mut reader).await.unwrap().expect("message");
 
-        assert_eq!(message, body);
+        assert_eq!(message.body, body);
+        assert_eq!(message.format, StdioFormat::LineDelimited);
     }
 
     #[tokio::test]
     async fn writes_content_length_frame() {
         let mut output = Vec::new();
 
-        write_message(&mut output, "{}").await.unwrap();
+        write_message(&mut output, "{}", StdioFormat::Framed)
+            .await
+            .unwrap();
 
         assert_eq!(
             String::from_utf8(output).unwrap(),
             "Content-Length: 2\r\n\r\n{}"
         );
+    }
+
+    #[tokio::test]
+    async fn writes_legacy_newline_json() {
+        let mut output = Vec::new();
+
+        write_message(&mut output, "{}", StdioFormat::LineDelimited)
+            .await
+            .unwrap();
+
+        assert_eq!(String::from_utf8(output).unwrap(), "{}\n");
     }
 }
