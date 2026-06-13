@@ -1,6 +1,7 @@
 pub mod bridge;
 pub mod daemon;
 pub mod stdio;
+pub mod transport;
 pub mod watcher;
 pub mod web;
 

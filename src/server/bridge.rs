@@ -12,6 +12,8 @@ use std::path::Path;
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
+use super::transport;
+
 /// Forward this process's stdio MCP session to the daemon at `socket_path`,
 /// scoped to `workspace`.
 ///
@@ -35,8 +37,12 @@ pub async fn try_bridge(socket_path: &Path, workspace: &str) -> Result<bool> {
 
     // Pump editor stdin → daemon and daemon → editor stdout concurrently.
     let stdin_to_daemon = async move {
-        let mut lines = BufReader::new(io::stdin()).lines();
-        while let Some(line) = lines.next_line().await? {
+        let mut stdin = BufReader::new(io::stdin());
+        while let Some(message) = transport::read_message(&mut stdin).await? {
+            let line = match serde_json::from_str::<serde_json::Value>(&message) {
+                Ok(value) => serde_json::to_string(&value)?,
+                Err(_) => message.trim().to_string(),
+            };
             write_half.write_all(line.as_bytes()).await?;
             write_half.write_all(b"\n").await?;
             write_half.flush().await?;
@@ -47,9 +53,7 @@ pub async fn try_bridge(socket_path: &Path, workspace: &str) -> Result<bool> {
         let mut stdout = io::stdout();
         let mut lines = BufReader::new(read_half).lines();
         while let Some(line) = lines.next_line().await? {
-            stdout.write_all(line.as_bytes()).await?;
-            stdout.write_all(b"\n").await?;
-            stdout.flush().await?;
+            transport::write_message(&mut stdout, &line).await?;
         }
         Ok::<(), anyhow::Error>(())
     };

@@ -1,8 +1,9 @@
 use anyhow::Result;
-use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{self, BufReader};
 
 use crate::mcp::handle_request_with_registry;
 use crate::mcp::protocol::{JsonRpcRequest, JsonRpcResponse};
+use crate::server::transport;
 use crate::store::CrateRegistry;
 
 /// Run the MCP server over stdio (stdin/stdout), the standard transport for
@@ -13,19 +14,19 @@ use crate::store::CrateRegistry;
 pub async fn run(registry: std::sync::Arc<CrateRegistry>) -> Result<()> {
     let stdin = BufReader::new(io::stdin());
     let mut stdout = io::stdout();
-    let mut lines = stdin.lines();
+    let mut messages = stdin;
 
     tracing::info!("Axon stdio transport ready");
 
-    while let Some(line) = lines.next_line().await? {
-        let line = line.trim().to_string();
-        if line.is_empty() {
+    while let Some(message) = transport::read_message(&mut messages).await? {
+        let message = message.trim().to_string();
+        if message.is_empty() {
             continue;
         }
 
-        tracing::debug!("← {}", line);
+        tracing::debug!("← {}", message);
 
-        let request: JsonRpcRequest = match serde_json::from_str(&line) {
+        let request: JsonRpcRequest = match serde_json::from_str(&message) {
             Ok(r) => r,
             Err(e) => {
                 let resp = JsonRpcResponse::error(None, -32700, format!("Parse error: {e}"));
@@ -46,10 +47,6 @@ pub async fn run(registry: std::sync::Arc<CrateRegistry>) -> Result<()> {
 }
 
 async fn send(stdout: &mut io::Stdout, resp: &JsonRpcResponse) -> Result<()> {
-    let json = serde_json::to_string(resp)?;
-    tracing::debug!("→ {}", json);
-    stdout.write_all(json.as_bytes()).await?;
-    stdout.write_all(b"\n").await?;
-    stdout.flush().await?;
-    Ok(())
+    tracing::debug!("→ {}", serde_json::to_string(resp)?);
+    transport::write_json(stdout, resp).await
 }
