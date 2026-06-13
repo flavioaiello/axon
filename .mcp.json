@@ -1,8 +1,9 @@
 {
   "mcpServers": {
     "axon": {
+      "type": "stdio",
       "command": "/opt/homebrew/bin/axon",
-      "args": ["serve"]
+      "args": ["serve", "--workspace", "${CLAUDE_PROJECT_DIR:-.}"]
     }
   }
 }

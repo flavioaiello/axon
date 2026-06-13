@@ -15,6 +15,7 @@ use tokio::net::UnixStream;
 use tokio::sync::Mutex;
 
 use super::stdio;
+use crate::store::canonicalize_path;
 
 /// Forward this process's stdio MCP session to the daemon at `socket_path`,
 /// scoped to `workspace`.
@@ -31,8 +32,10 @@ pub async fn try_bridge(socket_path: &Path, workspace: &str) -> Result<bool> {
 
     let (read_half, mut write_half) = stream.into_split();
 
-    // Handshake: scope the session to this workspace.
-    let handshake = json!({ "workspace": workspace }).to_string();
+    // Handshake: scope the session to this workspace. Resolve relative paths in
+    // the editor-spawned child before crossing into the long-running daemon,
+    // whose cwd is commonly `/` under launchd/Homebrew.
+    let handshake = workspace_handshake(workspace);
     write_half.write_all(handshake.as_bytes()).await?;
     write_half.write_all(b"\n").await?;
     write_half.flush().await?;
@@ -80,4 +83,24 @@ pub async fn try_bridge(socket_path: &Path, workspace: &str) -> Result<bool> {
     }
 
     Ok(true)
+}
+
+fn workspace_handshake(workspace: &str) -> String {
+    json!({ "workspace": canonicalize_path(workspace) }).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workspace_handshake_canonicalizes_relative_workspace() {
+        let cwd = std::env::current_dir().unwrap();
+        let handshake: serde_json::Value = serde_json::from_str(&workspace_handshake(".")).unwrap();
+
+        assert_eq!(
+            handshake["workspace"],
+            cwd.canonicalize().unwrap().to_string_lossy().as_ref()
+        );
+    }
 }

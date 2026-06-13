@@ -201,12 +201,13 @@ Codex stores MCP servers in TOML. For a project-shared setup, add
 ```toml
 [mcp_servers.axon]
 command = "/opt/homebrew/bin/axon"
-cwd = ".."
 args = ["serve", "--workspace", "."]
 ```
 
-The project config lives in `.codex/`, so `cwd = ".."` starts axon from the
-repository root before resolving `--workspace .`.
+Leave `cwd` unset here. Codex starts the MCP child in the session workspace,
+and axon's bridge canonicalizes `--workspace .` before handing the session to
+the long-running daemon. That keeps project configs portable and avoids making
+workspace resolution depend on the MCP launcher process.
 
 For a private user-level setup shared by Codex CLI and the Codex IDE extension,
 put the same table in `~/.codex/config.toml` with an absolute workspace path:
