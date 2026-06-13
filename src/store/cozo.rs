@@ -708,15 +708,9 @@ impl Store {
     ) -> Result<usize> {
         self.with_write_lock(|| {
             self.save_actual(workspace_path, &scan.model)?;
-            // Failed semantic resolution replaces the relation with an empty
-            // generation so stale edges do not linger. Intentionally skipped
-            // startup scans leave the last semantic generation intact.
-            if !matches!(
-                scan.semantic_resolution,
-                crate::domain::analyze::SemanticResolution::Skipped { .. }
-            ) {
-                self.save_resolved_calls(workspace_path, &scan.resolved_calls)?;
-            }
+            // Even on semantic-resolution failure, `resolved_calls` is empty;
+            // persisting it retracts stale resolved_call rows from earlier scans.
+            self.save_resolved_calls(workspace_path, &scan.resolved_calls)?;
             self.compute_drift(workspace_path)
         })
     }

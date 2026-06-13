@@ -21,7 +21,6 @@ pub use super::ast::*;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SemanticResolution {
     Resolved,
-    Skipped { reason: String },
     Failed { error: String },
 }
 
@@ -45,16 +44,6 @@ pub fn scan_actual_graph_with_options(
     options: &RustScanOptions,
 ) -> Result<ActualScan> {
     let model = scan_actual_model(workspace_root, desired)?;
-    if !options.resolve_semantic_calls {
-        return Ok(ActualScan {
-            model,
-            resolved_calls: Vec::new(),
-            semantic_resolution: SemanticResolution::Skipped {
-                reason: "semantic call resolution disabled for this scan profile".to_string(),
-            },
-        });
-    }
-
     match rust_analyzer::resolve_calls_with_options(workspace_root, options) {
         Ok(resolved_calls) => Ok(ActualScan {
             model,

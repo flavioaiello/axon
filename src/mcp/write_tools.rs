@@ -420,8 +420,9 @@ fn dispatch_write_tool(
                         persisted_call_edges: None,
                         resolved_call_edges: scan.resolved_calls.len(),
                         persisted_resolved_call_edges: None,
-                        semantic_resolution_status: semantic_resolution_status(
-                            &scan.semantic_resolution,
+                        semantic_resolution_succeeded: matches!(
+                            scan.semantic_resolution,
+                            SemanticResolution::Resolved
                         ),
                     };
 
@@ -508,7 +509,7 @@ fn dispatch_write_tool(
                                     "resolved_call_edges": counts.persisted_resolved_call_edges.unwrap_or(counts.resolved_call_edges),
                                     "extracted_resolved_call_edges": counts.resolved_call_edges,
                                     "persisted_resolved_call_edges": counts.persisted_resolved_call_edges,
-                                    "semantic_resolution": counts.semantic_resolution_status,
+                                    "semantic_resolution": if counts.semantic_resolution_succeeded { "resolved" } else { "failed" },
                                 },
                                 "reasoning_cache_warnings": follow_on_failures,
                                 "follow_on_failures": follow_on_failures,
@@ -517,7 +518,7 @@ fn dispatch_write_tool(
                             });
                             let limitations = sync_limitations(
                                 drift_entry_count.is_none(),
-                                counts.semantic_resolution_status == "failed",
+                                !counts.semantic_resolution_succeeded,
                             );
 
                             reasoning_result(
@@ -1740,11 +1741,7 @@ fn rust_scan_options_from_args(args: &Value) -> Result<RustScanOptions, String> 
     let scope = rust_scan_scope_from_args(args)?;
     let features = rust_feature_selection_from_value(args.get("features"))?;
 
-    Ok(RustScanOptions {
-        scope,
-        features,
-        ..RustScanOptions::default()
-    })
+    Ok(RustScanOptions { scope, features })
 }
 
 fn rust_scan_scope_from_args(args: &Value) -> Result<RustScanScope, String> {
@@ -1802,12 +1799,10 @@ fn rust_feature_diff_options_from_args(
         RustScanOptions {
             scope: scope.clone(),
             features: base_features,
-            ..RustScanOptions::default()
         },
         RustScanOptions {
             scope,
             features: compare_features,
-            ..RustScanOptions::default()
         },
     ))
 }
@@ -1851,7 +1846,6 @@ fn rust_feature_selection_from_mode(
 fn rust_scan_options_json(options: &RustScanOptions) -> Value {
     json!({
         "scope": options.scope.as_str(),
-        "semantic_calls": if options.resolve_semantic_calls { "enabled" } else { "skipped" },
         "features": {
             "mode": options.features.mode(),
             "selected": options.features.selected_features(),
@@ -1909,22 +1903,10 @@ fn scan_counts_json(scan: &ActualScan) -> Value {
 fn semantic_resolution_json(resolution: &SemanticResolution) -> Value {
     match resolution {
         SemanticResolution::Resolved => json!({ "status": "resolved" }),
-        SemanticResolution::Skipped { reason } => json!({
-            "status": "skipped",
-            "reason": reason,
-        }),
         SemanticResolution::Failed { error } => json!({
             "status": "failed",
             "error": error,
         }),
-    }
-}
-
-fn semantic_resolution_status(resolution: &SemanticResolution) -> &'static str {
-    match resolution {
-        SemanticResolution::Resolved => "resolved",
-        SemanticResolution::Skipped { .. } => "skipped",
-        SemanticResolution::Failed { .. } => "failed",
     }
 }
 
@@ -2439,7 +2421,7 @@ struct SyncCounts {
     persisted_call_edges: Option<usize>,
     resolved_call_edges: usize,
     persisted_resolved_call_edges: Option<usize>,
-    semantic_resolution_status: &'static str,
+    semantic_resolution_succeeded: bool,
 }
 
 fn build_sync_report(
@@ -2520,7 +2502,7 @@ fn build_sync_report(
         "resolved_call_edges": persisted_resolved_call_edges,
         "extracted_resolved_call_edges": counts.resolved_call_edges,
         "persisted_resolved_call_edges": counts.persisted_resolved_call_edges,
-        "semantic_resolution": counts.semantic_resolution_status,
+        "semantic_resolution": if counts.semantic_resolution_succeeded { "resolved" } else { "failed" },
         "implemented_state_saved": true,
         "had_previous_snapshot": had_previous,
         "drift_recomputed": drift_recomputed,
@@ -2803,7 +2785,7 @@ mod tests {
                 persisted_call_edges: Some(7),
                 resolved_call_edges: 5,
                 persisted_resolved_call_edges: Some(5),
-                semantic_resolution_status: "resolved",
+                semantic_resolution_succeeded: true,
             },
             false,
             Some(5),
@@ -2906,7 +2888,7 @@ mod tests {
                 persisted_call_edges: None,
                 resolved_call_edges: 0,
                 persisted_resolved_call_edges: None,
-                semantic_resolution_status: "failed",
+                semantic_resolution_succeeded: false,
             },
             false,
             None,
@@ -2945,7 +2927,7 @@ mod tests {
                 persisted_call_edges: Some(1),
                 resolved_call_edges: 0,
                 persisted_resolved_call_edges: Some(0),
-                semantic_resolution_status: "failed",
+                semantic_resolution_succeeded: false,
             },
             false,
             Some(0),
@@ -2957,37 +2939,6 @@ mod tests {
         assert_eq!(report["semantic_resolution"], "failed");
         assert_eq!(report["resolved_call_edges"], 0);
         assert!(report["follow_on_failures"].as_array().unwrap().is_empty());
-    }
-
-    #[test]
-    fn test_build_sync_report_surfaces_skipped_semantic_resolution() {
-        let report = build_sync_report(
-            SyncCounts {
-                contexts_scanned: 1,
-                entities: 1,
-                value_objects: 0,
-                services: 0,
-                repositories: 0,
-                events: 0,
-                source_files: 1,
-                symbols: 1,
-                import_edges: 1,
-                persisted_import_edges: Some(1),
-                reference_edges: 1,
-                persisted_reference_edges: Some(1),
-                call_edges: 1,
-                persisted_call_edges: Some(1),
-                resolved_call_edges: 0,
-                persisted_resolved_call_edges: Some(3),
-                semantic_resolution_status: "skipped",
-            },
-            true,
-            Some(0),
-            &[],
-        );
-
-        assert_eq!(report["semantic_resolution"], "skipped");
-        assert_eq!(report["resolved_call_edges"], 3);
     }
 
     #[test]

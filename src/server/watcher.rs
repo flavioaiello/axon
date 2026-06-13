@@ -1,5 +1,4 @@
-use crate::domain::analyze::{SemanticResolution, scan_actual_graph_with_options};
-use crate::domain::rust_facts::RustScanOptions;
+use crate::domain::analyze::{SemanticResolution, scan_actual_graph};
 use crate::store::CrateRegistry;
 use anyhow::Result;
 use notify::{Event, RecursiveMode, Watcher};
@@ -115,11 +114,9 @@ async fn sync_all_crates(registry: &CrateRegistry) -> Result<()> {
         // The previous implemented graph is optional enrichment, not a gate.
         let previous = entry.store.load_actual(&ws)?;
 
-        // Startup/watch sync must stay responsive. It refreshes the syntax
-        // graph and preserves the last semantic call generation, while explicit
-        // rust_scan requests can still run rust-analyzer call resolution.
-        let scan_options = RustScanOptions::syntax_only();
-        let scan = scan_actual_graph_with_options(&entry.root, previous.as_ref(), &scan_options)?;
+        // Full bottom-up scan scoped to this crate's root, including semantic
+        // enrichment when rust-analyzer can resolve the current workspace.
+        let scan = scan_actual_graph(&entry.root, previous.as_ref())?;
 
         // Save into this crate's local store and refresh temporal drift as one operation.
         let drift_count = entry.store.save_actual_scan_and_compute_drift(&ws, &scan)?;
