@@ -112,7 +112,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         // Default: serve from cwd, bridging to the shared daemon (daemon-only).
-        None => serve_via_daemon(resolve_workspace_for_serve(None)?).await?,
+        None => serve_via_daemon_or_workspace_error(None).await?,
 
         Some(Commands::Serve {
             workspace,
@@ -123,8 +123,7 @@ async fn main() -> Result<()> {
                 let workspace = resolve_workspace(workspace)?;
                 run_standalone(workspace, web_port).await?;
             } else {
-                let workspace = resolve_workspace_for_serve(workspace)?;
-                serve_via_daemon(workspace).await?;
+                serve_via_daemon_or_workspace_error(workspace).await?;
             }
         }
 
@@ -299,29 +298,6 @@ fn resolve_workspace(workspace: Option<String>) -> Result<String> {
     Ok(workspace.to_string_lossy().into_owned())
 }
 
-fn resolve_workspace_for_serve(workspace: Option<String>) -> Result<String> {
-    if let Some(workspace) = workspace {
-        return Ok(workspace);
-    }
-
-    let cwd = std::env::current_dir().context("cannot determine current directory")?;
-    let (workspace, inferred) = infer_workspace_or_cwd_for_serve(&cwd);
-    if !inferred {
-        tracing::warn!(
-            "no Cargo workspace or package found at or above {}; using current directory so the MCP client receives a JSON-RPC workspace error instead of a closed connection",
-            cwd.display()
-        );
-    }
-    Ok(workspace.to_string_lossy().into_owned())
-}
-
-fn infer_workspace_or_cwd_for_serve(start: &Path) -> (PathBuf, bool) {
-    match infer_workspace_from(start) {
-        Some(workspace) => (workspace, true),
-        None => (canonicalize_or_self(start), false),
-    }
-}
-
 fn infer_workspace_from(start: &Path) -> Option<PathBuf> {
     let start = if start.is_file() {
         start.parent()?
@@ -415,6 +391,65 @@ async fn serve_via_daemon(workspace: String) -> Result<()> {
     )
 }
 
+async fn serve_via_daemon_or_workspace_error(workspace: Option<String>) -> Result<()> {
+    match resolve_workspace(workspace) {
+        Ok(workspace) => serve_via_daemon(workspace).await,
+        Err(error) => serve_workspace_resolution_error(error).await,
+    }
+}
+
+async fn serve_workspace_resolution_error(error: anyhow::Error) -> Result<()> {
+    tracing::warn!(
+        "workspace resolution failed before MCP daemon bridge startup: {error:#}; serving JSON-RPC errors until the client closes stdin"
+    );
+    let stdin = tokio::io::BufReader::new(tokio::io::stdin());
+    let mut stdout = tokio::io::stdout();
+    serve_static_workspace_error(stdin, &mut stdout, format!("{error:#}")).await
+}
+
+async fn serve_static_workspace_error<R, W>(
+    mut reader: R,
+    writer: &mut W,
+    error_message: String,
+) -> Result<()>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    while let Some(mcp_message) = server::stdio::read_message(&mut reader).await? {
+        let body = mcp_message.body.trim();
+        if body.is_empty() {
+            continue;
+        }
+
+        let request: axon::mcp::protocol::JsonRpcRequest = match serde_json::from_str(body) {
+            Ok(request) => request,
+            Err(error) => {
+                let response = axon::mcp::protocol::JsonRpcResponse::error(
+                    None,
+                    -32700,
+                    format!("Parse error: {error}"),
+                );
+                let response = serde_json::to_string(&response)?;
+                server::stdio::write_message(writer, &response, mcp_message.format).await?;
+                continue;
+            }
+        };
+
+        if request.id.is_some() {
+            let response = axon::mcp::protocol::JsonRpcResponse::error(
+                request.id,
+                -32000,
+                error_message.clone(),
+            );
+            let response = serde_json::to_string(&response)?;
+            server::stdio::write_message(writer, &response, mcp_message.format).await?;
+        }
+    }
+
+    Ok(())
+}
+
 /// The original single-workspace in-process server: builds a registry, starts a
 /// watcher and the web graph, and serves MCP over stdio.
 async fn run_standalone(workspace: String, web_port: u16) -> Result<()> {
@@ -502,17 +537,28 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    #[test]
-    fn serve_workspace_resolution_falls_back_to_cwd_without_cargo() {
-        let root = temp_root("axon_workspace_resolution_serve_empty");
-        let nested = root.join("nested");
-        std::fs::create_dir_all(&nested).unwrap();
+    #[tokio::test]
+    async fn workspace_resolution_error_is_reported_over_stdio() {
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#;
+        let input = format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
+        let mut output = Vec::new();
 
-        let (workspace, inferred) = infer_workspace_or_cwd_for_serve(&nested);
+        serve_static_workspace_error(
+            tokio::io::BufReader::new(input.as_bytes()),
+            &mut output,
+            "no Cargo workspace".into(),
+        )
+        .await
+        .unwrap();
 
-        assert!(!inferred);
-        assert_eq!(workspace, nested.canonicalize().unwrap());
+        let output = String::from_utf8(output).unwrap();
+        let (_, response) = output.split_once("\r\n\r\n").unwrap();
+        let response: serde_json::Value = serde_json::from_str(response).unwrap();
 
-        let _ = std::fs::remove_dir_all(root);
+        assert_eq!(response["error"]["code"], -32000);
+        assert!(response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("no Cargo workspace"));
     }
 }
