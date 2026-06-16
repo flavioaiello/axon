@@ -556,9 +556,11 @@ mod tests {
         let response: serde_json::Value = serde_json::from_str(response).unwrap();
 
         assert_eq!(response["error"]["code"], -32000);
-        assert!(response["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("no Cargo workspace"));
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("no Cargo workspace")
+        );
     }
 }
