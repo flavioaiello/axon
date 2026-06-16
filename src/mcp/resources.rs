@@ -1,5 +1,5 @@
 use super::load_actual_model;
-use crate::mcp::protocol::*;
+use crate::mcp::protocol::{ResourceContent, ResourceDefinition, ResourceReadResult};
 use crate::mcp::tools::build_model_overview;
 use crate::store::Store;
 

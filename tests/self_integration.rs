@@ -14,6 +14,13 @@
 //!   8. **refactor(reset)** → revert desired to actual
 //!   9. **Datalog reasoning** → prove value: queries impossible without the graph
 
+#![allow(
+    clippy::expect_used,
+    clippy::print_stderr,
+    clippy::todo,
+    clippy::unwrap_used
+)]
+
 use serde_json::{Value, json};
 use std::env::temp_dir;
 use std::sync::atomic::{AtomicU64, Ordering};

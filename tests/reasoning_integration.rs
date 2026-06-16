@@ -9,6 +9,8 @@
 //!   • `*_with`:    uses field/method/invariant/vo_rule relations → answer
 //!   • `*_without`: uses only entity/service/event headers → no answer (or imprecise)
 
+#![allow(clippy::expect_used, clippy::print_stderr, clippy::unwrap_used)]
+
 use std::env::temp_dir;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;

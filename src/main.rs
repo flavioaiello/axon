@@ -1,13 +1,33 @@
+#![cfg_attr(
+    test,
+    allow(
+        clippy::expect_used,
+        clippy::panic,
+        clippy::print_stderr,
+        clippy::print_stdout,
+        clippy::todo,
+        clippy::unwrap_used
+    )
+)]
+
 use axon::domain;
 use axon::server;
 use axon::store;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use std::fmt;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use tracing_subscriber::EnvFilter;
 
 const AXON_VERSION: &str = axon::VERSION;
+
+macro_rules! status {
+    ($($arg:tt)*) => {
+        write_status(format_args!($($arg)*))
+    };
+}
 
 #[derive(Parser)]
 #[command(
@@ -161,17 +181,19 @@ async fn main() -> Result<()> {
             let entry = registry.primary();
             let ws = entry.workspace_key();
             entry.store.export_to_file(&ws, &file, &state)?;
-            eprintln!(
+            status!(
                 "Exported {} model for crate '{}' to: {}",
-                state, entry.name, file
-            );
+                state,
+                entry.name,
+                file
+            )?;
         }
 
         Some(Commands::List { workspace }) => {
             let workspace = resolve_workspace(workspace)?;
             let registry = store::CrateRegistry::open(std::path::Path::new(&workspace))?;
-            eprintln!("{:<25} {:<55} STATUS", "CRATE", "PATH");
-            eprintln!("{}", "-".repeat(90));
+            status!("{:<25} {:<55} STATUS", "CRATE", "PATH")?;
+            status!("{}", "-".repeat(90))?;
             for entry in registry.crates() {
                 let ws = entry.workspace_key();
                 let has_model = entry
@@ -181,9 +203,9 @@ async fn main() -> Result<()> {
                     .flatten()
                     .is_some_and(|m| !m.bounded_contexts.is_empty());
                 let status = if has_model { "has model" } else { "no model" };
-                eprintln!("{:<25} {:<55} {}", entry.name, ws, status);
+                status!("{:<25} {:<55} {}", entry.name, ws, status)?;
             }
-            eprintln!("\n{} crate(s) total", registry.crates().len());
+            status!("\n{} crate(s) total", registry.crates().len())?;
         }
 
         Some(Commands::Check { workspace }) => {
@@ -191,16 +213,16 @@ async fn main() -> Result<()> {
             for entry in registry.crates() {
                 let ws = entry.workspace_key();
                 let live_deps = domain::analyze::scan_workspace(&entry.root)?;
-                eprintln!("Crate '{}': {} live imports.", entry.name, live_deps.len());
+                status!("Crate '{}': {} live imports.", entry.name, live_deps.len())?;
                 match entry.store.check_live_dependencies(&ws, &live_deps) {
                     Ok(violations) => {
                         if violations.is_empty() {
-                            eprintln!("  No architectural layer violations found.");
+                            status!("  No architectural layer violations found.")?;
                         } else {
-                            eprintln!("  Violations found: {:?}", violations);
+                            status!("  Violations found: {:?}", violations)?;
                         }
                     }
-                    Err(e) => eprintln!("  Failed to check: {}", e),
+                    Err(e) => status!("  Failed to check: {}", e)?,
                 }
             }
         }
@@ -247,7 +269,7 @@ async fn main() -> Result<()> {
 
                 let drift_count = entry.store.save_actual_scan_and_compute_drift(&ws, &scan)?;
 
-                eprintln!(
+                status!(
                     "Crate '{}': {} contexts -> {} entities, {} VOs, {} services, {} repos, {} events; {} files, {} symbols, {} imports, {} references, {} calls, {} resolved calls; {} temporal changes",
                     entry.name,
                     actual.bounded_contexts.len(),
@@ -263,22 +285,30 @@ async fn main() -> Result<()> {
                     call_edge_count,
                     resolved_call_count,
                     drift_count
-                );
+                )?;
                 if let domain::analyze::SemanticResolution::Failed { error } =
                     &scan.semantic_resolution
                 {
-                    eprintln!(
+                    status!(
                         "  rust-analyzer semantic resolution failed; resolved_call edges cleared: {error}"
-                    );
+                    )?;
                 }
             }
-            eprintln!(
+            status!(
                 "Implemented model saved for {} crate(s).",
                 registry.crates().len()
-            );
+            )?;
         }
     }
 
+    Ok(())
+}
+
+fn write_status(args: fmt::Arguments<'_>) -> Result<()> {
+    let stderr = std::io::stderr();
+    let mut lock = stderr.lock();
+    lock.write_fmt(args)?;
+    lock.write_all(b"\n")?;
     Ok(())
 }
 

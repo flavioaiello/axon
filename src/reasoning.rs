@@ -10,7 +10,15 @@ use crate::store::{
 };
 
 mod claims;
-use claims::*;
+use claims::{
+    CANONICAL_CLAIM_IDS, CLAIM_ARCHITECTURE_OVERVIEW, CLAIM_CHECK_AGGREGATE_QUALITY,
+    CLAIM_CHECK_ALL, CLAIM_CHECK_CIRCULAR_DEPS, CLAIM_CHECK_DRIFT, CLAIM_CHECK_LAYER_VIOLATIONS,
+    CLAIM_CHECK_ORPHAN_CONTEXTS, CLAIM_CHECK_POLICY_VIOLATIONS, CLAIM_DIAGNOSE_REFACTOR,
+    CLAIM_DRIFT_OVERVIEW, CLAIM_HISTORY_PREFIX, CLAIM_HOW_CONNECTED_PREFIX, CLAIM_IMPACT_PREFIX,
+    CLAIM_REFACTOR_PLAN, CLAIM_SAFE_TO_DELETE_PREFIX, CLAIM_SEARCH_PREFIX,
+    CLAIM_WHY_AGGREGATE_QUALITY, CLAIM_WHY_CIRCULAR_DEPS, CLAIM_WHY_LAYER_VIOLATIONS,
+    CLAIM_WHY_ORPHAN_CONTEXTS, CLAIM_WHY_POLICY_VIOLATIONS,
+};
 
 type CanonicalClaimBuilder = for<'a> fn(
     &ReasoningKernel<'a>,
@@ -235,7 +243,7 @@ impl<'a> ReasoningKernel<'a> {
     }
 
     fn ensure_fresh(&self, workspace_path: &str, claim_id: &str) -> Result<()> {
-        self.store.reload_persisted_policy(workspace_path)?;
+        self.store.refresh_runtime_constraints(workspace_path)?;
         let refresh_needed = match self.store.load_reasoning_claim(workspace_path, claim_id)? {
             Some(claim) => claim.stale,
             None => true,
@@ -257,7 +265,7 @@ impl<'a> ReasoningKernel<'a> {
     where
         F: FnOnce(&Self, i64, &MaterializedReasoningData) -> Result<PersistedReasoningClaim>,
     {
-        self.store.reload_persisted_policy(workspace_path)?;
+        self.store.refresh_runtime_constraints(workspace_path)?;
         if let Some(claim) = self.store.load_reasoning_claim(workspace_path, claim_id)? {
             let basis = self.snapshot_basis(workspace_path)?;
             if !claim.stale && claim_dependencies_match_basis(&claim, &basis) {
@@ -618,10 +626,12 @@ impl<'a> ReasoningKernel<'a> {
             ),
         };
         let status = payload["status"].as_str().unwrap_or(mode).to_string();
-        let witness_count = payload["count"]
-            .as_u64()
-            .or_else(|| payload["summary"]["total_changes"].as_u64())
-            .unwrap_or(0) as usize;
+        let witness_count = u64_to_usize_saturating(
+            payload["count"]
+                .as_u64()
+                .or_else(|| payload["summary"]["total_changes"].as_u64())
+                .unwrap_or(0),
+        );
 
         Ok(build_claim(
             &history_claim_id(args),
@@ -675,9 +685,9 @@ impl<'a> ReasoningKernel<'a> {
         computed_at_us: i64,
     ) -> Result<PersistedReasoningClaim> {
         let query = subject["query"].as_str().unwrap_or("");
-        let limit = subject["limit"].as_u64().unwrap_or(20) as usize;
+        let limit = u64_to_usize_saturating(subject["limit"].as_u64().unwrap_or(20));
         let payload = self.store.search_text(workspace_path, query, limit)?;
-        let count = payload["count"].as_u64().unwrap_or(0) as usize;
+        let count = u64_to_usize_saturating(payload["count"].as_u64().unwrap_or(0));
         let includes_rust_fact_results = payload["results"].as_array().is_some_and(|results| {
             results.iter().any(|result| {
                 result["search_mode"].as_str() == Some("rust_fact_scan")
@@ -1487,9 +1497,13 @@ impl<'a> ReasoningKernel<'a> {
             .as_array()
             .cloned()
             .unwrap_or_default();
-        let count = data.policy_result["count"].as_u64().unwrap_or(0) as usize;
+        let count = u64_to_usize_saturating(data.policy_result["count"].as_u64().unwrap_or(0));
         let configured = data.policy_result["configured"].as_bool().unwrap_or(false);
         let policy_coverage = data.policy_result["policy_coverage"].clone();
+        let accepted_deviations = data.policy_result["accepted_deviations"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
         let mut limitations = vec![
             "Policy evaluation depends on declared constraints and stored implemented dependencies."
                 .into(),
@@ -1500,6 +1514,12 @@ impl<'a> ReasoningKernel<'a> {
                     .into(),
             );
         }
+        if !accepted_deviations.is_empty() {
+            limitations.push(
+                "Accepted runtime architecture deviations are warnings, not invariant failures."
+                    .into(),
+            );
+        }
         build_claim(
             CLAIM_CHECK_POLICY_VIOLATIONS,
             "check",
@@ -1507,6 +1527,11 @@ impl<'a> ReasoningKernel<'a> {
             data.policy_result["status"].as_str().unwrap_or("unknown"),
             if !configured {
                 "Policy constraints are not fully configured.".into()
+            } else if violations.is_empty() && !accepted_deviations.is_empty() {
+                format!(
+                    "No policy violations detected; {} accepted runtime deviation(s) were observed.",
+                    accepted_deviations.len()
+                )
             } else if violations.is_empty() {
                 "No policy violations detected.".into()
             } else {
@@ -1519,6 +1544,9 @@ impl<'a> ReasoningKernel<'a> {
                 "policy_coverage": policy_coverage,
                 "violations": data.policy_result["violations"],
                 "count": data.policy_result["count"],
+                "accepted_deviations": data.policy_result["accepted_deviations"],
+                "accepted_deviation_count": data.policy_result["accepted_deviation_count"],
+                "warnings": data.policy_result["warnings"],
             }),
             vec![ReasoningDerivation {
                 rule: "dependency MUST_NOT violate declared constraint".into(),
@@ -1536,6 +1564,8 @@ impl<'a> ReasoningKernel<'a> {
                     "configured": configured,
                     "policy_coverage": data.policy_result["policy_coverage"],
                     "violations": violations,
+                    "accepted_deviations": accepted_deviations,
+                    "warnings": data.policy_result["warnings"],
                 }),
             )],
             vec![],
@@ -1604,6 +1634,9 @@ impl<'a> ReasoningKernel<'a> {
     ) -> PersistedReasoningClaim {
         let policy_count = data.policy_result["count"].as_u64().unwrap_or(0);
         let policy_configured = data.policy_result["configured"].as_bool().unwrap_or(false);
+        let accepted_deviation_count = data.policy_result["accepted_deviation_count"]
+            .as_u64()
+            .unwrap_or(0);
         let results = json!({
             "layer_violations": {
                 "status": data.layer_violations.is_empty(),
@@ -1624,6 +1657,7 @@ impl<'a> ReasoningKernel<'a> {
             "policy_violations": {
                 "status": policy_count == 0,
                 "count": policy_count,
+                "accepted_deviation_count": accepted_deviation_count,
             },
             "policy_coverage": {
                 "status": policy_configured,
@@ -1835,6 +1869,10 @@ impl<'a> ReasoningKernel<'a> {
             .as_array()
             .cloned()
             .unwrap_or_default();
+        let accepted_deviations = data.policy_result["accepted_deviations"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
         let evidence: Vec<Value> = violations
             .iter()
             .map(|violation| {
@@ -1871,7 +1909,14 @@ impl<'a> ReasoningKernel<'a> {
             "policy_violations",
             if clean { "true" } else { "false" },
             if clean {
-                "No policy violations detected. All dependencies conform to declared constraints.".into()
+                if accepted_deviations.is_empty() {
+                    "No policy violations detected. All dependencies conform to declared constraints.".into()
+                } else {
+                    format!(
+                        "No policy violations detected; {} runtime deviation(s) were explicitly accepted.",
+                        accepted_deviations.len()
+                    )
+                }
             } else {
                 format!(
                     "{} policy violation(s) found. Dependencies violate declared architectural constraints.",
@@ -1882,7 +1927,14 @@ impl<'a> ReasoningKernel<'a> {
                 "violation_type": "policy_violations",
                 "status": if clean { "true" } else { "false" },
                 "explanation": if clean {
-                    "No policy violations detected. All dependencies conform to declared constraints.".to_string()
+                    if accepted_deviations.is_empty() {
+                        "No policy violations detected. All dependencies conform to declared constraints.".to_string()
+                    } else {
+                        format!(
+                            "No policy violations detected; {} runtime deviation(s) were explicitly accepted.",
+                            accepted_deviations.len()
+                        )
+                    }
                 } else {
                     format!(
                         "{} policy violation(s) found. Dependencies violate declared architectural constraints.",
@@ -1904,7 +1956,15 @@ impl<'a> ReasoningKernel<'a> {
                 ],
                 witness_count: evidence.len(),
             }],
-            vec![support("evidence", "Policy violation explanations", json!(evidence))],
+            vec![support(
+                "evidence",
+                "Policy violation explanations",
+                json!({
+                    "violations": evidence,
+                    "accepted_deviations": accepted_deviations,
+                    "warnings": data.policy_result["warnings"],
+                }),
+            )],
             vec![],
             vec![
                 "Policy explanations depend on declared constraints and stored implemented dependencies.".into(),
@@ -2184,6 +2244,9 @@ impl<'a> ReasoningKernel<'a> {
                 "status": data.policy_result["status"],
                 "count": data.policy_result["count"],
                 "violations": data.policy_result["violations"],
+                "accepted_deviations": data.policy_result["accepted_deviations"],
+                "accepted_deviation_count": data.policy_result["accepted_deviation_count"],
+                "warnings": data.policy_result["warnings"],
             }
         });
 
@@ -2915,10 +2978,12 @@ fn diagnose_limitations(data: &MaterializedReasoningData) -> Vec<String> {
 }
 
 fn now_us() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_micros() as i64
+    u128_to_i64_saturating(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros(),
+    )
 }
 
 fn enrich_plan(store: &Store, workspace_path: &str, changes: &[Value]) -> Value {
@@ -3449,12 +3514,22 @@ fn escape_claim_component(value: &str) -> String {
 }
 
 fn impact_witness_count(payload: &Value) -> usize {
-    payload["count"]
-        .as_u64()
-        .or_else(|| payload["result"]["count"].as_u64())
-        .or_else(|| payload["result"]["total_edges"].as_u64())
-        .or_else(|| payload["total_edges"].as_u64())
-        .unwrap_or(0) as usize
+    u64_to_usize_saturating(
+        payload["count"]
+            .as_u64()
+            .or_else(|| payload["result"]["count"].as_u64())
+            .or_else(|| payload["result"]["total_edges"].as_u64())
+            .or_else(|| payload["total_edges"].as_u64())
+            .unwrap_or(0),
+    )
+}
+
+fn u64_to_usize_saturating(value: u64) -> usize {
+    usize::try_from(value).unwrap_or(usize::MAX)
+}
+
+fn u128_to_i64_saturating(value: u128) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
 }
 
 fn build_model_overview_json(store: &Store, workspace: &str, state: &str) -> Value {

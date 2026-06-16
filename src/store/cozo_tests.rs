@@ -1,4 +1,5 @@
 use super::*;
+use crate::domain::model::{ASTEdge, Severity};
 use std::env::temp_dir;
 
 fn test_model(name: &str) -> DomainModel {

@@ -7,10 +7,15 @@ use syn::visit::Visit;
 
 use super::model::DomainModel;
 use super::rust_analyzer::{self, ResolvedCall};
-use super::rust_facts::*;
+use super::rust_facts::{
+    CallEdge, ImportEdge, ReferenceEdge, RustScanOptions, SourceFile, SymbolDef,
+};
 use super::rust_syn::RustSynScanner;
 use super::scanner::AstScanner;
-use super::semantic_annotations::*;
+use super::semantic_annotations::{
+    BoundedContext, Conventions, DomainEvent, Entity, Field, Method, Module, Ownership, Repository,
+    Service, ServiceKind, TechStack, ValueObject,
+};
 
 // The scan-result value types (`CallInfo`, `FileScan`, `Discovered*`, …) live in
 // the leaf `super::ast` module and are re-exported here for backward

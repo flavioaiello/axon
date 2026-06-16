@@ -5,7 +5,9 @@ use std::collections::BTreeMap;
 use std::process::Command;
 
 use crate::domain::model::DomainModel;
-use crate::mcp::protocol::*;
+use crate::mcp::protocol::{
+    ToolCallResult, ToolDefinition, error_tool_result, json_tool_result, with_reasoning_context,
+};
 use crate::reasoning::ReasoningKernel;
 use crate::store::{PersistedReasoningClaim, Store};
 
@@ -368,7 +370,7 @@ pub fn call_tool(store: &Store, workspace_path: &str, name: &str, args: &Value) 
                 Some(q) => q,
                 None => return error_result("'query' parameter is required".into()),
             };
-            let limit = args["limit"].as_u64().unwrap_or(20) as usize;
+            let limit = u64_to_usize_saturating(args["limit"].as_u64().unwrap_or(20));
             let kernel = ReasoningKernel::new(store);
             match kernel.search(workspace_path, query, limit) {
                 Ok(claim) => stored_claim_result(store, workspace_path, &claim),
@@ -493,7 +495,7 @@ pub(crate) fn build_graph_confidence_report(store: &Store, workspace_path: &str)
         );
     }
 
-    let score = score.clamp(0, 100) as usize;
+    let score = usize::try_from(score.clamp(0, 100)).unwrap_or(100);
     let status = if source_files == 0 || symbols == 0 {
         "not_scanned"
     } else if score >= 90 {
@@ -764,14 +766,20 @@ fn output_text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).trim().to_string()
 }
 
+fn u64_to_usize_saturating(value: u64) -> usize {
+    usize::try_from(value).unwrap_or(usize::MAX)
+}
+
 fn graph_witness_count(payload: &Value) -> usize {
-    payload["count"]
-        .as_u64()
-        .or_else(|| payload["rows"].as_array().map(|rows| rows.len() as u64))
-        .or_else(|| payload["summary"]["node_count"].as_u64())
-        .or_else(|| payload["summary"]["edge_count"].as_u64())
-        .or_else(|| payload["summary"]["relation_count"].as_u64())
-        .unwrap_or(0) as usize
+    u64_to_usize_saturating(
+        payload["count"]
+            .as_u64()
+            .or_else(|| payload["rows"].as_array().map(|rows| rows.len() as u64))
+            .or_else(|| payload["summary"]["node_count"].as_u64())
+            .or_else(|| payload["summary"]["edge_count"].as_u64())
+            .or_else(|| payload["summary"]["relation_count"].as_u64())
+            .unwrap_or(0),
+    )
 }
 
 fn compact_rust_graph_payload(mut payload: Value) -> Value {
@@ -1557,6 +1565,8 @@ fn rust_module_path_from_file_path(file_path: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::domain::model::*;
+    use crate::mcp::protocol::ContentBlock;
+    use crate::store::default_layer_constraints;
     use std::env::temp_dir;
 
     fn test_store() -> Store {
@@ -1785,10 +1795,10 @@ mod tests {
             parsed["implemented"]["rust_ontology"]["counts"]["structs"],
             1
         );
-        assert_eq!(parsed["health"]["score"], 94);
+        assert_eq!(parsed["health"]["score"], 96);
         assert_eq!(
             parsed["health"]["policy_coverage"]["dependency_constraint_count"],
-            0
+            default_layer_constraints().len()
         );
 
         let full_result = call_tool(&store, &ws, "rust_status", &json!({"detail": "full"}));
@@ -2823,8 +2833,8 @@ mod tests {
         let ws = format!("/tmp/test-callpath-{}", std::process::id());
         let mut model = DomainModel::empty(&ws);
         model.call_edges = vec![CallEdge {
-            caller: "Store::upsert_layer_assignment".into(),
-            callee: "persist_policy".into(),
+            caller: "Store::refresh_runtime_constraints".into(),
+            callee: "seed_default_constraints".into(),
             file_path: "src/store/cozo.rs".into(),
             line: 4102,
             context: "store".into(),
@@ -2838,8 +2848,8 @@ mod tests {
             &json!({
                 "view": "paths",
                 "relation": "calls_symbol",
-                "from": "Store::upsert_layer_assignment",
-                "to": "persist_policy"
+                "from": "Store::refresh_runtime_constraints",
+                "to": "seed_default_constraints"
             }),
         );
         assert_eq!(result.is_error, None);
@@ -2849,7 +2859,10 @@ mod tests {
         assert_eq!(graph["relation"], "calls_symbol");
         assert_eq!(
             graph["rows"][0][0],
-            json!(["Store::upsert_layer_assignment", "persist_policy"])
+            json!([
+                "Store::refresh_runtime_constraints",
+                "seed_default_constraints"
+            ])
         );
     }
 

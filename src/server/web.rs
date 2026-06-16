@@ -13,7 +13,6 @@ pub const DEFAULT_WEB_PORT: u16 = 8888;
 pub async fn run(registry: Arc<CrateRegistry>, preferred_port: u16) -> Result<()> {
     let listener = bind_localhost(preferred_port).await?;
     let addr = listener.local_addr()?;
-    eprintln!("Axon web graph available at http://{}", addr);
     info!("Axon web graph available at http://{}", addr);
 
     loop {
@@ -38,10 +37,6 @@ async fn bind_localhost(port: u16) -> Result<TcpListener> {
 pub async fn run_multi(registries: super::WorkspaceRegistries, preferred_port: u16) -> Result<()> {
     let listener = bind_localhost(preferred_port).await?;
     let addr = listener.local_addr()?;
-    eprintln!(
-        "Axon web graph (all workspaces) available at http://{}",
-        addr
-    );
     info!(
         "Axon multi-workspace web graph available at http://{}",
         addr

@@ -10,6 +10,8 @@
 //! - OLD: `extract_live_dependencies` + `scan_file` + `extract_calls` → 3 parses/file
 //! - NEW: `scan_source` → 1 parse/file
 
+#![allow(clippy::print_stdout, clippy::unwrap_used)]
+
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 

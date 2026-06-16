@@ -5,6 +5,8 @@
 //! cargo test --release --test sync_bench -- --ignored --nocapture
 //! ```
 
+#![allow(clippy::print_stdout, clippy::unwrap_used)]
+
 use std::path::Path;
 use std::time::{Duration, Instant};
 

@@ -4,11 +4,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::RwLock;
 
-use crate::domain::model::*;
+use crate::domain::model::{
+    APIEndpoint, Aggregate, ArchitecturalDecision, ArchitecturalRule, BoundedContext, CallEdge,
+    Conventions, DecisionStatus, DomainEvent, DomainModel, Entity, ExternalSystem, Field,
+    ImportEdge, Method, Module, Ownership, Policy, PolicyKind, ReadModel, ReferenceEdge,
+    Repository, Service, ServiceKind, SourceFile, SymbolDef, TechStack, ValueObject,
+};
 
 pub(crate) const ACTUAL_STATE: &str = "actual";
 
@@ -271,7 +275,6 @@ impl PersistedReasoningClaim {
 /// - `DomainModel` structs are reconstructed on-demand from relations.
 pub struct Store {
     db: DbInstance,
-    policy_path: Option<PathBuf>,
     operation_lock: RwLock<()>,
 }
 
@@ -310,24 +313,18 @@ impl Store {
     /// store location, but CozoDB data now lives only for the process lifetime.
     pub fn open(path: &Path) -> Result<Self> {
         let root = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-        let policy_path = root
-            .join("Cargo.toml")
-            .is_file()
-            .then(|| root.join(".axon").join("policy.json"));
         let db = DbInstance::new("mem", "", Default::default())
             .map_err(|e| anyhow::anyhow!("Failed to open in-memory CozoDB: {:?}", e))?;
 
         Self::init_schema(&db)?;
         let store = Self {
             db,
-            policy_path,
             operation_lock: RwLock::new(()),
         };
         let ws = canonicalize_path(&root.to_string_lossy());
-        // Seed conventional Clean-Architecture rules first, then let any
-        // persisted overrides win by upserting over the same keys.
+        // Seed conventional Clean-Architecture rules in memory. Runtime
+        // overrides can replace these rows for the active store session.
         store.seed_default_constraints(&ws)?;
-        store.load_persisted_policy(&ws)?;
         Ok(store)
     }
 
@@ -753,10 +750,10 @@ impl Store {
                         sv(&c.callee),
                         sv(&c.callee_file),
                         sv(ACTUAL_STATE),
-                        cozo::DataValue::from(c.callee_line as i64),
+                        cozo::DataValue::from(usize_to_i64(c.callee_line)),
                         sv(&c.caller_file),
-                        cozo::DataValue::from(c.caller_line as i64),
-                        cozo::DataValue::from(c.call_site_line as i64),
+                        cozo::DataValue::from(usize_to_i64(c.caller_line)),
+                        cozo::DataValue::from(usize_to_i64(c.call_site_line)),
                         sv(&c.call_expr),
                         sv(&c.dispatch_kind),
                     ])
@@ -905,7 +902,7 @@ impl Store {
                 ("desc", &f.description),
             ]);
             params.insert("req".into(), cozo::DataValue::Bool(f.required));
-            params.insert("idx".into(), int_dv(i as i64));
+            params.insert("idx".into(), int_dv(usize_to_i64(i)));
             self
                 .run_script(
                     "?[workspace, context, owner_kind, owner, name, state, field_type, required, description, idx] <- \
@@ -940,7 +937,7 @@ impl Store {
                 ("desc", &m.description),
                 ("rt", &m.return_type),
             ]);
-            params.insert("idx".into(), int_dv(i as i64));
+            params.insert("idx".into(), int_dv(usize_to_i64(i)));
             self
                 .run_script(
                     "?[workspace, context, owner_kind, owner, name, state, description, return_type, idx] <- \
@@ -964,7 +961,7 @@ impl Store {
                     ("desc", &p.description),
                 ]);
                 pp.insert("req".into(), cozo::DataValue::Bool(p.required));
-                pp.insert("idx".into(), int_dv(j as i64));
+                pp.insert("idx".into(), int_dv(usize_to_i64(j)));
                 self
                     .run_script(
                         "?[workspace, context, owner_kind, owner, method, name, state, param_type, required, description, idx] <- \
@@ -1080,7 +1077,7 @@ impl Store {
                 ("entity", entity),
                 ("text", invariant),
             ]);
-            params.insert("idx".into(), int_dv(idx as i64));
+            params.insert("idx".into(), int_dv(usize_to_i64(idx)));
             self.run_script(
                 "?[workspace, context, entity, idx, state, text] <- [[$ws, $ctx, $entity, $idx, 'actual', $text]] :put invariant { workspace, context, entity, idx, state => text }",
                 params,
@@ -1109,7 +1106,7 @@ impl Store {
                 ("vo", value_object),
                 ("text", rule),
             ]);
-            params.insert("idx".into(), int_dv(idx as i64));
+            params.insert("idx".into(), int_dv(usize_to_i64(idx)));
             self.run_script(
                 "?[workspace, context, value_object, idx, state, text] <- [[$ws, $ctx, $vo, $idx, 'actual', $text]] :put vo_rule { workspace, context, value_object, idx, state => text }",
                 params,
@@ -1480,8 +1477,14 @@ impl Store {
                     "file".into(),
                     cozo::DataValue::Str(entity.file_path.as_deref().unwrap_or("").into()),
                 );
-                params.insert("sl".into(), int_dv(entity.start_line.unwrap_or(0) as i64));
-                params.insert("el".into(), int_dv(entity.end_line.unwrap_or(0) as i64));
+                params.insert(
+                    "sl".into(),
+                    int_dv(usize_to_i64(entity.start_line.unwrap_or(0))),
+                );
+                params.insert(
+                    "el".into(),
+                    int_dv(usize_to_i64(entity.end_line.unwrap_or(0))),
+                );
                 self.run_script(
                     "?[workspace, context, name, state, description, aggregate_root, file_path, start_line, end_line] <- [[$ws, $ctx, $name, $st, $desc, $agg, $file, $sl, $el]] :put entity { workspace, context, name, state => description, aggregate_root, file_path, start_line, end_line }",
                     params,
@@ -1511,7 +1514,7 @@ impl Store {
                         ("st", state),
                         ("text", inv),
                     ]);
-                    params.insert("idx".into(), int_dv(idx as i64));
+                    params.insert("idx".into(), int_dv(usize_to_i64(idx)));
                     self.run_script(
                         "?[workspace, context, entity, idx, state, text] <- [[$ws, $ctx, $ent, $idx, $st, $text]] :put invariant { workspace, context, entity, idx, state => text }",
                         params,
@@ -1543,7 +1546,7 @@ impl Store {
                         ("link", trigger),
                         ("st", state),
                     ]);
-                    params.insert("idx".into(), int_dv(idx as i64));
+                    params.insert("idx".into(), int_dv(usize_to_i64(idx)));
                     self.run_script(
                         "?[workspace, context, policy, link_kind, link, idx, state] <- [[$ws, $ctx, $policy, 'trigger', $link, $idx, $st]] :put policy_link { workspace, context, policy, link_kind, link, idx, state }",
                         params,
@@ -1558,7 +1561,7 @@ impl Store {
                         ("link", command),
                         ("st", state),
                     ]);
-                    params.insert("idx".into(), int_dv(idx as i64));
+                    params.insert("idx".into(), int_dv(usize_to_i64(idx)));
                     self.run_script(
                         "?[workspace, context, policy, link_kind, link, idx, state] <- [[$ws, $ctx, $policy, 'command', $link, $idx, $st]] :put policy_link { workspace, context, policy, link_kind, link, idx, state }",
                         params,
@@ -1624,8 +1627,11 @@ impl Store {
                     "file".into(),
                     cozo::DataValue::Str(svc.file_path.as_deref().unwrap_or("").into()),
                 );
-                params.insert("sl".into(), int_dv(svc.start_line.unwrap_or(0) as i64));
-                params.insert("el".into(), int_dv(svc.end_line.unwrap_or(0) as i64));
+                params.insert(
+                    "sl".into(),
+                    int_dv(usize_to_i64(svc.start_line.unwrap_or(0))),
+                );
+                params.insert("el".into(), int_dv(usize_to_i64(svc.end_line.unwrap_or(0))));
                 self.run_script(
                     "?[workspace, context, name, state, description, kind, file_path, start_line, end_line] <- [[$ws, $ctx, $name, $st, $desc, $kind, $file, $sl, $el]] :put service { workspace, context, name, state => description, kind, file_path, start_line, end_line }",
                     params,
@@ -1661,8 +1667,11 @@ impl Store {
                     "file".into(),
                     cozo::DataValue::Str(evt.file_path.as_deref().unwrap_or("").into()),
                 );
-                params.insert("sl".into(), int_dv(evt.start_line.unwrap_or(0) as i64));
-                params.insert("el".into(), int_dv(evt.end_line.unwrap_or(0) as i64));
+                params.insert(
+                    "sl".into(),
+                    int_dv(usize_to_i64(evt.start_line.unwrap_or(0))),
+                );
+                params.insert("el".into(), int_dv(usize_to_i64(evt.end_line.unwrap_or(0))));
                 self.run_script(
                     "?[workspace, context, name, state, description, source, file_path, start_line, end_line] <- [[$ws, $ctx, $name, $st, $desc, $src, $file, $sl, $el]] :put event { workspace, context, name, state => description, source, file_path, start_line, end_line }",
                     params,
@@ -1683,8 +1692,11 @@ impl Store {
                     "file".into(),
                     cozo::DataValue::Str(vo.file_path.as_deref().unwrap_or("").into()),
                 );
-                params.insert("sl".into(), int_dv(vo.start_line.unwrap_or(0) as i64));
-                params.insert("el".into(), int_dv(vo.end_line.unwrap_or(0) as i64));
+                params.insert(
+                    "sl".into(),
+                    int_dv(usize_to_i64(vo.start_line.unwrap_or(0))),
+                );
+                params.insert("el".into(), int_dv(usize_to_i64(vo.end_line.unwrap_or(0))));
                 self.run_script(
                     "?[workspace, context, name, state, description, file_path, start_line, end_line] <- [[$ws, $ctx, $name, $st, $desc, $file, $sl, $el]] :put value_object { workspace, context, name, state => description, file_path, start_line, end_line }",
                     params,
@@ -1706,7 +1718,7 @@ impl Store {
                         ("st", state),
                         ("text", rule),
                     ]);
-                    p.insert("idx".into(), int_dv(idx as i64));
+                    p.insert("idx".into(), int_dv(usize_to_i64(idx)));
                     self.run_script(
                         "?[workspace, context, value_object, idx, state, text] <- [[$ws, $ctx, $vo, $idx, $st, $text]] :put vo_rule { workspace, context, value_object, idx, state => text }",
                         p,
@@ -1727,8 +1739,14 @@ impl Store {
                     "file".into(),
                     cozo::DataValue::Str(repo.file_path.as_deref().unwrap_or("").into()),
                 );
-                params.insert("sl".into(), int_dv(repo.start_line.unwrap_or(0) as i64));
-                params.insert("el".into(), int_dv(repo.end_line.unwrap_or(0) as i64));
+                params.insert(
+                    "sl".into(),
+                    int_dv(usize_to_i64(repo.start_line.unwrap_or(0))),
+                );
+                params.insert(
+                    "el".into(),
+                    int_dv(usize_to_i64(repo.end_line.unwrap_or(0))),
+                );
                 self.run_script(
                     "?[workspace, context, name, state, aggregate, file_path, start_line, end_line] <- [[$ws, $ctx, $name, $st, $agg, $file, $sl, $el]] :put repository { workspace, context, name, state => aggregate, file_path, start_line, end_line }",
                     params,
@@ -1784,7 +1802,7 @@ impl Store {
                     ("ctx", ctx),
                     ("st", state),
                 ]);
-                params.insert("idx".into(), int_dv(idx as i64));
+                params.insert("idx".into(), int_dv(usize_to_i64(idx)));
                 self.run_script(
                     "?[workspace, system, context, idx, state] <- [[$ws, $name, $ctx, $idx, $st]] :put external_system_context { workspace, system, context, idx, state }",
                     params,
@@ -1815,7 +1833,7 @@ impl Store {
                     ("ctx", ctx),
                     ("st", state),
                 ]);
-                params.insert("idx".into(), int_dv(idx as i64));
+                params.insert("idx".into(), int_dv(usize_to_i64(idx)));
                 self.run_script(
                     "?[workspace, decision_id, context, idx, state] <- [[$ws, $id, $ctx, $idx, $st]] :put decision_context { workspace, decision_id, context, idx, state }",
                     params,
@@ -1829,7 +1847,7 @@ impl Store {
                     ("text", consequence),
                     ("st", state),
                 ]);
-                params.insert("idx".into(), int_dv(idx as i64));
+                params.insert("idx".into(), int_dv(usize_to_i64(idx)));
                 self.run_script(
                     "?[workspace, decision_id, idx, state, text] <- [[$ws, $id, $idx, $st, $text]] :put decision_consequence { workspace, decision_id, idx, state => text }",
                     params,
@@ -1854,7 +1872,7 @@ impl Store {
                     sv(&edge.edge_type),
                     sv(state),
                     sv(&edge.file_path),
-                    cozo::DataValue::from(edge.line as i64),
+                    cozo::DataValue::from(usize_to_i64(edge.line)),
                 ])
             })
             .collect();
@@ -1894,8 +1912,8 @@ impl Store {
                     sv(&sym.kind),
                     sv(&sym.context),
                     sv(&sym.file_path),
-                    int_dv(sym.start_line as i64),
-                    int_dv(sym.end_line as i64),
+                    int_dv(usize_to_i64(sym.start_line)),
+                    int_dv(usize_to_i64(sym.end_line)),
                     sv(&sym.visibility),
                 ])
             })
@@ -1938,7 +1956,7 @@ impl Store {
                     sv(&re.from_file),
                     sv(&re.to_path),
                     sv(&re.reference_kind),
-                    int_dv(re.line as i64),
+                    int_dv(usize_to_i64(re.line)),
                     sv(state),
                     sv(&re.context),
                 ])
@@ -1962,7 +1980,7 @@ impl Store {
                     sv(&ce.callee),
                     sv(state),
                     sv(&ce.file_path),
-                    int_dv(ce.line as i64),
+                    int_dv(usize_to_i64(ce.line)),
                     sv(&ce.context),
                 ])
             })
@@ -1985,7 +2003,8 @@ impl Store {
         let now_us = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
-            .as_micros() as i64;
+            .as_micros();
+        let now_us = u128_to_i64_saturating(now_us);
         let latest_ts = self
             .list_snapshots(workspace, state)?
             .into_iter()
@@ -2568,7 +2587,7 @@ impl Store {
                         to_node: dv_str(&r[1]),
                         edge_type: dv_str(&r[2]),
                         file_path: dv_str(&r[3]),
-                        line: dv_i64(&r[4]).max(0) as usize,
+                        line: i64_to_usize_saturating(dv_i64(&r[4]).max(0)),
                     })
                     .collect()
             },
@@ -2599,8 +2618,8 @@ impl Store {
                         kind: dv_str(&r[1]),
                         context: dv_str(&r[2]),
                         file_path: dv_str(&r[3]),
-                        start_line: dv_i64(&r[4]) as usize,
-                        end_line: dv_i64(&r[5]) as usize,
+                        start_line: i64_to_usize_saturating(dv_i64(&r[4])),
+                        end_line: i64_to_usize_saturating(dv_i64(&r[5])),
                         visibility: dv_str(&r[6]),
                     })
                     .collect()
@@ -2630,7 +2649,7 @@ impl Store {
                         caller: dv_str(&r[0]),
                         callee: dv_str(&r[1]),
                         file_path: dv_str(&r[2]),
-                        line: dv_i64(&r[3]) as usize,
+                        line: i64_to_usize_saturating(dv_i64(&r[3])),
                         context: dv_str(&r[4]),
                     })
                     .collect()
@@ -2646,7 +2665,7 @@ impl Store {
                         from_file: dv_str(&r[0]),
                         to_path: dv_str(&r[1]),
                         reference_kind: dv_str(&r[2]),
-                        line: dv_i64(&r[3]) as usize,
+                        line: i64_to_usize_saturating(dv_i64(&r[3])),
                         context: dv_str(&r[4]),
                     })
                     .collect()
@@ -2989,8 +3008,14 @@ impl Store {
             "file".into(),
             cozo::DataValue::Str(entity.file_path.as_deref().unwrap_or("").into()),
         );
-        params.insert("sl".into(), int_dv(entity.start_line.unwrap_or(0) as i64));
-        params.insert("el".into(), int_dv(entity.end_line.unwrap_or(0) as i64));
+        params.insert(
+            "sl".into(),
+            int_dv(usize_to_i64(entity.start_line.unwrap_or(0))),
+        );
+        params.insert(
+            "el".into(),
+            int_dv(usize_to_i64(entity.end_line.unwrap_or(0))),
+        );
         self.run_script(
             "?[workspace, context, name, state, description, aggregate_root, file_path, start_line, end_line] <- [[$ws, $ctx, $name, 'actual', $desc, $aggregate_root, $file, $sl, $el]] :put entity { workspace, context, name, state => description, aggregate_root, file_path, start_line, end_line }",
             params,
@@ -3092,8 +3117,14 @@ impl Store {
             "file".into(),
             cozo::DataValue::Str(service.file_path.as_deref().unwrap_or("").into()),
         );
-        params.insert("sl".into(), int_dv(service.start_line.unwrap_or(0) as i64));
-        params.insert("el".into(), int_dv(service.end_line.unwrap_or(0) as i64));
+        params.insert(
+            "sl".into(),
+            int_dv(usize_to_i64(service.start_line.unwrap_or(0))),
+        );
+        params.insert(
+            "el".into(),
+            int_dv(usize_to_i64(service.end_line.unwrap_or(0))),
+        );
         self.run_script(
             "?[workspace, context, name, state, description, kind, file_path, start_line, end_line] <- [[$ws, $ctx, $name, 'actual', $desc, $kind, $file, $sl, $el]] :put service { workspace, context, name, state => description, kind, file_path, start_line, end_line }",
             params,
@@ -3132,8 +3163,14 @@ impl Store {
             "file".into(),
             cozo::DataValue::Str(event.file_path.as_deref().unwrap_or("").into()),
         );
-        params.insert("sl".into(), int_dv(event.start_line.unwrap_or(0) as i64));
-        params.insert("el".into(), int_dv(event.end_line.unwrap_or(0) as i64));
+        params.insert(
+            "sl".into(),
+            int_dv(usize_to_i64(event.start_line.unwrap_or(0))),
+        );
+        params.insert(
+            "el".into(),
+            int_dv(usize_to_i64(event.end_line.unwrap_or(0))),
+        );
         self.run_script(
             "?[workspace, context, name, state, description, source, file_path, start_line, end_line] <- [[$ws, $ctx, $name, 'actual', $desc, $source, $file, $sl, $el]] :put event { workspace, context, name, state => description, source, file_path, start_line, end_line }",
             params,
@@ -3175,11 +3212,11 @@ impl Store {
         );
         params.insert(
             "sl".into(),
-            int_dv(value_object.start_line.unwrap_or(0) as i64),
+            int_dv(usize_to_i64(value_object.start_line.unwrap_or(0))),
         );
         params.insert(
             "el".into(),
-            int_dv(value_object.end_line.unwrap_or(0) as i64),
+            int_dv(usize_to_i64(value_object.end_line.unwrap_or(0))),
         );
         self.run_script(
             "?[workspace, context, name, state, description, file_path, start_line, end_line] <- [[$ws, $ctx, $name, 'actual', $desc, $file, $sl, $el]] :put value_object { workspace, context, name, state => description, file_path, start_line, end_line }",
@@ -3230,9 +3267,12 @@ impl Store {
         );
         params.insert(
             "sl".into(),
-            int_dv(repository.start_line.unwrap_or(0) as i64),
+            int_dv(usize_to_i64(repository.start_line.unwrap_or(0))),
         );
-        params.insert("el".into(), int_dv(repository.end_line.unwrap_or(0) as i64));
+        params.insert(
+            "el".into(),
+            int_dv(usize_to_i64(repository.end_line.unwrap_or(0))),
+        );
         self.run_script(
             "?[workspace, context, name, state, aggregate, file_path, start_line, end_line] <- [[$ws, $ctx, $name, 'actual', $aggregate, $file, $sl, $el]] :put repository { workspace, context, name, state => aggregate, file_path, start_line, end_line }",
             params,
@@ -3384,7 +3424,7 @@ impl Store {
                 ("name", &policy.name),
                 ("link", trigger),
             ]);
-            p.insert("idx".into(), int_dv(idx as i64));
+            p.insert("idx".into(), int_dv(usize_to_i64(idx)));
             self.run_script("?[workspace, context, policy, link_kind, link, idx, state] <- [[$ws, $ctx, $name, 'trigger', $link, $idx, 'actual']] :put policy_link { workspace, context, policy, link_kind, link, idx, state }", p, ScriptMutability::Mutable).map_err(|e| anyhow::anyhow!("upsert_policy trigger: {:?}", e))?;
         }
         for (idx, command) in policy.commands.iter().enumerate() {
@@ -3394,7 +3434,7 @@ impl Store {
                 ("name", &policy.name),
                 ("link", command),
             ]);
-            p.insert("idx".into(), int_dv(idx as i64));
+            p.insert("idx".into(), int_dv(usize_to_i64(idx)));
             self.run_script("?[workspace, context, policy, link_kind, link, idx, state] <- [[$ws, $ctx, $name, 'command', $link, $idx, 'actual']] :put policy_link { workspace, context, policy, link_kind, link, idx, state }", p, ScriptMutability::Mutable).map_err(|e| anyhow::anyhow!("upsert_policy command: {:?}", e))?;
         }
         Ok(())
@@ -3464,7 +3504,7 @@ impl Store {
         self.run_mutation_script("?[workspace, system, context, idx, state, vld] := *external_system_context{workspace, system, context, idx, state @ 'NOW'}, workspace = $ws, system = $name, state = 'actual', vld = 'RETRACT' :put external_system_context { workspace, system, context, idx, state, vld }", params_map(&[("ws", &ws), ("name", &system.name)]), format!("retract external system contexts for {}", system.name))?;
         for (idx, ctx) in system.consumed_by_contexts.iter().enumerate() {
             let mut p = params_map(&[("ws", &ws), ("name", &system.name), ("ctx", ctx)]);
-            p.insert("idx".into(), int_dv(idx as i64));
+            p.insert("idx".into(), int_dv(usize_to_i64(idx)));
             self.run_script("?[workspace, system, context, idx, state] <- [[$ws, $name, $ctx, $idx, 'actual']] :put external_system_context { workspace, system, context, idx, state }", p, ScriptMutability::Mutable).map_err(|e| anyhow::anyhow!("upsert_external_system ctx: {:?}", e))?;
         }
         Ok(())
@@ -3503,12 +3543,12 @@ impl Store {
         self.run_mutation_script("?[workspace, decision_id, idx, state, vld] := *decision_consequence{workspace, decision_id, idx, state @ 'NOW'}, workspace = $ws, decision_id = $id, state = 'actual', vld = 'RETRACT' :put decision_consequence { workspace, decision_id, idx, state, vld }", params_map(&[("ws", &ws), ("id", &decision.id)]), format!("retract decision consequences for {}", decision.id))?;
         for (idx, ctx) in decision.contexts.iter().enumerate() {
             let mut p = params_map(&[("ws", &ws), ("id", &decision.id), ("ctx", ctx)]);
-            p.insert("idx".into(), int_dv(idx as i64));
+            p.insert("idx".into(), int_dv(usize_to_i64(idx)));
             self.run_script("?[workspace, decision_id, context, idx, state] <- [[$ws, $id, $ctx, $idx, 'actual']] :put decision_context { workspace, decision_id, context, idx, state }", p, ScriptMutability::Mutable).map_err(|e| anyhow::anyhow!("upsert_architectural_decision ctx: {:?}", e))?;
         }
         for (idx, consequence) in decision.consequences.iter().enumerate() {
             let mut p = params_map(&[("ws", &ws), ("id", &decision.id), ("text", consequence)]);
-            p.insert("idx".into(), int_dv(idx as i64));
+            p.insert("idx".into(), int_dv(usize_to_i64(idx)));
             self.run_script("?[workspace, decision_id, idx, state, text] <- [[$ws, $id, $idx, 'actual', $text]] :put decision_consequence { workspace, decision_id, idx, state => text }", p, ScriptMutability::Mutable).map_err(|e| anyhow::anyhow!("upsert_architectural_decision consequence: {:?}", e))?;
         }
         Ok(())
@@ -3673,7 +3713,8 @@ impl Store {
             let drift_ts_us = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
-                .as_micros() as i64;
+                .as_micros();
+            let drift_ts_us = u128_to_i64_saturating(drift_ts_us);
             let mut meta_params = params_map(&[("ws", &ws)]);
             meta_params.insert("ts".into(), int_dv(drift_ts_us));
             self.run_mutation_script(
@@ -3909,10 +3950,10 @@ impl Store {
                     ("rule", &derivation.rule),
                     ("derived_from_json", &derived_from_json),
                 ]);
-                params.insert("idx".into(), int_dv(idx as i64));
+                params.insert("idx".into(), int_dv(usize_to_i64(idx)));
                 params.insert(
                     "witness_count".into(),
-                    int_dv(derivation.witness_count as i64),
+                    int_dv(usize_to_i64(derivation.witness_count)),
                 );
                 self.run_mutation_script(
                     "?[workspace, claim_id, idx, rule, derived_from_json, witness_count] <- \
@@ -3930,7 +3971,7 @@ impl Store {
                     ("assumption_kind", &assumption.assumption_kind),
                     ("text", &assumption.text),
                 ]);
-                params.insert("idx".into(), int_dv(idx as i64));
+                params.insert("idx".into(), int_dv(usize_to_i64(idx)));
                 self.run_mutation_script(
                     "?[workspace, claim_id, idx, assumption_kind, text] <- \
                      [[$ws, $claim_id, $idx, $assumption_kind, $text]] \
@@ -3950,7 +3991,7 @@ impl Store {
                     ("summary", &support.summary),
                     ("detail_json", &detail_json),
                 ]);
-                params.insert("idx".into(), int_dv(idx as i64));
+                params.insert("idx".into(), int_dv(usize_to_i64(idx)));
                 self.run_mutation_script(
                     "?[workspace, claim_id, idx, support_kind, summary, detail_json] <- \
                      [[$ws, $claim_id, $idx, $support_kind, $summary, $detail_json]] \
@@ -3967,7 +4008,7 @@ impl Store {
                     ("dependency_kind", &dependency.dependency_kind),
                     ("dependency_state", &dependency.dependency_state),
                 ]);
-                params.insert("idx".into(), int_dv(idx as i64));
+                params.insert("idx".into(), int_dv(usize_to_i64(idx)));
                 params.insert(
                     "basis_timestamp_us".into(),
                     int_dv(dependency.basis_timestamp_us),
@@ -3989,7 +4030,7 @@ impl Store {
                     ("fact_key", &justification.fact_key),
                     ("fact_state", &justification.fact_state),
                 ]);
-                params.insert("idx".into(), int_dv(idx as i64));
+                params.insert("idx".into(), int_dv(usize_to_i64(idx)));
                 params.insert(
                     "basis_timestamp_us".into(),
                     int_dv(justification.basis_timestamp_us),
@@ -4084,7 +4125,7 @@ impl Store {
                 rule: dv_str(&row[1]),
                 derived_from: serde_json::from_str::<Vec<String>>(&dv_str(&row[2]))
                     .unwrap_or_default(),
-                witness_count: dv_i64(&row[3]) as usize,
+                witness_count: i64_to_usize_saturating(dv_i64(&row[3])),
             })
             .collect();
 
@@ -4720,25 +4761,18 @@ impl Store {
             .collect())
     }
 
-    // ── Architecture Policy Operations ────────────────────────────────────
+    // ── Architecture Constraint Operations ─────────────────────────────────
 
-    /// Reload `.axon/policy.json` into the in-memory policy tables.
+    /// Refresh in-memory architecture constraints for a workspace.
     ///
-    /// Long-running daemon stores own in-memory policy state, so callers use
-    /// this at read boundaries to observe external policy-file edits without a
-    /// daemon restart. Returns `true` when the effective in-memory policy
-    /// changed and cached reasoning claims were invalidated.
-    pub fn reload_persisted_policy(&self, workspace: &str) -> Result<bool> {
-        if self.policy_path.is_none() {
-            return Ok(false);
-        }
-
+    /// Defaults and convention-inferred layers are recomputed in memory. Runtime
+    /// overrides are preserved for the active store session and are never written
+    /// into the scanned repository.
+    pub fn refresh_runtime_constraints(&self, workspace: &str) -> Result<bool> {
         let ws = canonicalize_path(workspace);
         let before = self.policy_snapshot(&ws)?;
 
-        self.clear_policy_in_memory(&ws)?;
         self.seed_default_constraints(&ws)?;
-        self.load_persisted_policy(&ws)?;
         if let Some(model) = self.load_actual(&ws)? {
             self.apply_inferred_layers(&ws, &model)?;
         }
@@ -4778,28 +4812,6 @@ impl Store {
         ))
     }
 
-    fn clear_policy_in_memory(&self, workspace: &str) -> Result<()> {
-        let ws = canonicalize_path(workspace);
-        let params = params_map(&[("ws", &ws)]);
-        self.run_script(
-            "?[workspace, context] := \
-                *layer_assignment{workspace, context}, workspace = $ws \
-             :rm layer_assignment { workspace, context }",
-            params.clone(),
-            ScriptMutability::Mutable,
-        )
-        .map_err(|e| anyhow::anyhow!("clear layer_assignment policy: {:?}", e))?;
-        self.run_script(
-            "?[workspace, constraint_kind, source, target] := \
-                *dependency_constraint{workspace, constraint_kind, source, target}, workspace = $ws \
-             :rm dependency_constraint { workspace, constraint_kind, source, target }",
-            params,
-            ScriptMutability::Mutable,
-        )
-        .map_err(|e| anyhow::anyhow!("clear dependency_constraint policy: {:?}", e))?;
-        Ok(())
-    }
-
     /// Assign a bounded context to an architectural layer.
     pub fn upsert_layer_assignment(
         &self,
@@ -4809,7 +4821,6 @@ impl Store {
     ) -> Result<()> {
         let ws = canonicalize_path(workspace);
         self.upsert_layer_assignment_in_memory(&ws, context, layer)?;
-        self.persist_policy(&ws)?;
         Ok(())
     }
 
@@ -4842,11 +4853,7 @@ impl Store {
                 ScriptMutability::Mutable,
             )
             .map_err(|e| anyhow::anyhow!("remove_layer_assignment: {:?}", e))?;
-        let removed = !existing.rows.is_empty();
-        if removed {
-            self.persist_policy(&ws)?;
-        }
-        Ok(removed)
+        Ok(!existing.rows.is_empty())
     }
 
     /// Add a dependency constraint between layers or contexts.
@@ -4862,7 +4869,6 @@ impl Store {
     ) -> Result<()> {
         let ws = canonicalize_path(workspace);
         self.upsert_dependency_constraint_in_memory(&ws, constraint_kind, source, target, rule)?;
-        self.persist_policy(&ws)?;
         Ok(())
     }
 
@@ -4917,11 +4923,7 @@ impl Store {
                 ScriptMutability::Mutable,
             )
             .map_err(|e| anyhow::anyhow!("remove_dependency_constraint: {:?}", e))?;
-        let removed = !existing.rows.is_empty();
-        if removed {
-            self.persist_policy(&ws)?;
-        }
-        Ok(removed)
+        Ok(!existing.rows.is_empty())
     }
 
     /// List all layer assignments for a workspace.
@@ -4965,22 +4967,47 @@ impl Store {
     }
 
     /// Seed the built-in [`default_layer_constraints`] into the in-memory store.
-    /// Idempotent and never persisted — re-applied on every open.
+    /// Idempotent and never persisted. Runtime overrides for the same key win.
     fn seed_default_constraints(&self, workspace: &str) -> Result<()> {
         let ws = canonicalize_path(workspace);
         for (kind, source, target, rule) in default_layer_constraints() {
-            self.upsert_dependency_constraint_in_memory(&ws, kind, source, target, rule)?;
+            if !self.dependency_constraint_exists(&ws, kind, source, target)? {
+                self.upsert_dependency_constraint_in_memory(&ws, kind, source, target, rule)?;
+            }
         }
         Ok(())
+    }
+
+    fn dependency_constraint_exists(
+        &self,
+        workspace: &str,
+        constraint_kind: &str,
+        source: &str,
+        target: &str,
+    ) -> Result<bool> {
+        let ws = canonicalize_path(workspace);
+        let params = params_map(&[
+            ("ws", &ws),
+            ("kind", constraint_kind),
+            ("src", source),
+            ("tgt", target),
+        ]);
+        let result = self
+            .run_script(
+                "?[constraint_kind, source, target] := \
+                    *dependency_constraint{workspace: $ws, constraint_kind, source, target}, \
+                    constraint_kind = $kind, source = $src, target = $tgt",
+                params,
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| anyhow::anyhow!("dependency_constraint_exists: {:?}", e))?;
+        Ok(!result.rows.is_empty())
     }
 
     /// Materialize convention-inferred layer assignments for the model's
     /// contexts. A context is assigned only when its name maps to a known layer
     /// (via [`crate::domain::analyze::classify_layer`]) *and* it has no existing
-    /// assignment, so explicit/persisted assignments are never overwritten.
-    ///
-    /// Inferred rows live in-memory only; [`Self::persist_policy`] filters them
-    /// back out, keeping `.axon/policy.json` override-only.
+    /// assignment, so explicit runtime assignments are never overwritten.
     fn apply_inferred_layers(&self, workspace: &str, model: &DomainModel) -> Result<()> {
         let ws = canonicalize_path(workspace);
         let assigned = self
@@ -4999,117 +5026,11 @@ impl Store {
         Ok(())
     }
 
-    fn load_persisted_policy(&self, workspace: &str) -> Result<()> {
-        let Some(path) = &self.policy_path else {
-            return Ok(());
-        };
-        if !path.exists() {
-            return Ok(());
-        }
-
-        let text = fs::read_to_string(path)
-            .with_context(|| format!("read persisted architecture policy at {}", path.display()))?;
-        let policy: PersistedArchitecturePolicy =
-            serde_json::from_str(&text).with_context(|| {
-                format!("parse persisted architecture policy at {}", path.display())
-            })?;
-
-        for assignment in policy.layer_assignments {
-            self.upsert_layer_assignment_in_memory(
-                workspace,
-                &assignment.context,
-                &assignment.layer,
-            )?;
-        }
-        for constraint in policy.dependency_constraints {
-            self.upsert_dependency_constraint_in_memory(
-                workspace,
-                &constraint.constraint_kind,
-                &constraint.source,
-                &constraint.target,
-                &constraint.rule,
-            )?;
-        }
-
-        Ok(())
-    }
-
-    fn persist_policy(&self, workspace: &str) -> Result<()> {
-        let Some(path) = &self.policy_path else {
-            return Ok(());
-        };
-
-        // Persist only explicit overrides: drop assignments that merely match
-        // what convention-inference would produce, so the policy file stays
-        // override-only rather than echoing every inferred layer.
-        let mut layer_assignments = self
-            .list_layer_assignments(workspace)?
-            .into_iter()
-            .filter(|(context, layer)| {
-                crate::domain::analyze::classify_layer(context) != Some(layer.as_str())
-            })
-            .map(|(context, layer)| PersistedLayerAssignment { context, layer })
-            .collect::<Vec<_>>();
-        layer_assignments.sort_by(|a, b| a.context.cmp(&b.context));
-
-        // Likewise drop any constraint identical to a seeded default.
-        let defaults = default_layer_constraints()
-            .iter()
-            .copied()
-            .collect::<BTreeSet<_>>();
-        let mut dependency_constraints = self
-            .list_dependency_constraints(workspace)?
-            .into_iter()
-            .filter(|(constraint_kind, source, target, rule)| {
-                !defaults.contains(&(
-                    constraint_kind.as_str(),
-                    source.as_str(),
-                    target.as_str(),
-                    rule.as_str(),
-                ))
-            })
-            .map(
-                |(constraint_kind, source, target, rule)| PersistedDependencyConstraint {
-                    constraint_kind,
-                    source,
-                    target,
-                    rule,
-                },
-            )
-            .collect::<Vec<_>>();
-        dependency_constraints.sort_by(|a, b| {
-            (&a.constraint_kind, &a.source, &a.target).cmp(&(
-                &b.constraint_kind,
-                &b.source,
-                &b.target,
-            ))
-        });
-
-        let policy = PersistedArchitecturePolicy {
-            version: 1,
-            layer_assignments,
-            dependency_constraints,
-        };
-
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("create policy directory {}", parent.display()))?;
-        }
-        let tmp_path = path.with_extension("json.tmp");
-        let json = serde_json::to_string_pretty(&policy)?;
-        fs::write(&tmp_path, format!("{json}\n"))
-            .with_context(|| format!("write temporary policy file {}", tmp_path.display()))?;
-        fs::rename(&tmp_path, path)
-            .with_context(|| format!("replace persisted architecture policy {}", path.display()))?;
-
-        Ok(())
-    }
-
     /// Evaluate policy violations: find context dependencies that violate layer
     /// or context-level forbidden constraints.
     pub fn evaluate_policy_violations(&self, workspace: &str) -> Result<serde_json::Value> {
         let ws = canonicalize_path(workspace);
-        self.reload_persisted_policy(&ws)?;
+        self.refresh_runtime_constraints(&ws)?;
         self.evaluate_policy_violations_canonical(&ws)
     }
 
@@ -5120,12 +5041,20 @@ impl Store {
         // where X→Y is forbidden
         let layer_violations = self
             .run_script(
-                "?[from_ctx, to_ctx, from_layer, to_layer] := \
+                "allowed_layer[from_layer, to_layer] := \
+                    *dependency_constraint{workspace: $ws, constraint_kind: 'layer', \
+                        source: from_layer, target: to_layer, rule: 'allowed'} \
+                 allowed_context[from_ctx, to_ctx] := \
+                    *dependency_constraint{workspace: $ws, constraint_kind: 'context', \
+                        source: from_ctx, target: to_ctx, rule: 'allowed'} \
+                 ?[from_ctx, to_ctx, from_layer, to_layer] := \
                     *context_dep{workspace: $ws, from_ctx, to_ctx, state: 'actual' @ 'NOW'}, \
                     *layer_assignment{workspace: $ws, context: from_ctx, layer: from_layer}, \
                     *layer_assignment{workspace: $ws, context: to_ctx, layer: to_layer}, \
                     *dependency_constraint{workspace: $ws, constraint_kind: 'layer', \
-                        source: from_layer, target: to_layer, rule: 'forbidden'}",
+                        source: from_layer, target: to_layer, rule: 'forbidden'}, \
+                    not allowed_layer[from_layer, to_layer], \
+                    not allowed_context[from_ctx, to_ctx]",
                 params.clone(),
                 ScriptMutability::Immutable,
             )
@@ -5134,14 +5063,42 @@ impl Store {
         // Context-level violations: context A depends on context B where A→B is forbidden
         let context_violations = self
             .run_script(
-                "?[from_ctx, to_ctx] := \
+                "allowed_context[from_ctx, to_ctx] := \
+                    *dependency_constraint{workspace: $ws, constraint_kind: 'context', \
+                        source: from_ctx, target: to_ctx, rule: 'allowed'} \
+                 ?[from_ctx, to_ctx] := \
                     *context_dep{workspace: $ws, from_ctx, to_ctx, state: 'actual' @ 'NOW'}, \
                     *dependency_constraint{workspace: $ws, constraint_kind: 'context', \
-                        source: from_ctx, target: to_ctx, rule: 'forbidden'}",
-                params,
+                        source: from_ctx, target: to_ctx, rule: 'forbidden'}, \
+                    not allowed_context[from_ctx, to_ctx]",
+                params.clone(),
                 ScriptMutability::Immutable,
             )
             .map_err(|e| anyhow::anyhow!("policy context violations: {:?}", e))?;
+
+        let accepted_layer_deviations = self
+            .run_script(
+                "?[from_ctx, to_ctx, from_layer, to_layer] := \
+                    *context_dep{workspace: $ws, from_ctx, to_ctx, state: 'actual' @ 'NOW'}, \
+                    *layer_assignment{workspace: $ws, context: from_ctx, layer: from_layer}, \
+                    *layer_assignment{workspace: $ws, context: to_ctx, layer: to_layer}, \
+                    *dependency_constraint{workspace: $ws, constraint_kind: 'layer', \
+                        source: from_layer, target: to_layer, rule: 'allowed'}",
+                params.clone(),
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| anyhow::anyhow!("accepted layer deviations: {:?}", e))?;
+
+        let accepted_context_deviations = self
+            .run_script(
+                "?[from_ctx, to_ctx] := \
+                    *context_dep{workspace: $ws, from_ctx, to_ctx, state: 'actual' @ 'NOW'}, \
+                    *dependency_constraint{workspace: $ws, constraint_kind: 'context', \
+                        source: from_ctx, target: to_ctx, rule: 'allowed'}",
+                params,
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| anyhow::anyhow!("accepted context deviations: {:?}", e))?;
 
         let layer_items: Vec<serde_json::Value> = layer_violations
             .rows
@@ -5171,8 +5128,51 @@ impl Store {
             })
             .collect();
 
+        let accepted_layer_items: Vec<serde_json::Value> = accepted_layer_deviations
+            .rows
+            .iter()
+            .map(|r| {
+                json!({
+                    "kind": "layer",
+                    "from_context": dv_str(&r[0]),
+                    "to_context": dv_str(&r[1]),
+                    "from_layer": dv_str(&r[2]),
+                    "to_layer": dv_str(&r[3]),
+                    "rule": "allowed",
+                })
+            })
+            .collect();
+
+        let accepted_context_items: Vec<serde_json::Value> = accepted_context_deviations
+            .rows
+            .iter()
+            .map(|r| {
+                json!({
+                    "kind": "context",
+                    "from_context": dv_str(&r[0]),
+                    "to_context": dv_str(&r[1]),
+                    "rule": "allowed",
+                })
+            })
+            .collect();
+
         let all_violations: Vec<serde_json::Value> =
             layer_items.into_iter().chain(context_items).collect();
+        let accepted_deviations: Vec<serde_json::Value> = accepted_layer_items
+            .into_iter()
+            .chain(accepted_context_items)
+            .collect();
+        let warnings: Vec<serde_json::Value> = accepted_deviations
+            .iter()
+            .map(|deviation| {
+                json!(format!(
+                    "Accepted runtime architecture deviation: {} -> {} ({})",
+                    deviation["from_context"].as_str().unwrap_or("?"),
+                    deviation["to_context"].as_str().unwrap_or("?"),
+                    deviation["kind"].as_str().unwrap_or("constraint")
+                ))
+            })
+            .collect();
         let complexity = self.context_complexity(ws)?;
         let policy_coverage = self.policy_coverage(ws, &complexity)?;
         let configured = policy_coverage.context_count == 0
@@ -5192,6 +5192,10 @@ impl Store {
             "policy_coverage": policy_coverage,
             "violations": all_violations,
             "count": all_violations.len(),
+            "accepted_deviations": accepted_deviations,
+            "accepted_deviation_count": accepted_deviations.len(),
+            "warnings": warnings,
+            "constraint_persistence": "runtime_only",
         }))
     }
 
@@ -5218,8 +5222,8 @@ impl Store {
         let to_filter = args["to"].as_str().unwrap_or("");
         let requested_scope =
             RustFactScope::parse(args["scope"].as_str().unwrap_or("all"), RustFactScope::All)?;
-        let limit = args["limit"].as_u64().unwrap_or(50).clamp(1, 200) as usize;
-        let offset = args["offset"].as_u64().unwrap_or(0).min(10_000) as usize;
+        let limit = u64_to_usize_saturating(args["limit"].as_u64().unwrap_or(50).clamp(1, 200));
+        let offset = u64_to_usize_saturating(args["offset"].as_u64().unwrap_or(0).min(10_000));
         let filter_context = context_filter.to_lowercase();
         let filter_file = file_filter.to_lowercase();
         let filter_symbol = symbol_filter.to_lowercase();
@@ -6026,7 +6030,7 @@ impl Store {
                 )
                 .map_err(|e| anyhow::anyhow!("graph relation count {relation}: {:?}", e))?;
             let count = rows.rows.first().map(|row| dv_i64(&row[0])).unwrap_or(0);
-            counts.insert(relation.to_string(), count.max(0) as usize);
+            counts.insert(relation.to_string(), i64_to_usize_saturating(count.max(0)));
         }
 
         Ok(counts)
@@ -6796,7 +6800,7 @@ impl Store {
             recommendations.push(json!({
                 "kind": if public_api_like { "public_api_surface" } else { "facade" },
                 "target": target,
-                "score": if public_api_like { (importers.len() as i64).max(1) / 2 } else { importers.len() as i64 },
+                "score": if public_api_like { (usize_to_i64(importers.len())).max(1) / 2 } else { usize_to_i64(importers.len()) },
                 "confidence": if public_api_like { "medium" } else if importers.len() >= 5 { "high" } else { "medium" },
                 "rationale": if public_api_like { "Several files import a shared public API-shaped module; keep the surface deliberate and avoid broad wildcard coupling." } else { "Several outside files import this internal module directly; a stable facade can reduce downstream churn." },
                 "proposed_shape": if public_api_like { "Keep the module as an explicit public API, and tighten imports or split exports if the surface becomes too broad." } else { "Expose a narrow module facade or port and route external imports through it." },
@@ -6883,7 +6887,7 @@ impl Store {
                 recommendations.push(json!({
                     "kind": "map_reduce",
                     "target": callee,
-                    "score": caller_count as i64 + files.len() as i64,
+                    "score": usize_to_i64(caller_count) + usize_to_i64(files.len()),
                     "confidence": if contexts.len() > 1 { "medium" } else { "low" },
                     "rationale": "Many independent callers feed the same aggregation-shaped callee; the call graph suggests a possible map/reduce or batch pipeline boundary.",
                     "proposed_shape": "Map work per file/module, reduce through this callee, and validate semantic independence before parallelizing.",
@@ -6899,7 +6903,7 @@ impl Store {
                 recommendations.push(json!({
                     "kind": "actor_boundary",
                     "target": callee,
-                    "score": caller_count as i64,
+                    "score": usize_to_i64(caller_count),
                     "confidence": "low",
                     "rationale": "A command-shaped callee has broad fan-in; if it owns mutable coordination, it may want an actor or queue boundary.",
                     "proposed_shape": "Keep state behind one owner and have callers submit typed commands/events instead of direct coordination calls.",
@@ -6945,7 +6949,7 @@ impl Store {
             recommendations.push(json!({
                 "kind": "rename",
                 "target": short,
-                "score": matches.len() as i64 + ambiguous_calls as i64,
+                "score": usize_to_i64(matches.len()) + usize_to_i64(ambiguous_calls),
                 "confidence": if ambiguous_calls > 0 { "medium" } else { "low" },
                 "rationale": "Multiple symbols share this short name, which makes syntactic call/import evidence ambiguous and weakens future rename safety.",
                 "proposed_shape": "Give at least the cross-boundary or high-fan-in symbol a role-specific name, then use rust-analyzer rename for edits.",
@@ -7078,7 +7082,7 @@ impl Store {
             recommendations.push(json!({
                 "kind": "move_or_facade",
                 "target": symbol,
-                "score": *dominant_count as i64,
+                "score": usize_to_i64(*dominant_count),
                 "confidence": "medium",
                 "rationale": "Most inbound calls come from a different context than the symbol's declared context; either the symbol belongs nearer those callers or the current context needs a clearer facade.",
                 "proposed_shape": "Evaluate moving the symbol, extracting a port, or exposing an explicit facade from the owning context.",
@@ -7109,7 +7113,7 @@ impl Store {
             recommendations.push(json!({
                 "kind": "port_adapter_review",
                 "target": "trait implementations",
-                "score": impl_edges as i64,
+                "score": usize_to_i64(impl_edges),
                 "confidence": "low",
                 "rationale": "The graph contains trait implementation edges; cross-context concrete dependencies should usually point at the trait port instead of adapters.",
                 "proposed_shape": "Review implements edges with inbound imports/calls and keep adapters behind their port boundary.",
@@ -7301,7 +7305,7 @@ impl Store {
                 continue;
             }
             let scope = rust_fact_scope_label(&file_path, &caller, &callee);
-            let raw_priority = base_score + inbound.min(10) as i64;
+            let raw_priority = base_score + usize_to_i64(inbound.min(10));
             let remediation = if scope == "test" {
                 "Keep test unwraps when they express fixture setup or assertion intent; otherwise use expect with an intent-specific message."
             } else {
@@ -7452,7 +7456,7 @@ impl Store {
                 "kind": "high_fan_in_private_symbol",
                 "category": "coupling",
                 "severity": "info",
-                "priority_score": scoped_priority(42 + callers.len().min(20) as i64, scope),
+                "priority_score": scoped_priority(42 + usize_to_i64(callers.len().min(20)), scope),
                 "scope": scope,
                 "confidence": "medium",
                 "target": name,
@@ -7659,7 +7663,7 @@ impl Store {
     ) -> Result<serde_json::Value> {
         let ws = canonicalize_path(workspace);
         let mut params = params_map(&[("ws", &ws), ("q", query)]);
-        params.insert("k".into(), int_dv(limit as i64));
+        params.insert("k".into(), int_dv(usize_to_i64(limit)));
 
         let mut results: Vec<serde_json::Value> = Vec::new();
 
@@ -8027,16 +8031,17 @@ impl Store {
             }
         }
         let damping = 0.85;
-        let base = (1.0 - damping) / n as f64;
-        let mut rank = vec![1.0_f64 / n as f64; n];
+        let n_f64 = usize_to_f64(n);
+        let base = (1.0 - damping) / n_f64;
+        let mut rank = vec![1.0_f64 / n_f64; n];
         for _ in 0..200 {
             let mut next = vec![base; n];
             let mut dangling = 0.0;
             for i in 0..n {
                 if out[i].is_empty() {
-                    dangling += damping * rank[i] / n as f64;
+                    dangling += damping * rank[i] / n_f64;
                 } else {
-                    let share = damping * rank[i] / out[i].len() as f64;
+                    let share = damping * rank[i] / usize_to_f64(out[i].len());
                     for &j in &out[i] {
                         next[j] += share;
                     }
@@ -8257,7 +8262,7 @@ impl Store {
 
         while let Some(ctx) = ready.iter().next().cloned() {
             ready.remove(&ctx);
-            let order = ordered.len() as i64;
+            let order = usize_to_i64(ordered.len());
             ordered.push((ctx.clone(), order));
             if let Some(context_dependents) = dependents.get(&ctx) {
                 for dependent in context_dependents {
@@ -8298,7 +8303,7 @@ impl Store {
 
     pub fn model_health(&self, workspace: &str) -> Result<ModelHealth> {
         let canonical = canonicalize_path(workspace);
-        self.reload_persisted_policy(&canonical)?;
+        self.refresh_runtime_constraints(&canonical)?;
         let circular = self.circular_deps(&canonical)?;
         let module_cycles = self.module_cycles(&canonical).unwrap_or_default();
         let violations = self.layer_violations(&canonical)?;
@@ -8348,8 +8353,11 @@ impl Store {
                 + usize::from(policy_coverage.dependency_constraint_count == 0)
         };
         let info = orphans.len() + policy_gaps;
-        let score = (100i32 - (critical as i32 * 20) - (warnings as i32 * 5) - (info as i32 * 2))
-            .max(0) as u32;
+        let score = 100_i64
+            .saturating_sub(usize_to_i64(critical).saturating_mul(20))
+            .saturating_sub(usize_to_i64(warnings).saturating_mul(5))
+            .saturating_sub(usize_to_i64(info).saturating_mul(2));
+        let score = u32::try_from(score.max(0)).unwrap_or(0);
 
         Ok(ModelHealth {
             score,
@@ -8420,7 +8428,8 @@ impl Store {
                 )
                 .map_err(|e| anyhow::anyhow!("context_complexity entity count: {:?}", e))?
                 .rows
-                .len() as u32;
+                .len();
+            let entity_count = usize_to_u32(entity_count);
             let service_count = self
                 .run_script(
                     "?[name] := *service{workspace: $ws, context: $ctx, name, state: 'actual' @ 'NOW'}",
@@ -8429,7 +8438,8 @@ impl Store {
                 )
                 .map_err(|e| anyhow::anyhow!("context_complexity service count: {:?}", e))?
                 .rows
-                .len() as u32;
+                .len();
+            let service_count = usize_to_u32(service_count);
             let event_count = self
                 .run_script(
                     "?[name] := *event{workspace: $ws, context: $ctx, name, state: 'actual' @ 'NOW'}",
@@ -8438,7 +8448,8 @@ impl Store {
                 )
                 .map_err(|e| anyhow::anyhow!("context_complexity event count: {:?}", e))?
                 .rows
-                .len() as u32;
+                .len();
+            let event_count = usize_to_u32(event_count);
             let dep_count = self
                 .run_script(
                     "?[dep] := *context_dep{workspace: $ws, from_ctx: $ctx, to_ctx: dep, state: 'actual' @ 'NOW'}",
@@ -8447,7 +8458,8 @@ impl Store {
                 )
                 .map_err(|e| anyhow::anyhow!("context_complexity dependency count: {:?}", e))?
                 .rows
-                .len() as u32;
+                .len();
+            let dep_count = usize_to_u32(dep_count);
             complexity.push(ContextComplexity {
                 context,
                 entity_count,
@@ -8500,29 +8512,6 @@ impl Store {
             .map(|r| [dv_str(&r[0]), dv_str(&r[1])])
             .collect())
     }
-}
-
-// ── Policy Persistence Types ──────────────────────────────────────────────
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PersistedArchitecturePolicy {
-    version: u32,
-    layer_assignments: Vec<PersistedLayerAssignment>,
-    dependency_constraints: Vec<PersistedDependencyConstraint>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PersistedLayerAssignment {
-    context: String,
-    layer: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PersistedDependencyConstraint {
-    constraint_kind: String,
-    source: String,
-    target: String,
-    rule: String,
 }
 
 // ── Helper Functions ───────────────────────────────────────────────────────
@@ -8605,8 +8594,8 @@ pub fn canonicalize_path(path: &str) -> String {
 /// the outer ring. Every outward-pointing layer dependency is forbidden. Because
 /// this grammar is the same for every Rust/DDD project, it ships as a default so
 /// a conventionally-structured workspace gets architecture governance with no
-/// hand-written policy. These rows are never written to `.axon/policy.json`;
-/// only explicit overrides are persisted (see [`Store::persist_policy`]).
+/// hand-written policy. These rows are never written into the scanned
+/// repository; explicit overrides are runtime-only for the active store session.
 pub fn default_layer_constraints()
 -> &'static [(&'static str, &'static str, &'static str, &'static str)] {
     &[
@@ -8627,6 +8616,34 @@ fn params_map(pairs: &[(&str, &str)]) -> BTreeMap<String, cozo::DataValue> {
 
 fn int_dv(n: i64) -> cozo::DataValue {
     cozo::DataValue::Num(cozo::Num::Int(n))
+}
+
+fn usize_to_i64(value: usize) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+fn usize_to_u32(value: usize) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
+}
+
+fn u64_to_usize_saturating(value: u64) -> usize {
+    usize::try_from(value).unwrap_or(usize::MAX)
+}
+
+fn i64_to_usize_saturating(value: i64) -> usize {
+    if value <= 0 {
+        0
+    } else {
+        usize::try_from(value).unwrap_or(usize::MAX)
+    }
+}
+
+fn u128_to_i64_saturating(value: u128) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+fn usize_to_f64(value: usize) -> f64 {
+    f64::from(usize_to_u32(value))
 }
 
 fn text_matches(haystack: &str, needle_lowercase: &str) -> bool {
@@ -9011,6 +9028,7 @@ fn dv_str(val: &cozo::DataValue) -> String {
 fn dv_i64(val: &cozo::DataValue) -> i64 {
     match val {
         cozo::DataValue::Num(cozo::Num::Int(i)) => *i,
+        #[allow(clippy::cast_possible_truncation)]
         cozo::DataValue::Num(cozo::Num::Float(f)) => *f as i64,
         _ => 0,
     }
@@ -9023,7 +9041,7 @@ fn dv_opt_string(val: &cozo::DataValue) -> Option<String> {
 
 fn dv_opt_usize(val: &cozo::DataValue) -> Option<usize> {
     match dv_i64(val) {
-        n if n > 0 => Some(n as usize),
+        n if n > 0 => usize::try_from(n).ok(),
         _ => None,
     }
 }

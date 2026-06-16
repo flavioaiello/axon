@@ -1,7 +1,15 @@
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::json;
 
-use super::{load_actual_model, prompts, protocol::*, resources, tools, write_tools};
+use super::{
+    load_actual_model, prompts,
+    protocol::{
+        InitializeResult, JsonRpcRequest, JsonRpcResponse, PromptGetParams, PromptsCapability,
+        PromptsListResult, ResourceReadParams, ResourcesCapability, ResourcesListResult,
+        ServerCapabilities, ServerInfo, ToolCallParams, ToolsCapability, ToolsListResult,
+    },
+    resources, tools, write_tools,
+};
 use crate::store::{CrateEntry, CrateRegistry, Store};
 
 /// List of write-tool names used to route `tools/call` to the mutable path.

@@ -7,6 +7,8 @@
 //! degree centrality, topological order), orphan/god context detection,
 //! dependency paths, model health, drift computation, and search.
 
+#![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
+
 use std::env::temp_dir;
 use std::fs;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -73,9 +75,8 @@ fn canonicalize(path: &str) -> String {
     canonicalize_path(path)
 }
 
-/// Create a unique temp directory that looks like a crate root (has a
-/// `Cargo.toml`), so `Store::open` enables `.axon/policy.json` persistence and
-/// keys all operations under the same canonical workspace.
+/// Create a unique temp directory that looks like a crate root and keys all
+/// operations under the same canonical workspace.
 fn unique_crate_root(prefix: &str) -> std::path::PathBuf {
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -399,7 +400,10 @@ fn policy_violation_none_when_no_forbidden() {
     assert_eq!(result["status"], "unconfigured");
     assert_eq!(result["configured"], false);
     assert_eq!(result["count"], 0);
-    assert_eq!(result["policy_coverage"]["dependency_constraint_count"], 0);
+    assert_eq!(
+        result["policy_coverage"]["dependency_constraint_count"],
+        default_layer_constraints().len()
+    );
 }
 
 #[test]
@@ -415,10 +419,10 @@ fn policy_violation_none_when_policy_configured() {
     store.save_desired(&ws, &model).unwrap();
 
     store
-        .upsert_layer_assignment(&canon, "A", "domain")
+        .upsert_layer_assignment(&canon, "A", "application")
         .unwrap();
     store
-        .upsert_layer_assignment(&canon, "B", "infrastructure")
+        .upsert_layer_assignment(&canon, "B", "domain")
         .unwrap();
     store
         .upsert_dependency_constraint(&canon, "layer", "infrastructure", "domain", "forbidden")
@@ -431,63 +435,61 @@ fn policy_violation_none_when_policy_configured() {
 }
 
 #[test]
-fn policy_assignments_survive_store_reopen_for_crate_root() {
-    let unique = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let root = temp_dir().join(format!(
-        "axon_policy_reopen_{}_{}",
-        std::process::id(),
-        unique
-    ));
-    fs::create_dir_all(&root).unwrap();
-    fs::write(
-        root.join("Cargo.toml"),
-        "[package]\nname = \"policy-reopen\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
-    )
-    .unwrap();
+fn runtime_constraints_do_not_survive_store_reopen_for_crate_root() {
+    let root = unique_crate_root("axon_policy_reopen");
     let ws = canonicalize_path(&root.to_string_lossy());
 
     {
         let store = Store::open(&root).unwrap();
-        // "A" matches no layer convention, so this is a genuine explicit override.
         store.upsert_layer_assignment(&ws, "A", "domain").unwrap();
-        // A non-default constraint that must round-trip across reopen.
         store
             .upsert_dependency_constraint(&ws, "context", "Auth", "Billing", "forbidden")
             .unwrap();
+
+        assert_eq!(
+            store.list_layer_assignments(&ws).unwrap(),
+            vec![("A".into(), "domain".into())]
+        );
+        assert!(store.list_dependency_constraints(&ws).unwrap().contains(&(
+            "context".into(),
+            "Auth".into(),
+            "Billing".into(),
+            "forbidden".into()
+        )));
+        assert!(
+            !root.join(".axon").exists(),
+            "runtime constraints must not create project-local .axon state"
+        );
     }
 
     let reopened = Store::open(&root).unwrap();
-    assert_eq!(
-        reopened.list_layer_assignments(&ws).unwrap(),
-        vec![("A".into(), "domain".into())]
+    assert!(
+        reopened.list_layer_assignments(&ws).unwrap().is_empty(),
+        "runtime layer overrides must not survive store reopen"
     );
 
     let constraints = reopened.list_dependency_constraints(&ws).unwrap();
-    // The explicit override survives the reopen…
     assert!(
-        constraints.contains(&(
+        !constraints.contains(&(
             "context".into(),
             "Auth".into(),
             "Billing".into(),
             "forbidden".into()
         )),
-        "explicit override should survive reopen, got {constraints:?}"
+        "runtime dependency overrides must not survive store reopen"
     );
-    // …alongside the always-seeded Clean-Architecture defaults.
     for (kind, source, target, rule) in default_layer_constraints() {
-        assert!(
-            constraints.contains(&(
-                kind.to_string(),
-                source.to_string(),
-                target.to_string(),
-                rule.to_string()
-            )),
-            "default {source}->{target} should be present after reopen"
-        );
+        assert!(constraints.contains(&(
+            kind.to_string(),
+            source.to_string(),
+            target.to_string(),
+            rule.to_string()
+        )));
     }
+    assert!(
+        !root.join(".axon").exists(),
+        "reopening must not create project-local .axon state"
+    );
 }
 
 #[test]
@@ -513,54 +515,39 @@ fn default_constraints_seeded_at_crate_root() {
 }
 
 #[test]
-fn persisted_policy_reload_updates_long_lived_store() {
-    let root = unique_crate_root("axon_policy_reload");
+fn allowed_runtime_deviation_suppresses_default_violation_and_warns() {
+    let root = unique_crate_root("axon_policy_allowed");
     let ws = canonicalize_path(&root.to_string_lossy());
     let store = Store::open(&root).unwrap();
 
-    let mut reasoning = empty_ctx("reasoning");
-    reasoning.dependencies = vec!["store".into()];
-    let store_ctx = empty_ctx("store");
+    let mut domain = empty_ctx("domain");
+    domain.dependencies = vec!["infrastructure".into()];
+    let infra = empty_ctx("infrastructure");
     let mut model = empty_model();
-    model.bounded_contexts = vec![reasoning, store_ctx];
+    model.bounded_contexts = vec![domain, infra];
     store.save_actual(&ws, &model).unwrap();
-
-    store
-        .upsert_layer_assignment(&ws, "reasoning", "application")
-        .unwrap();
-    store
-        .upsert_layer_assignment(&ws, "store", "infrastructure")
-        .unwrap();
 
     let before = store.evaluate_policy_violations(&ws).unwrap();
     assert_eq!(before["status"], "false");
     assert_eq!(before["count"], 1);
 
-    fs::write(
-        root.join(".axon").join("policy.json"),
-        r#"{
-  "version": 1,
-  "layer_assignments": [
-    { "context": "reasoning", "layer": "infrastructure" },
-    { "context": "store", "layer": "infrastructure" }
-  ],
-  "dependency_constraints": []
-}
-"#,
-    )
-    .unwrap();
-
-    assert!(store.reload_persisted_policy(&ws).unwrap());
-    let assignments = store.list_layer_assignments(&ws).unwrap();
-    assert!(assignments.contains(&("reasoning".into(), "infrastructure".into())));
-    assert!(!assignments.contains(&("reasoning".into(), "application".into())));
+    store
+        .upsert_dependency_constraint(&ws, "layer", "domain", "infrastructure", "allowed")
+        .unwrap();
 
     let after = store.evaluate_policy_violations(&ws).unwrap();
     assert_eq!(after["status"], "true");
     assert_eq!(after["count"], 0);
+    assert_eq!(after["accepted_deviation_count"], 1);
+    assert_eq!(after["constraint_persistence"], "runtime_only");
+    assert!(!after["warnings"].as_array().unwrap().is_empty());
 
     let health = store.model_health(&ws).unwrap();
     assert!(health.policy_violations.is_empty());
+    assert!(
+        !root.join(".axon").exists(),
+        "accepted deviations must remain runtime-only"
+    );
 }
 
 #[test]
@@ -594,7 +581,7 @@ fn inferred_layers_flag_violation_without_manual_policy() {
 }
 
 #[test]
-fn inferred_and_default_policy_are_not_persisted() {
+fn inferred_default_and_explicit_constraints_are_runtime_only() {
     let root = unique_crate_root("axon_policy_overrideonly");
     let ws = canonicalize_path(&root.to_string_lossy());
 
@@ -609,23 +596,28 @@ fn inferred_and_default_policy_are_not_persisted() {
         assert!(before.contains(&("domain".into(), "domain".into())));
         assert!(before.contains(&("infrastructure".into(), "infrastructure".into())));
 
-        // An explicit override on an unconventional context triggers persistence.
         store
             .upsert_layer_assignment(&ws, "billing", "domain")
             .unwrap();
+        assert!(
+            !root.join(".axon").exists(),
+            "explicit runtime overrides must not create project-local .axon state"
+        );
     }
 
-    // Reopen WITHOUT re-scanning: only explicit overrides should reload.
     let reopened = Store::open(&root).unwrap();
-    assert_eq!(
-        reopened.list_layer_assignments(&ws).unwrap(),
-        vec![("billing".into(), "domain".into())],
-        "inferred layers must not be persisted — only the explicit override"
+    assert!(
+        reopened.list_layer_assignments(&ws).unwrap().is_empty(),
+        "runtime layer overrides must not survive store reopen"
     );
     assert_eq!(
         reopened.list_dependency_constraints(&ws).unwrap().len(),
         default_layer_constraints().len(),
-        "no constraints beyond the re-seeded defaults should be persisted"
+        "only re-seeded defaults should be present after reopen"
+    );
+    assert!(
+        !root.join(".axon").exists(),
+        "reopen must not create project-local .axon state"
     );
 }
 
@@ -1187,7 +1179,10 @@ fn model_health_reports_policy_coverage_gaps() {
     let health = store.model_health(&canon).unwrap();
     assert_eq!(health.policy_coverage.context_count, 2);
     assert_eq!(health.policy_coverage.layer_assignment_count, 0);
-    assert_eq!(health.policy_coverage.dependency_constraint_count, 0);
+    assert_eq!(
+        health.policy_coverage.dependency_constraint_count,
+        default_layer_constraints().len()
+    );
     assert_eq!(health.policy_coverage.missing_layer_assignments.len(), 2);
     assert!(health.score < 100);
 
@@ -1200,7 +1195,10 @@ fn model_health_reports_policy_coverage_gaps() {
 
     let updated = store.model_health(&canon).unwrap();
     assert_eq!(updated.policy_coverage.layer_assignment_count, 1);
-    assert_eq!(updated.policy_coverage.dependency_constraint_count, 1);
+    assert_eq!(
+        updated.policy_coverage.dependency_constraint_count,
+        default_layer_constraints().len()
+    );
     assert_eq!(updated.policy_coverage.missing_layer_assignments, vec!["B"]);
 }
 
@@ -1681,7 +1679,7 @@ fn rust_graph_relation_counts_match_call_graph_stats() {
     assert_eq!(stats["total_edges"], 3);
     assert_eq!(
         counts["calls_symbol"],
-        stats["total_edges"].as_u64().unwrap() as usize
+        usize::try_from(stats["total_edges"].as_u64().unwrap()).unwrap()
     );
 
     let graph = store

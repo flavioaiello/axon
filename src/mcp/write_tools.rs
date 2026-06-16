@@ -2,12 +2,21 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::domain::analyze::{ActualScan, SemanticResolution};
-use crate::domain::model::*;
+use crate::domain::model::{
+    Aggregate, ArchitecturalDecision, DecisionStatus, DomainEvent, Entity, ExternalSystem, Field,
+    Method, Module, Ownership, Policy, PolicyKind, ReadModel, Repository, Service, ServiceKind,
+    ValueObject,
+};
 use crate::domain::rust_facts::{RustFeatureSelection, RustScanOptions, RustScanScope};
 use crate::domain::to_snake;
-use crate::mcp::protocol::*;
+use crate::mcp::protocol::{
+    ToolCallResult, ToolDefinition, error_tool_result, json_error_tool_result, json_tool_result,
+    text_tool_result, with_reasoning_context,
+};
 use crate::reasoning::ReasoningKernel;
 use crate::store::{PersistedReasoningClaim, ReasoningFactRef, Store};
+
+const RUNTIME_CONSTRAINT_WARNING: &str = "Architecture constraint changes are runtime-only; pass deviations again in a new session or iteration.";
 
 /// Returns the list of write tools the Axon server exposes.
 pub fn list_write_tools() -> Vec<ToolDefinition> {
@@ -154,7 +163,7 @@ fn rust_native_write_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "rust_constraints".into(),
-            description: "Declare and evaluate constraints over Rust modules and optional semantic annotations: layer assignments, allowed or forbidden dependencies, list current constraints, or evaluate violations.".into(),
+            description: "Declare and evaluate runtime-only constraints over Rust modules and optional semantic annotations: layer assignments, allowed deviations, forbidden dependencies, list current constraints, or evaluate violations.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -453,9 +462,9 @@ fn dispatch_write_tool(
                             };
                             let mut follow_on_failures = Vec::new();
 
-                            if let Err(e) = store.reload_persisted_policy(workspace_path) {
+                            if let Err(e) = store.refresh_runtime_constraints(workspace_path) {
                                 follow_on_failures
-                                    .push(format!("policy reload after scan failed: {e}"));
+                                    .push(format!("constraint refresh after scan failed: {e}"));
                             }
 
                             let drift_entry_count = Some(drift_count);
@@ -760,9 +769,11 @@ fn dispatch_write_tool(
                         return error_result("'layer' is required for assign_layer");
                     }
                     match store.upsert_layer_assignment(workspace_path, &context, &layer) {
-                        Ok(()) => match invalidate_and_refresh_policy(store, workspace_path) {
+                        Ok(()) => match invalidate_and_refresh_constraints(store, workspace_path) {
                             Ok(()) => text_result(json!({
                                 "message": format!("Assigned context '{}' to layer '{}'", context, layer),
+                                "constraint_persistence": "runtime_only",
+                                "warning": RUNTIME_CONSTRAINT_WARNING,
                             }).to_string()),
                             Err(e) => error_result(format!(
                                 "Layer assignment succeeded but {e}"
@@ -778,10 +789,12 @@ fn dispatch_write_tool(
                         return error_result("'context' is required for remove_layer");
                     }
                     match store.remove_layer_assignment(workspace_path, &context) {
-                        Ok(true) => match invalidate_and_refresh_policy(store, workspace_path) {
-                            Ok(()) => text_result(format!(
-                                "Removed layer assignment for context '{context}'"
-                            )),
+                        Ok(true) => match invalidate_and_refresh_constraints(store, workspace_path) {
+                            Ok(()) => text_result(json!({
+                                "message": format!("Removed layer assignment for context '{context}'"),
+                                "constraint_persistence": "runtime_only",
+                                "warning": RUNTIME_CONSTRAINT_WARNING,
+                            }).to_string()),
                             Err(e) => error_result(format!("Layer removal succeeded but {e}")),
                         },
                         Ok(false) => error_result(format!(
@@ -811,9 +824,15 @@ fn dispatch_write_tool(
                         return error_result("'rule' must be 'forbidden' or 'allowed'");
                     }
                     match store.upsert_dependency_constraint(workspace_path, &constraint_kind, &source, &target, rule) {
-                        Ok(()) => match invalidate_and_refresh_policy(store, workspace_path) {
+                        Ok(()) => match invalidate_and_refresh_constraints(store, workspace_path) {
                             Ok(()) => text_result(json!({
-                                "message": format!("{} dependency: {} → {} ({})", rule, source, target, constraint_kind),
+                                "message": if rule == "allowed" {
+                                    format!("Accepted runtime dependency deviation: {} -> {} ({})", source, target, constraint_kind)
+                                } else {
+                                    format!("{} dependency: {} -> {} ({})", rule, source, target, constraint_kind)
+                                },
+                                "constraint_persistence": "runtime_only",
+                                "warning": RUNTIME_CONSTRAINT_WARNING,
                             }).to_string()),
                             Err(e) => error_result(format!(
                                 "Constraint update succeeded but {e}"
@@ -838,11 +857,19 @@ fn dispatch_write_tool(
                         &source,
                         &target,
                     ) {
-                        Ok(true) => match invalidate_and_refresh_policy(store, workspace_path) {
-                            Ok(()) => text_result(format!(
-                                "Removed {} constraint {} -> {}",
-                                constraint_kind, source, target
-                            )),
+                        Ok(true) => match invalidate_and_refresh_constraints(store, workspace_path)
+                        {
+                            Ok(()) => text_result(
+                                json!({
+                                    "message": format!(
+                                        "Removed {} constraint {} -> {}",
+                                        constraint_kind, source, target
+                                    ),
+                                    "constraint_persistence": "runtime_only",
+                                    "warning": RUNTIME_CONSTRAINT_WARNING,
+                                })
+                                .to_string(),
+                            ),
                             Err(e) => error_result(format!("Constraint removal succeeded but {e}")),
                         },
                         Ok(false) => error_result(format!(
@@ -854,8 +881,8 @@ fn dispatch_write_tool(
                 }
 
                 "list" => {
-                    if let Err(e) = store.reload_persisted_policy(workspace_path) {
-                        return error_result(format!("Policy reload failed: {e}"));
+                    if let Err(e) = store.refresh_runtime_constraints(workspace_path) {
+                        return error_result(format!("Constraint refresh failed: {e}"));
                     }
                     let layers = store
                         .list_layer_assignments(workspace_path)
@@ -884,6 +911,8 @@ fn dispatch_write_tool(
                         json!({
                             "layer_assignments": layer_items,
                             "dependency_constraints": constraint_items,
+                            "constraint_persistence": "runtime_only",
+                            "warning": RUNTIME_CONSTRAINT_WARNING,
                         })
                         .to_string(),
                     )
@@ -1723,7 +1752,7 @@ fn invalidate_and_refresh_facts(
     Ok(())
 }
 
-fn invalidate_and_refresh_policy(store: &Store, workspace_path: &str) -> Result<(), String> {
+fn invalidate_and_refresh_constraints(store: &Store, workspace_path: &str) -> Result<(), String> {
     store
         .invalidate_reasoning_claims_for_facts(
             workspace_path,
@@ -1732,14 +1761,16 @@ fn invalidate_and_refresh_policy(store: &Store, workspace_path: &str) -> Result<
                 fact_ref("dependency_constraint", "*", "actual"),
             ],
         )
-        .map_err(|e| format!("reasoning policy fact invalidation failed: {e}"))?;
+        .map_err(|e| format!("reasoning constraint fact invalidation failed: {e}"))?;
     store
         .invalidate_reasoning_claims_for_dependency(workspace_path, "actual")
-        .map_err(|e| format!("reasoning policy dependency invalidation failed: {e}"))?;
+        .map_err(|e| format!("reasoning constraint dependency invalidation failed: {e}"))?;
     let kernel = ReasoningKernel::new(store);
     kernel
         .eager_refresh_stale_claims(workspace_path)
-        .map_err(|e| format!("reasoning eager refresh failed after policy invalidation: {e}"))?;
+        .map_err(|e| {
+            format!("reasoning eager refresh failed after constraint invalidation: {e}")
+        })?;
     Ok(())
 }
 
@@ -2630,6 +2661,8 @@ fn attach_diagnose_readiness(payload: &mut Value, store: &Store, workspace_path:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::model::{BoundedContext, CallEdge, Conventions, DomainModel, TechStack};
+    use crate::mcp::protocol::ContentBlock;
     use crate::store::Store;
     use std::env::temp_dir;
 
