@@ -112,17 +112,18 @@ async fn main() -> Result<()> {
 
     match cli.command {
         // Default: serve from cwd, bridging to the shared daemon (daemon-only).
-        None => serve_via_daemon(resolve_workspace(None)?).await?,
+        None => serve_via_daemon(resolve_workspace_for_serve(None)?).await?,
 
         Some(Commands::Serve {
             workspace,
             web_port,
             standalone,
         }) => {
-            let workspace = resolve_workspace(workspace)?;
             if standalone {
+                let workspace = resolve_workspace(workspace)?;
                 run_standalone(workspace, web_port).await?;
             } else {
+                let workspace = resolve_workspace_for_serve(workspace)?;
                 serve_via_daemon(workspace).await?;
             }
         }
@@ -296,6 +297,29 @@ fn resolve_workspace(workspace: Option<String>) -> Result<String> {
     })?;
 
     Ok(workspace.to_string_lossy().into_owned())
+}
+
+fn resolve_workspace_for_serve(workspace: Option<String>) -> Result<String> {
+    if let Some(workspace) = workspace {
+        return Ok(workspace);
+    }
+
+    let cwd = std::env::current_dir().context("cannot determine current directory")?;
+    let (workspace, inferred) = infer_workspace_or_cwd_for_serve(&cwd);
+    if !inferred {
+        tracing::warn!(
+            "no Cargo workspace or package found at or above {}; using current directory so the MCP client receives a JSON-RPC workspace error instead of a closed connection",
+            cwd.display()
+        );
+    }
+    Ok(workspace.to_string_lossy().into_owned())
+}
+
+fn infer_workspace_or_cwd_for_serve(start: &Path) -> (PathBuf, bool) {
+    match infer_workspace_from(start) {
+        Some(workspace) => (workspace, true),
+        None => (canonicalize_or_self(start), false),
+    }
 }
 
 fn infer_workspace_from(start: &Path) -> Option<PathBuf> {
@@ -474,6 +498,20 @@ mod tests {
         std::fs::create_dir_all(&nested).unwrap();
 
         assert_eq!(infer_workspace_from(&nested), None);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn serve_workspace_resolution_falls_back_to_cwd_without_cargo() {
+        let root = temp_root("axon_workspace_resolution_serve_empty");
+        let nested = root.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let (workspace, inferred) = infer_workspace_or_cwd_for_serve(&nested);
+
+        assert!(!inferred);
+        assert_eq!(workspace, nested.canonicalize().unwrap());
 
         let _ = std::fs::remove_dir_all(root);
     }
