@@ -18,8 +18,7 @@ use std::sync::Arc;
 /// A discovered crate within a workspace, with its own in-memory CozoDB store.
 ///
 /// Each crate gets an independent store for the lifetime of the current process.
-/// The `workspace_key()` value is the canonical crate root path, used as the
-/// `workspace` column value in all CozoDB relations.
+/// The `crate_key()` value is the canonical crate root path.
 pub struct CrateEntry {
     /// Crate name (from directory name)
     pub name: String,
@@ -30,9 +29,15 @@ pub struct CrateEntry {
 }
 
 impl CrateEntry {
-    /// The canonical workspace key for this crate's store operations.
-    pub fn workspace_key(&self) -> String {
+    /// The canonical key for this crate's store operations.
+    pub fn crate_key(&self) -> String {
         canonicalize_path(&self.root.to_string_lossy())
+    }
+
+    /// Compatibility alias for relations that still store this key in a
+    /// historically named `workspace` column.
+    pub fn workspace_key(&self) -> String {
+        self.crate_key()
     }
 }
 
