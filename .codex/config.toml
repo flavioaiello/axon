@@ -1,4 +1,4 @@
 [mcp_servers.axon]
 enabled = true
-command = "/opt/homebrew/bin/axon"
-args = ["serve", "--workspace", "."]
+command = "/Users/flavioaiello/git/axon/target/debug/axon"
+args = ["serve"]

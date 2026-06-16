@@ -1,0 +1,9 @@
+{
+  "servers": {
+    "axon": {
+      "type": "stdio",
+      "command": "${workspaceFolder}/target/debug/axon",
+      "args": ["serve"]
+    }
+  }
+}

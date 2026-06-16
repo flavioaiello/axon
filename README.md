@@ -101,7 +101,7 @@ Add to `.vscode/mcp.json` in your project:
     "axon": {
       "type": "stdio",
       "command": "/opt/homebrew/bin/axon",
-      "args": ["serve", "--workspace", "${workspaceFolder}"]
+      "args": ["serve"]
     }
   }
 }
@@ -121,7 +121,7 @@ binary so MCP requests exercise your edited source:
     "axon-dev": {
       "type": "stdio",
       "command": "${workspaceFolder}/target/debug/axon",
-      "args": ["serve", "--workspace", "${workspaceFolder}"]
+      "args": ["serve"]
     }
   }
 }
@@ -129,7 +129,9 @@ binary so MCP requests exercise your edited source:
 
 The default `serve` command bridges to the shared daemon. Restarting the
 Homebrew service restarts that daemon, but it does not rebuild or reinstall a
-locally edited binary.
+locally edited binary. When `--workspace` is omitted, axon infers the workspace
+from the nearest Cargo workspace or package ancestor of the MCP child process
+cwd. It does not scan downward from unrelated directories.
 
 ### GitHub Copilot CLI
 
@@ -166,7 +168,7 @@ Claude Code can use a project-shared `.mcp.json` file:
     "axon": {
       "type": "stdio",
       "command": "/opt/homebrew/bin/axon",
-      "args": ["serve", "--workspace", "${CLAUDE_PROJECT_DIR:-.}"]
+      "args": ["serve"]
     }
   }
 }
@@ -176,7 +178,7 @@ You can also register the same server from a VS Code or VSCodium terminal:
 
 ```bash
 claude mcp add --scope project --transport stdio axon -- \
-  /opt/homebrew/bin/axon serve --workspace '${CLAUDE_PROJECT_DIR:-.}'
+  /opt/homebrew/bin/axon serve
 ```
 
 For a private current-project config, omit `--scope project`; Claude Code stores
@@ -201,13 +203,12 @@ Codex stores MCP servers in TOML. For a project-shared setup, add
 ```toml
 [mcp_servers.axon]
 command = "/opt/homebrew/bin/axon"
-args = ["serve", "--workspace", "."]
+args = ["serve"]
 ```
 
-Leave `cwd` unset here. Codex starts the MCP child in the session workspace,
-and axon's bridge canonicalizes `--workspace .` before handing the session to
-the long-running daemon. That keeps project configs portable and avoids making
-workspace resolution depend on the MCP launcher process.
+Leave `cwd` unset here. Codex starts the MCP child in the session workspace, and
+axon resolves that launch directory to the nearest Cargo workspace/package
+ancestor before handing the session to the long-running daemon.
 
 For a private user-level setup shared by Codex CLI and the Codex IDE extension,
 put the same table in `~/.codex/config.toml` with an absolute workspace path:

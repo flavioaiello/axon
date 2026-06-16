@@ -1,6 +1,6 @@
 use crate::domain::analyze::{SemanticResolution, scan_actual_graph};
 use crate::store::CrateRegistry;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use notify::{Event, RecursiveMode, Watcher};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -50,7 +50,7 @@ impl ActualStateWatcher {
         let registry = self.registry;
 
         info!("Performing initial in-memory architecture sync...");
-        sync_all_crates(&registry).await?;
+        sync_all_crates(Arc::clone(&registry)).await?;
 
         tokio::spawn(async move {
             // Keep the watcher alive by moving it into the task
@@ -78,7 +78,7 @@ impl ActualStateWatcher {
                                     "Code modifications still arriving after {:?}. Syncing Actual Model...",
                                     max_debounce_duration
                                 );
-                                if let Err(e) = sync_all_crates(&registry).await {
+                                if let Err(e) = sync_all_crates(Arc::clone(&registry)).await {
                                     error!("Failed to sync actual model: {}", e);
                                 }
                                 break;
@@ -89,7 +89,7 @@ impl ActualStateWatcher {
                         _ = sleep(debounce_duration) => {
                             // Timer expired, time to sync!
                             info!("Code modification detected. Syncing Actual Model...");
-                            if let Err(e) = sync_all_crates(&registry).await {
+                            if let Err(e) = sync_all_crates(Arc::clone(&registry)).await {
                                 error!("Failed to sync actual model: {}", e);
                             }
                             break; // Done with this batch, go back to waiting for the next first event
@@ -107,7 +107,13 @@ impl ActualStateWatcher {
 ///
 /// Each crate is scanned independently: its own `src/` directory is parsed via
 /// the AST walker and the result is saved into that crate's local store.
-async fn sync_all_crates(registry: &CrateRegistry) -> Result<()> {
+async fn sync_all_crates(registry: Arc<CrateRegistry>) -> Result<()> {
+    tokio::task::spawn_blocking(move || sync_all_crates_blocking(&registry))
+        .await
+        .context("architecture sync task panicked")?
+}
+
+fn sync_all_crates_blocking(registry: &CrateRegistry) -> Result<()> {
     for entry in registry.crates() {
         let ws = entry.workspace_key();
 

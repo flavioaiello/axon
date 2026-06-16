@@ -2,8 +2,9 @@ use axon::domain;
 use axon::server;
 use axon::store;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use std::path::{Path, PathBuf};
 use tracing_subscriber::EnvFilter;
 
 const AXON_VERSION: &str = axon::VERSION;
@@ -23,7 +24,7 @@ struct Cli {
 enum Commands {
     /// Start the MCP stdio server (default when no subcommand given)
     Serve {
-        /// Workspace path (defaults to current directory)
+        /// Workspace path (defaults to the nearest Cargo workspace/package ancestor)
         #[arg(short, long)]
         workspace: Option<String>,
 
@@ -40,7 +41,7 @@ enum Commands {
 
     /// Start only the local web graph UI and live Rust indexer
     Web {
-        /// Workspace path (defaults to current directory)
+        /// Workspace path (defaults to the nearest Cargo workspace/package ancestor)
         #[arg(short, long)]
         workspace: Option<String>,
 
@@ -65,7 +66,7 @@ enum Commands {
 
     /// List all crates and their model status in a workspace
     List {
-        /// Workspace path (defaults to current directory)
+        /// Workspace path (defaults to the nearest Cargo workspace/package ancestor)
         #[arg(short, long)]
         workspace: Option<String>,
     },
@@ -109,26 +110,16 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    // Resolve workspace: explicit flag > cwd
-    let resolve_workspace = |w: Option<String>| -> String {
-        w.unwrap_or_else(|| {
-            std::env::current_dir()
-                .expect("cannot determine current directory")
-                .to_string_lossy()
-                .into_owned()
-        })
-    };
-
     match cli.command {
         // Default: serve from cwd, bridging to the shared daemon (daemon-only).
-        None => serve_via_daemon(resolve_workspace(None)).await?,
+        None => serve_via_daemon(resolve_workspace(None)?).await?,
 
         Some(Commands::Serve {
             workspace,
             web_port,
             standalone,
         }) => {
-            let workspace = resolve_workspace(workspace);
+            let workspace = resolve_workspace(workspace)?;
             if standalone {
                 run_standalone(workspace, web_port).await?;
             } else {
@@ -144,7 +135,7 @@ async fn main() -> Result<()> {
         }
 
         Some(Commands::Web { workspace, port }) => {
-            let workspace = resolve_workspace(workspace);
+            let workspace = resolve_workspace(workspace)?;
             let registry = std::sync::Arc::new(store::CrateRegistry::open(std::path::Path::new(
                 &workspace,
             ))?);
@@ -177,7 +168,7 @@ async fn main() -> Result<()> {
         }
 
         Some(Commands::List { workspace }) => {
-            let workspace = resolve_workspace(workspace);
+            let workspace = resolve_workspace(workspace)?;
             let registry = store::CrateRegistry::open(std::path::Path::new(&workspace))?;
             eprintln!("{:<25} {:<55} STATUS", "CRATE", "PATH");
             eprintln!("{}", "-".repeat(90));
@@ -291,6 +282,67 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+fn resolve_workspace(workspace: Option<String>) -> Result<String> {
+    if let Some(workspace) = workspace {
+        return Ok(workspace);
+    }
+
+    let cwd = std::env::current_dir().context("cannot determine current directory")?;
+    let workspace = infer_workspace_from(&cwd).with_context(|| {
+        format!(
+            "no Cargo workspace or package found at or above {}; run axon from a Rust project or pass --workspace /path/to/rust/workspace",
+            cwd.display()
+        )
+    })?;
+
+    Ok(workspace.to_string_lossy().into_owned())
+}
+
+fn infer_workspace_from(start: &Path) -> Option<PathBuf> {
+    let start = if start.is_file() {
+        start.parent()?
+    } else {
+        start
+    };
+    let mut package_root = None;
+
+    for candidate in start.ancestors() {
+        if candidate.parent().is_none() {
+            break;
+        }
+
+        let cargo_toml = candidate.join("Cargo.toml");
+        if !cargo_toml.is_file() {
+            continue;
+        }
+
+        if cargo_toml_declares_workspace(&cargo_toml) {
+            return Some(canonicalize_or_self(candidate));
+        }
+
+        if package_root.is_none() && candidate.join("src").is_dir() {
+            package_root = Some(canonicalize_or_self(candidate));
+        }
+    }
+
+    package_root
+}
+
+fn cargo_toml_declares_workspace(cargo_toml: &Path) -> bool {
+    let Ok(contents) = std::fs::read_to_string(cargo_toml) else {
+        return false;
+    };
+
+    contents.lines().any(|line| {
+        let line = line.split('#').next().unwrap_or_default().trim();
+        line == "[workspace]" || line.starts_with("[workspace.")
+    })
+}
+
+fn canonicalize_or_self(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
 fn spawn_web_graph(registry: std::sync::Arc<store::CrateRegistry>, port: u16) {
     tokio::spawn(async move {
         if let Err(e) = server::web::run(registry, port).await {
@@ -356,4 +408,73 @@ async fn run_standalone(workspace: String, web_port: u16) -> Result<()> {
 
     spawn_web_graph(std::sync::Arc::clone(&registry), web_port);
     server::stdio::run(registry).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_root(prefix: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("{prefix}_{}_{}", std::process::id(), unique))
+    }
+
+    #[test]
+    fn workspace_resolution_finds_package_root_from_nested_dir() {
+        let root = temp_root("axon_workspace_resolution_pkg");
+        let nested = root.join("src").join("bin");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            infer_workspace_from(&nested),
+            Some(root.canonicalize().unwrap())
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn workspace_resolution_prefers_cargo_workspace_root() {
+        let root = temp_root("axon_workspace_resolution_ws");
+        let member = root.join("crates").join("app");
+        let nested = member.join("src");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/app\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            member.join("Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            infer_workspace_from(&nested),
+            Some(root.canonicalize().unwrap())
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn workspace_resolution_does_not_search_unrelated_directories() {
+        let root = temp_root("axon_workspace_resolution_empty");
+        let nested = root.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        assert_eq!(infer_workspace_from(&nested), None);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

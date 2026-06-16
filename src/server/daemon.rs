@@ -177,15 +177,19 @@ async fn ensure_registry(registries: &Registries, workspace: &str) -> Result<Arc
         registry.crates().len()
     );
 
-    // Keep this workspace's model fresh. `spawn` completes the initial scan
-    // before returning, so the first MCP request does not see an empty model.
-    let watcher = ActualStateWatcher::new(Arc::clone(&registry));
-    watcher
-        .spawn()
-        .await
-        .with_context(|| format!("start watcher for workspace {key}"))?;
+    map.insert(key.clone(), Arc::clone(&registry));
 
-    map.insert(key, Arc::clone(&registry));
+    // Keep this workspace's model fresh without blocking MCP startup. The
+    // initial scan can take long enough for clients to time out while waiting
+    // for initialize/tools/list responses.
+    let watcher_registry = Arc::clone(&registry);
+    tokio::spawn(async move {
+        let watcher = ActualStateWatcher::new(watcher_registry);
+        if let Err(error) = watcher.spawn().await {
+            warn!("failed to start watcher for workspace {key}: {error:#}");
+        }
+    });
+
     Ok(registry)
 }
 
@@ -275,34 +279,49 @@ mod tests {
             "initialize should return a result, got: {line}"
         );
 
-        write_half
-            .write_all(
-                br#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"rust_status","arguments":{"detail":"full"}}}
-"#,
-            )
-            .await
-            .unwrap();
-        write_half.flush().await.unwrap();
+        let mut warmed_status = None;
+        for id in 2..=21 {
+            let request = format!(
+                r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"rust_status","arguments":{{"detail":"full"}}}}}}
+"#
+            );
+            write_half.write_all(request.as_bytes()).await.unwrap();
+            write_half.flush().await.unwrap();
 
-        let line = tokio::time::timeout(Duration::from_secs(5), lines.next_line())
-            .await
-            .expect("daemon rust_status response timed out")
-            .unwrap()
-            .expect("daemon closed without responding to rust_status");
-        let resp: serde_json::Value = serde_json::from_str(&line).unwrap();
-        assert_eq!(resp["jsonrpc"], "2.0");
-        assert_eq!(resp["id"], 2);
-        let content = resp["result"]["content"].as_array().unwrap();
-        let text = content[0]["text"].as_str().unwrap();
-        let status: serde_json::Value = serde_json::from_str(text).unwrap();
-        assert_eq!(
-            status["implemented"]["bounded_contexts"]
-                .as_array()
+            let line = tokio::time::timeout(Duration::from_secs(1), lines.next_line())
+                .await
+                .expect("daemon rust_status response timed out")
                 .unwrap()
-                .len(),
-            1
+                .expect("daemon closed without responding to rust_status");
+            let resp: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(resp["jsonrpc"], "2.0");
+            assert_eq!(resp["id"], id);
+            let Some(content) = resp["result"]["content"].as_array() else {
+                continue;
+            };
+            let Some(text) = content[0]["text"].as_str() else {
+                continue;
+            };
+            let status: serde_json::Value = serde_json::from_str(text).unwrap();
+            let context_count = status
+                .pointer("/implemented/bounded_contexts")
+                .and_then(|value| value.as_array())
+                .map(|contexts| contexts.len())
+                .unwrap_or_default();
+            if context_count == 1 {
+                warmed_status = Some(status);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        let status = warmed_status.expect("daemon model did not warm up");
+        assert_eq!(
+            status
+                .pointer("/truth_maintenance/drift/entry_count")
+                .and_then(|value| value.as_i64()),
+            Some(0)
         );
-        assert_eq!(status["truth_maintenance"]["drift"]["entry_count"], 0);
 
         let _ = std::fs::remove_file(&socket);
         let _ = std::fs::remove_dir_all(&root);
