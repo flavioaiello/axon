@@ -423,6 +423,10 @@ pub(crate) fn build_graph_confidence_report(store: &Store, workspace_path: &str)
     let call_edges = count("calls_symbol");
     let resolved_call_edges = count("resolved_call");
     let ast_edges = count("ast_edge");
+    let cfg_decorator_edges = cfg_decorator_edge_count(store, workspace_path);
+    let build_script_present = std::path::Path::new(workspace_path)
+        .join("build.rs")
+        .is_file();
     let truth = truth_maintenance_json(store, workspace_path);
     let drift_status = truth["drift"]["status"].as_str().unwrap_or("unknown");
     let scan_available = truth["scanned"]["available"].as_bool().unwrap_or(false)
@@ -538,6 +542,12 @@ pub(crate) fn build_graph_confidence_report(store: &Store, workspace_path: &str)
                     "relation": "resolved_call",
                     "edges": resolved_call_edges,
                     "precision": "compiler-resolved through embedded rust-analyzer libraries when Cargo workspace loading succeeds",
+                    "persisted_fields": ["caller", "caller_file", "caller_line", "callee", "callee_file", "callee_line", "call_site_line", "call_expr", "dispatch_kind"],
+                    "when_missing": {
+                        "fallback": "Axon keeps source files, symbols, imports, references, AST decorators, and syntactic calls_symbol edges.",
+                        "capability_lost": ["exact receiver/trait/alias/inference-sensitive call targets", "resolved call-site provenance", "compiler-resolved move/facade evidence"],
+                        "analyses_degraded": ["call_graph_stats resolved_project_callee sections", "call_graph_callers/callees when relying on aliases", "optimization_recommendations move_or_facade precision", "delete-safety and impact reviews that need exact inbound calls"],
+                    },
                 },
                 "truth_maintenance": {
                     "status": drift_status,
@@ -545,15 +555,38 @@ pub(crate) fn build_graph_confidence_report(store: &Store, workspace_path: &str)
                 },
                 "cfg_feature_awareness": {
                     "status": "partial",
-                    "details": "cfg predicates are captured as AST decorator edges when present; cargo feature metadata is reported by rust_readiness but per-feature graph slices are not modeled yet.",
+                    "cfg_decorator_edges": cfg_decorator_edges,
+                    "persisted_actual_profile": "single_profile",
+                    "transient_profile_comparison": "rust_feature_diff compares two scan profiles without persisting either as actual state",
+                    "persisted_profile_slices": false,
+                    "details": "cfg predicates are captured as AST decorator edges when present. Cargo feature metadata is visible and rust_feature_diff can compare transient profiles; the persisted actual graph remains one selected scan profile.",
+                    "analyses_degraded_without_persisted_slices": ["historical per-feature impact", "feature-specific delete safety", "feature-specific dependency neighborhoods from stored actual state"],
                 },
                 "generated_code": {
-                    "status": "not_modeled",
-                    "details": "build-script and proc-macro-expanded code are outside the persisted source graph unless materialized as Rust files.",
+                    "status": if build_script_present { "detected_unmodeled" } else { "not_modeled" },
+                    "build_script_present": build_script_present,
+                    "build_script_out_dirs": "disabled",
+                    "proc_macro_expansion": "disabled",
+                    "details": "The semantic resolver intentionally does not run build scripts or proc-macro expansion during daemon scans. Materialized Rust files are scanned; generated out-dir files and macro-expanded items are not persisted.",
+                    "analyses_degraded": ["symbols/imports/calls that only exist after build-script generation", "proc-macro-generated methods and trait impls", "call edges inside generated files"],
                 }
             }
         }
     })
+}
+
+fn cfg_decorator_edge_count(store: &Store, workspace_path: &str) -> usize {
+    store
+        .run_datalog(
+            "?[to_node] := *ast_edge{workspace: $ws, to_node, edge_type: 'decorators', state: 'actual' @ 'NOW'}",
+            workspace_path,
+        )
+        .map(|rows| {
+            rows.iter()
+                .filter(|row| row.first().is_some_and(|text| text.starts_with("cfg(")))
+                .count()
+        })
+        .unwrap_or(0)
 }
 
 fn build_readiness_report(store: &Store, workspace_path: &str) -> Value {
@@ -721,7 +754,9 @@ fn cargo_metadata_readiness(workspace_path: &str) -> Value {
         "workspace_member_count": workspace_member_count,
         "feature_count": feature_count,
         "target_directory": metadata["target_directory"],
-        "details": "Cargo package and feature metadata is visible; per-feature graph slicing is still a future capability.",
+        "details": "Cargo package and feature metadata is visible. rust_feature_diff can compare transient scan profiles; the persisted actual graph stores one selected profile at a time.",
+        "persisted_profile_slices": false,
+        "transient_profile_comparison": "rust_feature_diff",
     })
 }
 
@@ -1660,6 +1695,21 @@ mod tests {
         assert!(parsed["environment"]["rust_analyzer"].is_object());
         assert!(parsed["environment"]["cargo_metadata"].is_object());
         assert_eq!(parsed["graph_confidence"]["status"], "not_scanned");
+        assert!(
+            parsed["graph_confidence"]["capabilities"]["semantic_call_graph"]["persisted_fields"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|field| field == "call_expr")
+        );
+        assert_eq!(
+            parsed["graph_confidence"]["capabilities"]["cfg_feature_awareness"]["persisted_profile_slices"],
+            false
+        );
+        assert_eq!(
+            parsed["graph_confidence"]["capabilities"]["generated_code"]["proc_macro_expansion"],
+            "disabled"
+        );
     }
 
     #[test]
@@ -2107,6 +2157,7 @@ mod tests {
                     callee: "Store::load_actual".into(),
                     callee_file: "src/store/cozo.rs".into(),
                     callee_line: 1,
+                    ..Default::default()
                 }],
             )
             .unwrap();

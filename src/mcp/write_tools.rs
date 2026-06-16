@@ -359,7 +359,7 @@ fn dispatch_write_tool(
                 Some(evidence),
                 vec![
                     "Feature diff scans are transient and do not update the persisted actual graph, drift, or history.".into(),
-                    "Source-extracted facts are syntax-level and not Cargo cfg-pruned yet; feature-specific differences primarily appear in compiler-resolved call edges until cfg-aware slicing is modeled.".into(),
+                    "Source-extracted facts are syntax-level and not Cargo cfg-pruned yet; rust_feature_diff models transient profile differences, not persisted per-feature actual-state slices.".into(),
                 ],
                 json!({"source": "feature_diff", "state": "transient"}),
             )
@@ -476,6 +476,8 @@ fn dispatch_write_tool(
                             payload["scan_profile"] = rust_scan_options_json(&scan_options);
                             if let Some(error) = &semantic_resolution_error {
                                 payload["semantic_resolution_error"] = json!(error);
+                                payload["semantic_resolution_degradation"] =
+                                    semantic_resolution_degradation(error);
                             }
                             crate::mcp::tools::attach_graph_confidence(
                                 &mut payload,
@@ -514,6 +516,10 @@ fn dispatch_write_tool(
                                 "reasoning_cache_warnings": follow_on_failures,
                                 "follow_on_failures": follow_on_failures,
                                 "semantic_resolution_error": semantic_resolution_error,
+                                "semantic_resolution_degradation": semantic_resolution_error
+                                    .as_ref()
+                                    .map(|error| semantic_resolution_degradation(error))
+                                    .unwrap_or(Value::Null),
                                 "scan_profile": rust_scan_options_json(&scan_options),
                             });
                             let limitations = sync_limitations(
@@ -1906,8 +1912,29 @@ fn semantic_resolution_json(resolution: &SemanticResolution) -> Value {
         SemanticResolution::Failed { error } => json!({
             "status": "failed",
             "error": error,
+            "degradation": semantic_resolution_degradation(error),
         }),
     }
+}
+
+fn semantic_resolution_degradation(error: &str) -> Value {
+    json!({
+        "error": error,
+        "fallback_preserved": ["source_file", "symbol", "import_edge", "reference_edge", "calls_symbol", "ast_edge"],
+        "relations_cleared": ["resolved_call"],
+        "capability_lost": [
+            "exact receiver, trait, alias, and inference-sensitive call targets",
+            "resolved caller/callee provenance with call-site expression text",
+            "compiler-resolved inbound/outbound call evidence"
+        ],
+        "analyses_degraded": [
+            "call_graph_stats resolved_project_callee sections",
+            "call_graph_callers/callees when same-named symbols make syntactic edges ambiguous",
+            "optimization_recommendations move_or_facade precision",
+            "delete-safety and impact reviews that rely on exact inbound calls"
+        ],
+        "recovery": "Fix the cargo/rustc/rust-analyzer workspace loading error, then rerun rust_scan for this workspace."
+    })
 }
 
 fn feature_diff_summary(base: &ActualScan, compare: &ActualScan) -> (Value, Value) {
@@ -2043,8 +2070,16 @@ fn scan_fact_sets(scan: &ActualScan) -> BTreeMap<String, BTreeSet<String>> {
                 .iter()
                 .map(|edge| {
                     format!(
-                        "{}->{}|{}|{}",
-                        edge.caller, edge.callee, edge.callee_file, edge.callee_line
+                        "{}|{}|{}->{}|{}|{}|{}|{}|{}",
+                        edge.caller,
+                        edge.caller_file,
+                        edge.caller_line,
+                        edge.callee,
+                        edge.callee_file,
+                        edge.callee_line,
+                        edge.call_site_line,
+                        edge.call_expr,
+                        edge.dispatch_kind
                     )
                 })
                 .collect(),
@@ -2515,12 +2550,14 @@ fn build_sync_report(
 fn sync_limitations(drift_failed: bool, semantic_resolution_failed: bool) -> Vec<String> {
     let mut limitations = vec![
         "Scan coverage is limited to statically extracted facts from supported languages.".into(),
-        "Dynamic dispatch, reflection, generated code, and runtime-only dependencies are not modeled.".into(),
+        "Runtime-only reflection, string-based lookups, and out-of-repository consumers are not modeled.".into(),
+        "Build-script out-dir files and proc-macro-expanded code are not persisted unless materialized as Rust files in the scanned workspace.".into(),
+        "The persisted actual graph stores one selected scan profile; use rust_feature_diff for transient Cargo feature comparisons.".into(),
     ];
 
     if semantic_resolution_failed {
         limitations.push(
-            "Compiler-resolved call edges are unavailable until rust-analyzer resolution succeeds."
+            "Compiler-resolved call edges are unavailable until rust-analyzer resolution succeeds; resolved-call-dependent impact, move/facade, and call-graph precision are degraded."
                 .into(),
         );
     }
@@ -2939,6 +2976,22 @@ mod tests {
         assert_eq!(report["semantic_resolution"], "failed");
         assert_eq!(report["resolved_call_edges"], 0);
         assert!(report["follow_on_failures"].as_array().unwrap().is_empty());
+
+        let degradation = semantic_resolution_degradation("cargo metadata failed");
+        assert!(
+            degradation["capability_lost"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item.as_str().unwrap_or("").contains("inference-sensitive"))
+        );
+        assert!(
+            degradation["analyses_degraded"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item.as_str().unwrap_or("").contains("move_or_facade"))
+        );
     }
 
     #[test]

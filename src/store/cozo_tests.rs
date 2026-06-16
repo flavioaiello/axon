@@ -341,21 +341,36 @@ fn resolved_calls_are_queryable_via_graph() {
     let calls = vec![
         ResolvedCall {
             caller: "CozoStore::save_actual".into(),
+            caller_file: "src/store/cozo.rs".into(),
+            caller_line: 400,
             callee: "CozoStore::save_state".into(),
             callee_file: "src/store/cozo.rs".into(),
             callee_line: 410,
+            call_site_line: 402,
+            call_expr: "save_state".into(),
+            dispatch_kind: "direct".into(),
         },
         ResolvedCall {
             caller: "CozoStore::save_actual".into(),
+            caller_file: "src/store/cozo.rs".into(),
+            caller_line: 400,
             callee: "canonicalize_path".into(),
             callee_file: "src/store/cozo.rs".into(),
             callee_line: 7000,
+            call_site_line: 401,
+            call_expr: "canonicalize_path".into(),
+            dispatch_kind: "direct".into(),
         },
         ResolvedCall {
             caller: "main".into(),
+            caller_file: "src/main.rs".into(),
+            caller_line: 1,
             callee: "CozoStore::save_state".into(),
             callee_file: "src/store/cozo.rs".into(),
             callee_line: 410,
+            call_site_line: 3,
+            call_expr: "save_state".into(),
+            dispatch_kind: "direct".into(),
         },
     ];
     assert_eq!(store.save_resolved_calls(ws, &calls).unwrap(), 3);
@@ -376,6 +391,14 @@ fn resolved_calls_are_queryable_via_graph() {
     assert!(edges.iter().all(|e| e["from"] == "CozoStore::save_actual"));
     assert!(edges.iter().any(|e| e["to"] == "CozoStore::save_state"));
     assert!(edges.iter().any(|e| e["file"] == "src/store/cozo.rs"));
+    assert!(
+        edges
+            .iter()
+            .any(|e| e["caller_file"] == "src/store/cozo.rs")
+    );
+    assert!(edges.iter().any(|e| e["call_site_line"] == 402));
+    assert!(edges.iter().any(|e| e["call_expr"] == "save_state"));
+    assert!(edges.iter().all(|e| e["dispatch_kind"] == "direct"));
 
     // `to="save_state"` → every caller resolving to save_state (two callers).
     let q2 = store
@@ -995,48 +1018,56 @@ fn optimization_recommendations_prefer_resolved_calls_for_move_candidates() {
                     callee: "Value::as_str".into(),
                     callee_file: "src/mcp/tools.rs".into(),
                     callee_line: 10,
+                    ..Default::default()
                 },
                 crate::domain::rust_analyzer::ResolvedCall {
                     caller: "Store::render_scope".into(),
                     callee: "RustScanScope::as_str".into(),
                     callee_file: "src/domain/rust_facts.rs".into(),
                     callee_line: 28,
+                    ..Default::default()
                 },
                 crate::domain::rust_analyzer::ResolvedCall {
                     caller: "Tools::sync_a".into(),
                     callee: "Store::save_state".into(),
                     callee_file: "src/store/cozo.rs".into(),
                     callee_line: 60,
+                    ..Default::default()
                 },
                 crate::domain::rust_analyzer::ResolvedCall {
                     caller: "Tools::sync_b".into(),
                     callee: "Store::save_state".into(),
                     callee_file: "src/store/cozo.rs".into(),
                     callee_line: 60,
+                    ..Default::default()
                 },
                 crate::domain::rust_analyzer::ResolvedCall {
                     caller: "Tools::sync_c".into(),
                     callee: "Store::save_state".into(),
                     callee_file: "src/store/cozo.rs".into(),
                     callee_line: 60,
+                    ..Default::default()
                 },
                 crate::domain::rust_analyzer::ResolvedCall {
                     caller: "test_save_state_a".into(),
                     callee: "Store::save_state".into(),
                     callee_file: "src/store/cozo.rs".into(),
                     callee_line: 60,
+                    ..Default::default()
                 },
                 crate::domain::rust_analyzer::ResolvedCall {
                     caller: "test_save_state_b".into(),
                     callee: "Store::save_state".into(),
                     callee_file: "src/store/cozo.rs".into(),
                     callee_line: 60,
+                    ..Default::default()
                 },
                 crate::domain::rust_analyzer::ResolvedCall {
                     caller: "test_save_state_c".into(),
                     callee: "Store::save_state".into(),
                     callee_file: "src/store/cozo.rs".into(),
                     callee_line: 60,
+                    ..Default::default()
                 },
             ],
         )

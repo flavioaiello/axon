@@ -23,16 +23,28 @@ use syn::parse::Parser;
 use super::rust_facts::{RustFeatureSelection, RustScanOptions};
 
 /// A call site resolved to the concrete function it targets.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ResolvedCall {
     /// Calling function (rust-analyzer's qualified name, e.g. `CozoStore::save_actual`).
     pub caller: String,
+    /// Workspace-relative file where the caller is defined.
+    pub caller_file: String,
+    /// 1-based line of the caller's definition.
+    pub caller_line: usize,
     /// Resolved callee function name.
     pub callee: String,
     /// Workspace-relative file where the callee is defined.
     pub callee_file: String,
     /// 1-based line of the callee's definition.
     pub callee_line: usize,
+    /// 1-based line of the call site in `caller_file`.
+    pub call_site_line: usize,
+    /// Source text at the resolved call site when rust-analyzer reports a source range.
+    pub call_expr: String,
+    /// Dispatch classification inferred from the resolved target. `direct` is a concrete
+    /// function/method target; `unknown` means rust-analyzer resolved the target but did
+    /// not expose enough call-hierarchy detail to classify trait mediation.
+    pub dispatch_kind: String,
 }
 
 /// A callable definition discovered syntactically, with enough position data to
@@ -145,17 +157,30 @@ pub fn resolve_calls_with_options(
                 .get(&(callee_file.clone(), line0))
                 .cloned()
                 .unwrap_or_else(|| qualified_target_name(&target));
+            let call_site =
+                call_site_info(&root, &vfs, &analysis, &call.ranges).unwrap_or_else(|| {
+                    CallSiteInfo {
+                        line: callable.line,
+                        expr: String::new(),
+                    }
+                });
             let key = (
                 callable.qualified.clone(),
                 callee.clone(),
                 callee_file.clone(),
+                call_site.line,
             );
             if seen.insert(key) {
                 out.push(ResolvedCall {
                     caller: callable.qualified.clone(),
+                    caller_file: callable.file_rel.clone(),
+                    caller_line: callable.line,
                     callee,
                     callee_file,
                     callee_line: line0 + 1,
+                    call_site_line: call_site.line,
+                    call_expr: call_site.expr,
+                    dispatch_kind: dispatch_kind(&target),
                 });
             }
         }
@@ -165,6 +190,11 @@ pub fn resolve_calls_with_options(
         (&a.caller, &a.callee, &a.callee_file).cmp(&(&b.caller, &b.callee, &b.callee_file))
     });
     Ok(out)
+}
+
+struct CallSiteInfo {
+    line: usize,
+    expr: String,
 }
 
 fn cargo_features(selection: &RustFeatureSelection) -> CargoFeatures {
@@ -231,6 +261,39 @@ fn target_location(
     let line_index = analysis.file_line_index(target.file_id).ok()?;
     let line_col = line_index.try_line_col(target.focus_or_full_range().start())?;
     Some((rel, line_col.line as usize))
+}
+
+fn call_site_info(
+    root: &Path,
+    vfs: &ra_ap_vfs::Vfs,
+    analysis: &ra_ap_ide::Analysis,
+    ranges: &[ra_ap_ide::FileRange],
+) -> Option<CallSiteInfo> {
+    let range = ranges.first()?;
+    let abs = PathBuf::from(vfs.file_path(range.file_id).to_string());
+    let _rel = abs.strip_prefix(root).ok()?;
+    let line_index = analysis.file_line_index(range.file_id).ok()?;
+    let line_col = line_index.try_line_col(range.range.start())?;
+    let source = analysis.file_text(range.file_id).ok()?;
+    let start = usize::try_from(u32::from(range.range.start())).ok()?;
+    let end = usize::try_from(u32::from(range.range.end())).ok()?;
+    let expr = source
+        .get(start..end)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    Some(CallSiteInfo {
+        line: line_col.line as usize + 1,
+        expr,
+    })
+}
+
+fn dispatch_kind(target: &NavigationTarget) -> String {
+    if target.container_name.is_some() {
+        "direct".into()
+    } else {
+        "unknown".into()
+    }
 }
 
 fn qualified_target_name(target: &NavigationTarget) -> String {

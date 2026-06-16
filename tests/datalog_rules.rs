@@ -1581,12 +1581,14 @@ fn call_graph_stats_summary() {
                     callee: "Project::c".into(),
                     callee_file: "src/lib.rs".into(),
                     callee_line: 1,
+                    ..Default::default()
                 },
                 ResolvedCall {
                     caller: "b".into(),
                     callee: "Project::c".into(),
                     callee_file: "src/lib.rs".into(),
                     callee_line: 1,
+                    ..Default::default()
                 },
             ],
         )

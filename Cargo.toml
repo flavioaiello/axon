@@ -23,3 +23,28 @@ ra_ap_ide = "=0.0.334"
 ra_ap_load-cargo = "=0.0.334"
 ra_ap_project_model = "=0.0.334"
 ra_ap_vfs = "=0.0.334"
+
+[lints.rust]
+dead_code = "deny"
+unused_imports = "deny"
+unused_variables = "deny"
+unused_mut = "deny"
+unused_must_use = "deny"
+unreachable_pub = "deny"
+unsafe_code = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+wildcard_imports = "deny"
+todo = "deny"
+dbg_macro = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+unimplemented = "deny"
+cast_possible_truncation = "warn"
+cast_sign_loss = "warn"
+cast_possible_wrap = "warn"
+cast_precision_loss = "warn"

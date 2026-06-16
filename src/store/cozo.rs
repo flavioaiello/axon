@@ -301,7 +301,7 @@ type PolicySnapshot = (
 
 type PracticeSymbolAlias = (String, String, String, i64, String);
 
-pub type SharedField = (String, String, String, String, String);
+pub(crate) type SharedField = (String, String, String, String, String);
 
 impl Store {
     /// Open an in-memory store.
@@ -528,7 +528,7 @@ impl Store {
             // Resolved call edges from rust-analyzer (name resolution + type
             // inference): which concrete definition a call site actually targets —
             // something the syn scanner cannot determine. Populated by the rust_scan semantic phase.
-            ":create resolved_call { workspace: String, caller: String, callee: String, callee_file: String, state: String, vld: Validity default 'ASSERT' => callee_line: Int default 0 }",
+            ":create resolved_call { workspace: String, caller: String, callee: String, callee_file: String, state: String, vld: Validity default 'ASSERT' => callee_line: Int default 0, caller_file: String default '', caller_line: Int default 0, call_site_line: Int default 0, call_expr: String default '', dispatch_kind: String default 'unknown' }",
             // ── Source-level relations ──
             ":create source_file { workspace: String, path: String, state: String, vld: Validity default 'ASSERT' => context: String default '', language: String default '' }",
             ":create symbol { workspace: String, name: String, state: String, vld: Validity default 'ASSERT' => kind: String default '', context: String default '', file_path: String default '', start_line: Int default 0, end_line: Int default 0, visibility: String default 'public' }",
@@ -754,13 +754,18 @@ impl Store {
                         sv(&c.callee_file),
                         sv(ACTUAL_STATE),
                         cozo::DataValue::from(c.callee_line as i64),
+                        sv(&c.caller_file),
+                        cozo::DataValue::from(c.caller_line as i64),
+                        cozo::DataValue::from(c.call_site_line as i64),
+                        sv(&c.call_expr),
+                        sv(&c.dispatch_kind),
                     ])
                 })
                 .collect();
             self.batch_put(
                 rows,
-                "?[workspace, caller, callee, callee_file, state, callee_line] <- $rows \
-                 :put resolved_call { workspace, caller, callee, callee_file, state, callee_line }",
+                "?[workspace, caller, callee, callee_file, state, callee_line, caller_file, caller_line, call_site_line, call_expr, dispatch_kind] <- $rows \
+                 :put resolved_call { workspace, caller, callee, callee_file, state, callee_line, caller_file, caller_line, call_site_line, call_expr, dispatch_kind }",
                 "save resolved_calls",
             )?;
             Ok(calls.len())
@@ -5720,9 +5725,9 @@ impl Store {
                         && filter_from.is_empty()
                         && filter_to.is_empty()
                     {
-                        "?[caller, callee, callee_file, callee_line] := *resolved_call{workspace: $ws, state: 'actual', caller, callee, callee_file, callee_line @ 'NOW'} :limit 500"
+                        "?[caller, callee, callee_file, callee_line, caller_file, caller_line, call_site_line, call_expr, dispatch_kind] := *resolved_call{workspace: $ws, state: 'actual', caller, callee, callee_file, callee_line, caller_file, caller_line, call_site_line, call_expr, dispatch_kind @ 'NOW'} :limit 500"
                     } else {
-                        "?[caller, callee, callee_file, callee_line] := *resolved_call{workspace: $ws, state: 'actual', caller, callee, callee_file, callee_line @ 'NOW'}"
+                        "?[caller, callee, callee_file, callee_line, caller_file, caller_line, call_site_line, call_expr, dispatch_kind] := *resolved_call{workspace: $ws, state: 'actual', caller, callee, callee_file, callee_line, caller_file, caller_line, call_site_line, call_expr, dispatch_kind @ 'NOW'}"
                     };
                     let rows = self
                         .run_script(
@@ -5762,6 +5767,11 @@ impl Store {
                             "edge_type": "calls",
                             "file": callee_file,
                             "line": dv_i64(&row[3]),
+                            "caller_file": dv_str(&row[4]),
+                            "caller_line": dv_i64(&row[5]),
+                            "call_site_line": dv_i64(&row[6]),
+                            "call_expr": dv_str(&row[7]),
+                            "dispatch_kind": dv_str(&row[8]),
                         }));
                     }
                 }
@@ -6548,7 +6558,7 @@ impl Store {
             .map_err(|e| anyhow::anyhow!("call_graph_stats symbols: {:?}", e))?;
         let resolved_call_callees = self
             .run_script(
-                "?[caller, callee, callee_file, callee_line] := *resolved_call{workspace: $ws, caller, callee, callee_file, state: 'actual', callee_line @ 'NOW'}",
+                "?[caller, callee, callee_file, callee_line, caller_file, caller_line, call_site_line, call_expr, dispatch_kind] := *resolved_call{workspace: $ws, caller, callee, callee_file, state: 'actual', callee_line, caller_file, caller_line, call_site_line, call_expr, dispatch_kind @ 'NOW'}",
                 params,
                 ScriptMutability::Immutable,
             )
@@ -6648,6 +6658,7 @@ impl Store {
                 "callee_line": callee_line,
                 "call_count": count,
                 "call_graph_relation": "resolved_call",
+                "provenance": "callee definition; resolved_call rows also persist caller_file, caller_line, call_site_line, call_expr, and dispatch_kind",
             })).collect::<Vec<_>>(),
         }))
     }
@@ -6700,7 +6711,7 @@ impl Store {
             .map_err(|e| anyhow::anyhow!("optimization calls: {:?}", e))?;
         let resolved_calls = self
             .run_script(
-                "?[caller, callee, callee_file] := *resolved_call{workspace: $ws, caller, callee, callee_file, state: 'actual' @ 'NOW'}",
+                "?[caller, callee, callee_file, caller_file] := *resolved_call{workspace: $ws, caller, callee, callee_file, caller_file, state: 'actual' @ 'NOW'}",
                 params.clone(),
                 ScriptMutability::Immutable,
             )
@@ -6986,11 +6997,17 @@ impl Store {
                 let caller = dv_str(&row[0]);
                 let callee = dv_str(&row[1]);
                 let callee_file = dv_str(&row[2]);
+                let caller_file = dv_str(&row[3]);
                 if !symbol_context_by_name.contains_key(&callee) {
                     continue;
                 }
-                let Some(caller_file) = symbol_file_by_name.get(&caller) else {
-                    continue;
+                let caller_file = if caller_file.is_empty() {
+                    let Some(symbol_file) = symbol_file_by_name.get(&caller) else {
+                        continue;
+                    };
+                    symbol_file.as_str()
+                } else {
+                    caller_file.as_str()
                 };
                 if !rust_fact_allowed(requested_scope, caller_file, &caller, &callee) {
                     continue;
@@ -7567,7 +7584,7 @@ impl Store {
             .collect())
     }
 
-    pub fn shared_fields(&self, workspace: &str) -> Result<Vec<SharedField>> {
+    pub(crate) fn shared_fields(&self, workspace: &str) -> Result<Vec<SharedField>> {
         let params = params_map(&[("ws", workspace)]);
         let rows = self
             .run_script(
