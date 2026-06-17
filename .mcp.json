@@ -1,9 +1,0 @@
-{
-  "mcpServers": {
-    "axon": {
-      "type": "stdio",
-      "command": "/Users/flavioaiello/git/axon/target/debug/axon",
-      "args": ["serve"]
-    }
-  }
-}
