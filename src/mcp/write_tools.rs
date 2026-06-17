@@ -11,7 +11,8 @@ use crate::domain::rust_facts::{RustFeatureSelection, RustScanOptions, RustScanS
 use crate::domain::to_snake;
 use crate::mcp::protocol::{
     ToolCallResult, ToolDefinition, error_tool_result, json_error_tool_result, json_tool_result,
-    text_tool_result, with_reasoning_context, with_workspace_context_schema,
+    text_tool_result, with_reasoning_context, with_workspace_context_description,
+    with_workspace_context_schema,
 };
 use crate::reasoning::ReasoningKernel;
 use crate::store::{PersistedReasoningClaim, ReasoningFactRef, Store};
@@ -23,6 +24,7 @@ pub fn list_write_tools() -> Vec<ToolDefinition> {
     rust_native_write_tools()
         .into_iter()
         .map(|mut tool| {
+            tool.description = with_workspace_context_description(tool.description);
             tool.input_schema = with_workspace_context_schema(tool.input_schema);
             tool
         })
@@ -2753,6 +2755,11 @@ mod tests {
         assert!(!names.contains(&"refactor_model"));
         assert!(!names.contains(&"assert_model"));
         for tool in &tools {
+            assert!(
+                tool.description.contains("Requires workspace_path"),
+                "{} description should mention required workspace_path/file_path context",
+                tool.name
+            );
             let properties = tool
                 .input_schema
                 .get("properties")

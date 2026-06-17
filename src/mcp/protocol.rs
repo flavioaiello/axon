@@ -263,6 +263,13 @@ pub fn with_workspace_context_schema(mut schema: Value) -> Value {
     schema
 }
 
+pub fn with_workspace_context_description(description: impl Into<String>) -> String {
+    format!(
+        "{} Requires workspace_path (Cargo workspace/package root) or file_path (file inside the target workspace) in every tool call.",
+        description.into()
+    )
+}
+
 // ─── Resources ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize)]

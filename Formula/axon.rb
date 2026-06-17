@@ -32,12 +32,19 @@ class Axon < Formula
 
         brew services start flavioaiello/axon/axon
 
-      It listens on ~/.axon/daemon.sock and holds each workspace's model
-      separately in memory. Every editor still launches `axon serve` (stdio),
-      which bridges to the daemon. Tool calls route by their workspace_path or
-      file_path arguments. Start the service first; `serve` will report an
-      error instead of silently falling back to a split in-process model.
-      MCP registration is global:
+      It listens on ~/.axon/daemon.sock and http://127.0.0.1:8888, holding each
+      workspace's model separately in memory. Tool calls route by their
+      workspace_path or file_path arguments. Start the service first; `serve`
+      will report an error instead of silently falling back to a split
+      in-process model.
+
+      Codex can connect directly to the daemon over streamable HTTP:
+
+        [mcp_servers.axon]
+        enabled = true
+        url = "http://127.0.0.1:8888/mcp"
+
+      Stdio MCP registration remains available as a compatibility bridge:
 
         {
           "servers": {

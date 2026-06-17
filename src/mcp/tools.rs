@@ -7,7 +7,7 @@ use std::process::Command;
 use crate::domain::model::DomainModel;
 use crate::mcp::protocol::{
     ToolCallResult, ToolDefinition, error_tool_result, json_tool_result, with_reasoning_context,
-    with_workspace_context_schema,
+    with_workspace_context_description, with_workspace_context_schema,
 };
 use crate::reasoning::ReasoningKernel;
 use crate::store::{PersistedReasoningClaim, Store};
@@ -31,7 +31,7 @@ impl From<ReadToolSpec> for ToolDefinition {
     fn from(spec: ReadToolSpec) -> Self {
         Self {
             name: spec.name,
-            description: spec.description,
+            description: with_workspace_context_description(spec.description),
             input_schema: with_workspace_context_schema(spec.input_schema),
         }
     }
@@ -1615,6 +1615,11 @@ mod tests {
             assert!(!names.contains(&legacy));
         }
         for tool in &tools {
+            assert!(
+                tool.description.contains("Requires workspace_path"),
+                "{} description should mention required workspace_path/file_path context",
+                tool.name
+            );
             let properties = tool
                 .input_schema
                 .get("properties")

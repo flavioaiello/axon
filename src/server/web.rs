@@ -1,6 +1,7 @@
 use crate::domain::model::DomainModel;
+use crate::mcp::protocol::{JsonRpcRequest, JsonRpcResponse};
 use crate::store::CrateRegistry;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -57,21 +58,33 @@ async fn handle_connection_multi(
     mut stream: TcpStream,
     registries: super::WorkspaceRegistries,
 ) -> Result<()> {
-    let mut buffer = [0_u8; 8192];
-    let read = stream.read(&mut buffer).await?;
-    if read == 0 {
+    let Some(request) = read_http_request(&mut stream).await? else {
         return Ok(());
+    };
+
+    if request.method == "OPTIONS" {
+        return respond(
+            &mut stream,
+            "204 No Content",
+            "text/plain; charset=utf-8",
+            "",
+        )
+        .await;
     }
 
-    let request = String::from_utf8_lossy(&buffer[..read]);
-    let target = request
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .unwrap_or("/");
-    let (path, query) = target.split_once('?').unwrap_or((target, ""));
-
-    match path {
+    match request.path.as_str() {
+        "/mcp" => match request.method.as_str() {
+            "POST" => respond_mcp(&mut stream, &registries, &request.body).await,
+            _ => {
+                respond(
+                    &mut stream,
+                    "405 Method Not Allowed",
+                    "text/plain; charset=utf-8",
+                    "MCP endpoint accepts POST requests",
+                )
+                .await
+            }
+        },
         "/" | "/index.html" => {
             respond(&mut stream, "200 OK", "text/html; charset=utf-8", WEB_HTML).await
         }
@@ -89,7 +102,7 @@ async fn handle_connection_multi(
             let body = serde_json::to_string_pretty(&build_workspace_inventory_json(&map))?;
             respond(&mut stream, "200 OK", "application/json", &body).await
         }
-        "/api/graph" => match select_registry(&registries, query).await {
+        "/api/graph" => match select_registry(&registries, &request.query).await {
             Some(registry) => {
                 let body = serde_json::to_string_pretty(&build_graph_json(&registry))?;
                 respond(&mut stream, "200 OK", "application/json", &body).await
@@ -104,7 +117,7 @@ async fn handle_connection_multi(
                 .await
             }
         },
-        "/api/health" => match select_registry(&registries, query).await {
+        "/api/health" => match select_registry(&registries, &request.query).await {
             Some(registry) => {
                 let body = serde_json::to_string_pretty(&build_health_json(&registry))?;
                 respond(&mut stream, "200 OK", "application/json", &body).await
@@ -119,6 +132,80 @@ async fn handle_connection_multi(
                 "not found",
             )
             .await
+        }
+    }
+}
+
+async fn respond_mcp(
+    stream: &mut TcpStream,
+    registries: &super::WorkspaceRegistries,
+    body: &str,
+) -> Result<()> {
+    match build_mcp_http_response(registries, body).await? {
+        Some(body) => respond(stream, "200 OK", "application/json", &body).await,
+        None => respond(stream, "202 Accepted", "text/plain; charset=utf-8", "").await,
+    }
+}
+
+async fn build_mcp_http_response(
+    registries: &super::WorkspaceRegistries,
+    body: &str,
+) -> Result<Option<String>> {
+    let value: Value = match serde_json::from_str(body.trim()) {
+        Ok(value) => value,
+        Err(error) => {
+            let response = JsonRpcResponse::error(None, -32700, format!("Parse error: {error}"));
+            return Ok(Some(serde_json::to_string(&response)?));
+        }
+    };
+
+    if let Value::Array(items) = value {
+        if items.is_empty() {
+            let response = JsonRpcResponse::error(None, -32600, "Invalid Request: empty batch");
+            return Ok(Some(serde_json::to_string(&response)?));
+        }
+
+        let mut responses = Vec::new();
+        for item in items {
+            match serde_json::from_value::<JsonRpcRequest>(item) {
+                Ok(request) => {
+                    let has_id = request.id.is_some();
+                    let response =
+                        super::daemon::handle_daemon_request(registries, None, &request).await;
+                    if has_id {
+                        responses.push(serde_json::to_value(response)?);
+                    }
+                }
+                Err(error) => {
+                    responses.push(serde_json::to_value(JsonRpcResponse::error(
+                        None,
+                        -32600,
+                        format!("Invalid Request: {error}"),
+                    ))?);
+                }
+            }
+        }
+
+        if responses.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(serde_json::to_string(&responses)?))
+        }
+    } else {
+        let request: JsonRpcRequest = match serde_json::from_value(value) {
+            Ok(request) => request,
+            Err(error) => {
+                let response =
+                    JsonRpcResponse::error(None, -32600, format!("Invalid Request: {error}"));
+                return Ok(Some(serde_json::to_string(&response)?));
+            }
+        };
+        let has_id = request.id.is_some();
+        let response = super::daemon::handle_daemon_request(registries, None, &request).await;
+        if has_id {
+            Ok(Some(serde_json::to_string(&response)?))
+        } else {
+            Ok(None)
         }
     }
 }
@@ -195,21 +282,21 @@ fn hex_nibble(b: u8) -> Option<u8> {
 }
 
 async fn handle_connection(mut stream: TcpStream, registry: Arc<CrateRegistry>) -> Result<()> {
-    let mut buffer = [0_u8; 8192];
-    let read = stream.read(&mut buffer).await?;
-    if read == 0 {
+    let Some(request) = read_http_request(&mut stream).await? else {
         return Ok(());
+    };
+
+    if request.method == "OPTIONS" {
+        return respond(
+            &mut stream,
+            "204 No Content",
+            "text/plain; charset=utf-8",
+            "",
+        )
+        .await;
     }
 
-    let request = String::from_utf8_lossy(&buffer[..read]);
-    let target = request
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .unwrap_or("/");
-    let (path, _) = target.split_once('?').unwrap_or((target, ""));
-
-    match path {
+    match request.path.as_str() {
         "/" | "/index.html" => {
             respond(&mut stream, "200 OK", "text/html; charset=utf-8", WEB_HTML).await
         }
@@ -242,6 +329,88 @@ async fn handle_connection(mut stream: TcpStream, registry: Arc<CrateRegistry>) 
     }
 }
 
+struct HttpRequest {
+    method: String,
+    path: String,
+    query: String,
+    body: String,
+}
+
+async fn read_http_request(stream: &mut TcpStream) -> Result<Option<HttpRequest>> {
+    let mut buffer = Vec::new();
+    let mut chunk = [0_u8; 8192];
+    let header_end = loop {
+        let read = stream.read(&mut chunk).await?;
+        if read == 0 {
+            if buffer.is_empty() {
+                return Ok(None);
+            }
+            bail!("HTTP request ended before headers were complete");
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+        if let Some(header_end) = find_header_end(&buffer) {
+            break header_end;
+        }
+        if buffer.len() > 1024 * 1024 {
+            bail!("HTTP request headers exceeded 1 MiB");
+        }
+    };
+
+    let headers = String::from_utf8(buffer[..header_end].to_vec())
+        .context("HTTP headers were not valid UTF-8")?;
+    let mut lines = headers.lines();
+    let request_line = lines.next().unwrap_or("GET / HTTP/1.1");
+    let mut request_parts = request_line.split_whitespace();
+    let method = request_parts.next().unwrap_or("GET").to_string();
+    let target = request_parts.next().unwrap_or("/");
+    let (path, query) = target.split_once('?').unwrap_or((target, ""));
+    let content_length = lines
+        .filter_map(content_length_header)
+        .next()
+        .unwrap_or_default();
+
+    while buffer.len() < header_end + content_length {
+        let read = stream.read(&mut chunk).await?;
+        if read == 0 {
+            bail!("HTTP request body ended before Content-Length was satisfied");
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+        if buffer.len() > header_end + 16 * 1024 * 1024 {
+            bail!("HTTP request body exceeded 16 MiB");
+        }
+    }
+
+    let body = String::from_utf8(buffer[header_end..header_end + content_length].to_vec())
+        .context("HTTP request body was not valid UTF-8")?;
+
+    Ok(Some(HttpRequest {
+        method,
+        path: path.to_string(),
+        query: query.to_string(),
+        body,
+    }))
+}
+
+fn find_header_end(buffer: &[u8]) -> Option<usize> {
+    buffer
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|position| position + 4)
+        .or_else(|| {
+            buffer
+                .windows(2)
+                .position(|window| window == b"\n\n")
+                .map(|position| position + 2)
+        })
+}
+
+fn content_length_header(line: &str) -> Option<usize> {
+    let (name, value) = line.split_once(':')?;
+    name.eq_ignore_ascii_case("content-length")
+        .then(|| value.trim().parse().ok())
+        .flatten()
+}
+
 async fn respond(
     stream: &mut TcpStream,
     status: &str,
@@ -249,7 +418,7 @@ async fn respond(
     body: &str,
 ) -> Result<()> {
     let response = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, MCP-Protocol-Version, Mcp-Session-Id\r\nAccess-Control-Expose-Headers: MCP-Protocol-Version, Mcp-Session-Id\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     stream.write_all(response.as_bytes()).await?;
@@ -1020,8 +1189,10 @@ const WEB_CYTOSCAPE: &str = include_str!("cytoscape.bundle.js");
 mod tests {
     use super::*;
     use crate::domain::model::*;
+    use std::collections::HashMap;
     use std::env::temp_dir;
     use std::fs;
+    use tokio::sync::Mutex;
 
     #[test]
     fn graph_json_contains_actual_model_nodes() {
@@ -1252,5 +1423,64 @@ mod tests {
         assert!(!WEB_HTML.contains("class=\"legend\""));
         assert!(!WEB_HTML.contains("Source file"));
         assert!(WEB_CYTOSCAPE.contains("cytoscape"));
+    }
+
+    #[tokio::test]
+    async fn mcp_http_tools_list_is_global() {
+        let registries = Arc::new(Mutex::new(HashMap::new()));
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#;
+
+        let response = build_mcp_http_response(&registries, body)
+            .await
+            .unwrap()
+            .expect("tools/list should return a response");
+        let response: Value = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(response["jsonrpc"], "2.0");
+        assert_eq!(response["id"], 1);
+        assert!(
+            response["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| {
+                    tool["name"] == "rust_status"
+                        && tool["inputSchema"]["properties"]
+                            .get("workspace_path")
+                            .is_some()
+                })
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_http_tool_call_requires_workspace_context() {
+        let registries = Arc::new(Mutex::new(HashMap::new()));
+        let body = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"rust_status","arguments":{"detail":"summary"}}}"#;
+
+        let response = build_mcp_http_response(&registries, body)
+            .await
+            .unwrap()
+            .expect("tool errors should return a JSON-RPC response");
+        let response: Value = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(response["jsonrpc"], "2.0");
+        assert_eq!(response["id"], 2);
+        assert_eq!(response["error"]["code"], -32602);
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("workspace_path")
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_http_notification_returns_no_body() {
+        let registries = Arc::new(Mutex::new(HashMap::new()));
+        let body = r#"{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}"#;
+
+        let response = build_mcp_http_response(&registries, body).await.unwrap();
+
+        assert!(response.is_none());
     }
 }

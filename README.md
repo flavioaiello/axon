@@ -198,21 +198,25 @@ args as the `.mcp.json` example above.
 
 ### Codex
 
-Codex stores MCP servers in TOML. For a project-shared setup, add
+Codex stores MCP servers in TOML and supports streamable HTTP servers with a
+`url` key. For a project-shared setup backed directly by the shared daemon, add
 `.codex/config.toml`:
 
 ```toml
 [mcp_servers.axon]
-command = "/opt/homebrew/bin/axon"
-args = ["serve"]
+enabled = true
+url = "http://127.0.0.1:8888/mcp"
 ```
 
-Leave `cwd` unset here. Codex starts the MCP child in the session workspace, and
-daemon-mode `serve` stays global; axon routes each tool call from its
-`workspace_path` or `file_path` argument.
+This talks to the Homebrew daemon's HTTP listener instead of spawning a Codex
+child process. Keep the daemon running with `brew services start
+flavioaiello/axon/axon`. The server stays global; axon routes each tool call
+from its `workspace_path` or `file_path` argument.
 
 For a private user-level setup shared by Codex CLI and the Codex IDE extension,
-put the same table in `~/.codex/config.toml`:
+put the same table in `~/.codex/config.toml`.
+
+If you need the stdio bridge instead, use this compatibility registration:
 
 ```toml
 [mcp_servers.axon]
@@ -287,7 +291,7 @@ axon [command] [options]
 | Command | Description |
 |:--------|:------------|
 | `serve` | Start the global MCP stdio bridge to the shared daemon; tool calls should pass `workspace_path` or `file_path`. `--workspace <path>` is a legacy default fallback. Use `--standalone` for an in-process workspace server; `--web-port` only applies in standalone mode |
-| `daemon` | Run the shared in-memory daemon, Unix socket bridge, live watcher, and multi-workspace web graph; accepts `--socket <path>` and `--web-port <port>` |
+| `daemon` | Run the shared in-memory daemon, Unix socket bridge, live watcher, multi-workspace web graph, and HTTP MCP endpoint at `/mcp`; accepts `--socket <path>` and `--web-port <port>` |
 | `web` | Start the background Rust watcher and local web graph for one workspace; accepts `--workspace <path>` (defaults to current directory) and `--port <port>` |
 | `export <file>` | Export a workspace model to JSON; requires `--workspace <path>` and accepts `--state actual` or compatibility aliases |
 | `list` | Show all discovered crates and their model status; accepts `--workspace <path>` (defaults to current directory) |
@@ -305,7 +309,9 @@ axon serve
 axon serve --workspace . --standalone
 ```
 
-Open `http://127.0.0.1:8888` to inspect the live Rust architecture overview. If the port is occupied, axon reports a bind error instead of switching ports.
+Open `http://127.0.0.1:8888` to inspect the live Rust architecture overview, or
+point streamable HTTP MCP clients at `http://127.0.0.1:8888/mcp`. If the port is
+occupied, axon reports a bind error instead of switching ports.
 
 ## How it works
 

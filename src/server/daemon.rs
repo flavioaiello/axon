@@ -118,7 +118,7 @@ async fn handle_connection(stream: UnixStream, registries: Registries) -> Result
     Ok(())
 }
 
-async fn handle_daemon_request(
+pub(super) async fn handle_daemon_request(
     registries: &Registries,
     default_workspace: Option<&str>,
     request: &JsonRpcRequest,
