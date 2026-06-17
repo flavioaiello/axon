@@ -2758,6 +2758,25 @@ mod tests {
                 .get("properties")
                 .and_then(|value| value.as_object())
                 .unwrap_or_else(|| panic!("{} should have object properties", tool.name));
+            assert_ne!(
+                tool.input_schema.get("required"),
+                Some(&json!([])),
+                "{} schema should omit empty required arrays",
+                tool.name
+            );
+            assert!(
+                tool.input_schema
+                    .get("allOf")
+                    .and_then(|value| value.as_array())
+                    .is_some_and(|all_of| all_of.contains(&json!({
+                        "anyOf": [
+                            { "required": ["workspace_path"] },
+                            { "required": ["file_path"] }
+                        ]
+                    }))),
+                "{} schema should require workspace_path or file_path",
+                tool.name
+            );
             for key in ["workspace_path", "file_path", "crate", "crate_name"] {
                 assert!(
                     properties.contains_key(key),

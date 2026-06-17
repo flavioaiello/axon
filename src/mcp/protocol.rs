@@ -196,6 +196,13 @@ pub fn with_workspace_context_schema(mut schema: Value) -> Value {
     object
         .entry("type")
         .or_insert_with(|| Value::String("object".into()));
+    if object
+        .get("required")
+        .and_then(|required| required.as_array())
+        .is_some_and(|required| required.is_empty())
+    {
+        object.remove("required");
+    }
     let properties = object.entry("properties").or_insert_with(|| json!({}));
     let Some(properties) = properties.as_object_mut() else {
         return schema;
@@ -225,6 +232,33 @@ pub fn with_workspace_context_schema(mut schema: Value) -> Value {
             "description": "Alias for crate."
         })
     });
+
+    let workspace_context_requirement = json!({
+        "anyOf": [
+            { "required": ["workspace_path"] },
+            { "required": ["file_path"] }
+        ]
+    });
+    match object.get_mut("allOf") {
+        Some(Value::Array(all_of)) => {
+            if !all_of.contains(&workspace_context_requirement) {
+                all_of.push(workspace_context_requirement);
+            }
+        }
+        Some(existing) => {
+            let existing = std::mem::take(existing);
+            object.insert(
+                "allOf".into(),
+                Value::Array(vec![existing, workspace_context_requirement]),
+            );
+        }
+        None => {
+            object.insert(
+                "allOf".into(),
+                Value::Array(vec![workspace_context_requirement]),
+            );
+        }
+    }
 
     schema
 }
