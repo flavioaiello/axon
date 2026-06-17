@@ -2,8 +2,7 @@
 //!
 //! Each editor still spawns `axon serve` as a stdio child (so `.mcp.json` is
 //! unchanged). When a [`super::daemon`] is running, `serve` forwards the MCP
-//! session to it over the Unix socket — tagged with this session's workspace —
-//! instead of holding its own in-process model. If no daemon is reachable, the
+//! session to it over the Unix socket. If no daemon is reachable, the
 //! caller decides whether to retry or abort.
 
 use anyhow::Result;
@@ -17,12 +16,15 @@ use tokio::sync::Mutex;
 use super::stdio;
 use crate::store::canonicalize_path;
 
-/// Forward this process's stdio MCP session to the daemon at `socket_path`,
-/// scoped to `workspace`.
+/// Forward this process's stdio MCP session to the daemon at `socket_path`.
+///
+/// `default_workspace` is a legacy session fallback for clients that do not pass
+/// workspace context with tool calls. New daemon-mode clients should omit it and
+/// provide `workspace_path` or `file_path` per call.
 ///
 /// Returns `Ok(false)` if the daemon isn't reachable. `Ok(true)` means the
 /// bridge ran until the editor or daemon closed the connection.
-pub async fn try_bridge(socket_path: &Path, workspace: &str) -> Result<bool> {
+pub async fn try_bridge(socket_path: &Path, default_workspace: Option<&str>) -> Result<bool> {
     let stream = match UnixStream::connect(socket_path).await {
         Ok(s) => s,
         // No daemon listening: let the caller retry or abort.
@@ -32,10 +34,9 @@ pub async fn try_bridge(socket_path: &Path, workspace: &str) -> Result<bool> {
 
     let (read_half, mut write_half) = stream.into_split();
 
-    // Handshake: scope the session to this workspace. Resolve relative paths in
-    // the editor-spawned child before crossing into the long-running daemon,
-    // whose cwd is commonly `/` under launchd/Homebrew.
-    let handshake = workspace_handshake(workspace);
+    // Handshake: keep the daemon transport framed before JSON-RPC begins. A
+    // workspace here is only a legacy default; normal routing is per tool call.
+    let handshake = workspace_handshake(default_workspace);
     write_half.write_all(handshake.as_bytes()).await?;
     write_half.write_all(b"\n").await?;
     write_half.flush().await?;
@@ -85,8 +86,11 @@ pub async fn try_bridge(socket_path: &Path, workspace: &str) -> Result<bool> {
     Ok(true)
 }
 
-fn workspace_handshake(workspace: &str) -> String {
-    json!({ "workspace": canonicalize_path(workspace) }).to_string()
+fn workspace_handshake(default_workspace: Option<&str>) -> String {
+    match default_workspace {
+        Some(workspace) => json!({ "workspace": canonicalize_path(workspace) }).to_string(),
+        None => json!({}).to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -96,11 +100,20 @@ mod tests {
     #[test]
     fn workspace_handshake_canonicalizes_relative_workspace() {
         let cwd = std::env::current_dir().unwrap();
-        let handshake: serde_json::Value = serde_json::from_str(&workspace_handshake(".")).unwrap();
+        let handshake: serde_json::Value =
+            serde_json::from_str(&workspace_handshake(Some("."))).unwrap();
 
         assert_eq!(
             handshake["workspace"],
             cwd.canonicalize().unwrap().to_string_lossy().as_ref()
         );
+    }
+
+    #[test]
+    fn workspace_handshake_can_be_global() {
+        let handshake: serde_json::Value =
+            serde_json::from_str(&workspace_handshake(None)).unwrap();
+
+        assert!(handshake.get("workspace").is_none());
     }
 }

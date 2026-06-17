@@ -63,9 +63,9 @@
     }
 
     .topbar > .brand { flex: 0 1 auto; }
-    .topbar > #crate-field,
+    .topbar > #workspace-field,
     .topbar > #layout-field { flex: 0 0 auto; }
-    .topbar > label.search:not(#layout-field) { flex: 1 1 240px; }
+    .topbar > label.search:not(#workspace-field) { flex: 1 1 240px; }
     .topbar > .toolbar { flex: 0 0 auto; margin-left: auto; }
 
     .brand {
@@ -146,107 +146,6 @@
     }
 
     .search select option { color: var(--text); background: #1b1d1a; }
-
-    .crate-menu {
-      position: relative;
-      min-width: 220px;
-    }
-
-    .crate-toggle {
-      width: 100%;
-      min-height: 38px;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-      padding: 8px 11px;
-      color: var(--text);
-      background: rgba(36, 38, 32, 0.82);
-    }
-
-    .crate-toggle::after {
-      content: "";
-      width: 10px;
-      height: 6px;
-      flex: 0 0 auto;
-      background: #a8a29a;
-      clip-path: polygon(0 0, 100% 0, 50% 100%);
-    }
-
-    .crate-panel {
-      position: absolute;
-      top: calc(100% + 8px);
-      left: 0;
-      z-index: 5;
-      width: min(420px, calc(100vw - 24px));
-      max-height: min(430px, calc(100vh - 120px));
-      overflow: auto;
-      padding: 8px;
-      border: 1px solid rgba(244, 239, 226, 0.17);
-      border-radius: 8px;
-      background: rgba(16, 18, 17, 0.98);
-      box-shadow: 0 18px 48px rgba(0, 0, 0, 0.34);
-    }
-
-    .crate-actions {
-      display: flex;
-      gap: 8px;
-      padding: 4px 4px 8px;
-      border-bottom: 1px solid rgba(244, 239, 226, 0.1);
-      margin-bottom: 6px;
-    }
-
-    .crate-actions button {
-      min-height: 30px;
-      padding: 5px 9px;
-      color: var(--muted);
-      background: rgba(244, 239, 226, 0.05);
-    }
-
-    .crate-list {
-      display: grid;
-      gap: 4px;
-    }
-
-    .crate-option {
-      display: grid;
-      grid-template-columns: auto minmax(0, 1fr);
-      gap: 9px;
-      align-items: start;
-      padding: 8px 7px;
-      border-radius: 6px;
-      color: var(--text);
-      cursor: pointer;
-    }
-
-    .crate-option:hover {
-      background: rgba(244, 239, 226, 0.06);
-    }
-
-    .crate-option input {
-      margin: 3px 0 0;
-      accent-color: var(--focus);
-    }
-
-    .crate-name,
-    .crate-meta {
-      display: block;
-      min-width: 0;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-
-    .crate-name {
-      font-weight: 800;
-      line-height: 1.2;
-    }
-
-    .crate-meta {
-      margin-top: 3px;
-      color: var(--quiet);
-      font-size: 12px;
-    }
 
     .toolbar {
       display: flex;
@@ -481,9 +380,6 @@
       h1 { font-size: 22px; }
       #subtitle { display: none; }
       .search { padding: 7px 10px; }
-      .crate-menu { min-width: 170px; }
-      .crate-toggle { min-height: 31px; padding: 5px 8px; }
-      .crate-panel { left: auto; right: 0; max-height: min(360px, calc(100vh - 90px)); }
       .toolbar { gap: 6px; justify-content: flex-start; overflow-x: auto; padding-bottom: 2px; }
       .topbar > .toolbar { flex: 0 0 auto; margin-left: auto; }
       .toggle,
@@ -503,16 +399,10 @@
       <h1>Axon</h1>
       <div id="subtitle">Live Rust architecture overview</div>
     </div>
-    <div class="crate-menu" id="crate-field" style="display:none">
-      <button class="crate-toggle" id="crate-toggle" type="button" aria-haspopup="true" aria-expanded="false">Crates</button>
-      <div class="crate-panel" id="crate-panel" hidden>
-        <div class="crate-actions">
-          <button id="crate-all" type="button">All</button>
-          <button id="crate-none" type="button">None</button>
-        </div>
-        <div class="crate-list" id="crate-list"></div>
-      </div>
-    </div>
+    <label class="search" id="workspace-field" style="display:none">
+      <span>Workspace</span>
+      <select id="workspace"></select>
+    </label>
     <label class="search">
       <span>Search</span>
       <input id="search" type="search" autocomplete="off" placeholder="crate, module, struct, path" />
@@ -575,12 +465,8 @@
       imports: document.getElementById('toggle-imports'),
       calls: document.getElementById('toggle-calls'),
     };
-    const crateField = document.getElementById('crate-field');
-    const crateToggle = document.getElementById('crate-toggle');
-    const cratePanel = document.getElementById('crate-panel');
-    const crateList = document.getElementById('crate-list');
-    const crateAll = document.getElementById('crate-all');
-    const crateNone = document.getElementById('crate-none');
+    const workspaceField = document.getElementById('workspace-field');
+    const workspaceSelect = document.getElementById('workspace');
 
     const C = {
       crate: '#46b9a7', module: '#70b8d6', struct: '#e6b655',
@@ -591,101 +477,36 @@
     if (window.cytoscapeFcose) cytoscape.use(window.cytoscapeFcose);
 
     const state = { data: null, cy: null, selectedId: null };
-    let crateInventory = [];
-    const selectedCrates = new Set();
 
-    function loadGraph(crateKeys) {
+    function loadGraph(workspace) {
       state.selectedId = null;
-      const keys = Array.isArray(crateKeys) ? crateKeys : selectedCrateKeys();
-      if (crateInventory.length && keys.length === 0) {
-        render(emptyGraph());
-        return;
-      }
-      const params = new URLSearchParams();
-      keys.forEach(key => params.append('crate', key));
-      const query = params.toString();
-      const url = query ? '/api/graph?' + query : '/api/graph';
+      const url = workspace ? '/api/graph?workspace=' + encodeURIComponent(workspace) : '/api/graph';
       fetch(url).then(r => r.json()).then(render).catch(err => {
         details.textContent = String(err);
         hoverReadout.textContent = 'Load failed';
       });
     }
 
-    fetch('/api/crates')
+    fetch('/api/workspaces')
       .then(r => (r.ok ? r.json() : Promise.reject()))
       .then(data => {
-        const list = ((data && data.crates) || []).filter(item => item.key);
+        const list = (data && data.workspaces) || [];
         if (list.length >= 1) {
-          crateInventory = list;
-          selectedCrates.clear();
-          crateInventory.forEach(item => selectedCrates.add(item.key));
-          renderCrateSelector();
-          crateField.style.display = '';
-          loadGraph(selectedCrateKeys());
+          workspaceSelect.innerHTML = '';
+          list.forEach(ws => {
+            const option = document.createElement('option');
+            option.value = ws.workspace;
+            option.textContent = ws.name + ' (' + ws.crates + (ws.crates === 1 ? ' crate)' : ' crates)');
+            workspaceSelect.appendChild(option);
+          });
+          workspaceField.style.display = '';
+          workspaceSelect.addEventListener('change', () => loadGraph(workspaceSelect.value));
+          loadGraph(list[0].workspace);
         } else {
           loadGraph(null);
         }
       })
       .catch(() => loadGraph(null));
-
-    function selectedCrateKeys() {
-      return crateInventory
-        .filter(item => selectedCrates.has(item.key))
-        .map(item => item.key);
-    }
-
-    function renderCrateSelector() {
-      clearElement(crateList);
-      crateInventory.forEach(item => {
-        const label = document.createElement('label');
-        label.className = 'crate-option';
-        label.title = item.root || item.key;
-
-        const input = document.createElement('input');
-        input.type = 'checkbox';
-        input.checked = selectedCrates.has(item.key);
-        input.addEventListener('change', () => {
-          if (input.checked) selectedCrates.add(item.key);
-          else selectedCrates.delete(item.key);
-          updateCrateToggle();
-          loadGraph(selectedCrateKeys());
-        });
-
-        const text = document.createElement('span');
-        const name = document.createElement('span');
-        name.className = 'crate-name';
-        name.textContent = item.name || item.key;
-        const meta = document.createElement('span');
-        meta.className = 'crate-meta';
-        meta.textContent = item.root || item.key;
-        text.append(name, meta);
-        label.append(input, text);
-        crateList.appendChild(label);
-      });
-      updateCrateToggle();
-    }
-
-    function updateCrateToggle() {
-      const total = crateInventory.length;
-      const active = selectedCrateKeys().length;
-      crateToggle.textContent = active === total ? 'Crates: all ' + total : 'Crates: ' + active + '/' + total;
-    }
-
-    function setAllCrates(checked) {
-      selectedCrates.clear();
-      if (checked) crateInventory.forEach(item => selectedCrates.add(item.key));
-      renderCrateSelector();
-      loadGraph(selectedCrateKeys());
-    }
-
-    function closeCratePanel() {
-      cratePanel.hidden = true;
-      crateToggle.setAttribute('aria-expanded', 'false');
-    }
-
-    function emptyGraph() {
-      return { crates: [], nodes: [], edges: [], stats: { crates: 0, modules: 0, structs: 0, imports: 0, calls: 0, methods: 0 } };
-    }
 
     function render(data) {
       data.nodes = data.nodes || [];
@@ -725,7 +546,7 @@
 
     // Map /api/graph nodes+edges to Cytoscape elements. Containment edges
     // (contains/declares) become parent relationships (compound nesting); the
-    // Hidden structs are dropped, walking parents up past them.
+    // Workspace nodes and hidden structs are dropped, walking parents up past them.
     function buildElements(data, options) {
       const parentOf = new Map();
       for (const e of data.edges) {
@@ -733,6 +554,7 @@
       }
       const visible = new Set();
       for (const n of data.nodes) {
+        if (n.kind === 'workspace') continue;
         if (n.kind === 'struct' && !options.showStructs) continue;
         visible.add(n.id);
       }
@@ -984,19 +806,6 @@
     Object.values(toggles).forEach(t => t.addEventListener('change', draw));
     layoutMode.addEventListener('change', draw);
     fitButton.addEventListener('click', () => { if (state.cy) state.cy.fit(undefined, 30); });
-    crateToggle.addEventListener('click', () => {
-      const shouldOpen = cratePanel.hidden;
-      cratePanel.hidden = !shouldOpen;
-      crateToggle.setAttribute('aria-expanded', String(shouldOpen));
-    });
-    crateAll.addEventListener('click', () => setAllCrates(true));
-    crateNone.addEventListener('click', () => setAllCrates(false));
-    document.addEventListener('click', event => {
-      if (!crateField.contains(event.target)) closeCratePanel();
-    });
-    document.addEventListener('keydown', event => {
-      if (event.key === 'Escape') closeCratePanel();
-    });
     window.addEventListener('resize', debounce(() => { if (state.cy) state.cy.resize(); }, 150));
 
     function clearElement(el) { while (el.firstChild) el.removeChild(el.firstChild); }

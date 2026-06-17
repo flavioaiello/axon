@@ -129,9 +129,10 @@ binary so MCP requests exercise your edited source:
 
 The default `serve` command bridges to the shared daemon. Restarting the
 Homebrew service restarts that daemon, but it does not rebuild or reinstall a
-locally edited binary. When `--workspace` is omitted, axon infers the workspace
-from the nearest Cargo workspace or package ancestor of the MCP child process
-cwd. It does not scan downward from unrelated directories.
+locally edited binary. In daemon mode, `serve` is global: tools route by the
+`workspace_path` or `file_path` argument supplied on each `tools/call`. The
+optional `--workspace` flag is only a legacy default fallback for clients that
+cannot pass per-call context.
 
 ### GitHub Copilot CLI
 
@@ -144,7 +145,7 @@ Add axon to `~/.copilot/mcp-config.json`:
     "axon": {
       "type": "stdio",
       "command": "/opt/homebrew/bin/axon",
-      "args": ["serve", "--workspace", "/absolute/path/to/rust/workspace"],
+      "args": ["serve"],
       "tools": ["*"]
     }
   }
@@ -189,7 +190,7 @@ If a GUI-launched Claude Code extension does not inherit your shell `PATH`, keep
 the full Homebrew binary path:
 
 ```bash
-claude mcp add axon -- /opt/homebrew/bin/axon serve --workspace /path/to/rust/workspace
+claude mcp add axon -- /opt/homebrew/bin/axon serve
 ```
 
 Claude Code extensions that expose MCP settings can use the same command and
@@ -207,22 +208,26 @@ args = ["serve"]
 ```
 
 Leave `cwd` unset here. Codex starts the MCP child in the session workspace, and
-axon resolves that launch directory to the nearest Cargo workspace/package
-ancestor before handing the session to the long-running daemon.
+daemon-mode `serve` stays global; axon routes each tool call from its
+`workspace_path` or `file_path` argument.
 
 For a private user-level setup shared by Codex CLI and the Codex IDE extension,
-put the same table in `~/.codex/config.toml` with an absolute workspace path:
+put the same table in `~/.codex/config.toml`:
 
 ```toml
 [mcp_servers.axon]
 command = "/opt/homebrew/bin/axon"
-args = ["serve", "--workspace", "/absolute/path/to/rust/workspace"]
+args = ["serve"]
 ```
+
+If an MCP client cannot provide `workspace_path` or `file_path` in tool calls,
+`axon serve --workspace /absolute/path/to/rust/workspace` remains available as a
+compatibility fallback for that one server registration.
 
 Or add it with the Codex CLI:
 
 ```bash
-codex mcp add axon -- /opt/homebrew/bin/axon serve --workspace "$PWD"
+codex mcp add axon -- /opt/homebrew/bin/axon serve
 ```
 
 Codex project config is loaded only after Codex trusts the project. The Codex
@@ -281,7 +286,7 @@ axon [command] [options]
 
 | Command | Description |
 |:--------|:------------|
-| `serve` | Start the MCP stdio bridge to the shared daemon; accepts `--workspace <path>` (defaults to current directory). Use `--standalone` for an in-process server; `--web-port` only applies in standalone mode |
+| `serve` | Start the global MCP stdio bridge to the shared daemon; tool calls should pass `workspace_path` or `file_path`. `--workspace <path>` is a legacy default fallback. Use `--standalone` for an in-process workspace server; `--web-port` only applies in standalone mode |
 | `daemon` | Run the shared in-memory daemon, Unix socket bridge, live watcher, and multi-workspace web graph; accepts `--socket <path>` and `--web-port <port>` |
 | `web` | Start the background Rust watcher and local web graph for one workspace; accepts `--workspace <path>` (defaults to current directory) and `--port <port>` |
 | `export <file>` | Export a workspace model to JSON; requires `--workspace <path>` and accepts `--state actual` or compatibility aliases |
@@ -296,7 +301,7 @@ Examples:
 
 ```bash
 axon web --workspace .
-axon serve --workspace .
+axon serve
 axon serve --workspace . --standalone
 ```
 

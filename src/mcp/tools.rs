@@ -7,6 +7,7 @@ use std::process::Command;
 use crate::domain::model::DomainModel;
 use crate::mcp::protocol::{
     ToolCallResult, ToolDefinition, error_tool_result, json_tool_result, with_reasoning_context,
+    with_workspace_context_schema,
 };
 use crate::reasoning::ReasoningKernel;
 use crate::store::{PersistedReasoningClaim, Store};
@@ -31,7 +32,7 @@ impl From<ReadToolSpec> for ToolDefinition {
         Self {
             name: spec.name,
             description: spec.description,
-            input_schema: spec.input_schema,
+            input_schema: with_workspace_context_schema(spec.input_schema),
         }
     }
 }
@@ -1612,6 +1613,20 @@ mod tests {
             "query_blast_radius",
         ] {
             assert!(!names.contains(&legacy));
+        }
+        for tool in &tools {
+            let properties = tool
+                .input_schema
+                .get("properties")
+                .and_then(|value| value.as_object())
+                .unwrap_or_else(|| panic!("{} should have object properties", tool.name));
+            for key in ["workspace_path", "file_path", "crate", "crate_name"] {
+                assert!(
+                    properties.contains_key(key),
+                    "{} schema should advertise {key}",
+                    tool.name
+                );
+            }
         }
     }
 

@@ -1,8 +1,8 @@
 use crate::domain::model::DomainModel;
-use crate::store::{CrateEntry, CrateRegistry, Store};
+use crate::store::CrateRegistry;
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -32,12 +32,15 @@ async fn bind_localhost(port: u16) -> Result<TcpListener> {
         .with_context(|| format!("bind web server on 127.0.0.1:{port}"))
 }
 
-/// Multi-crate web graph for the daemon: one server serving every registered
-/// crate, with graph display selected by crate keys.
+/// Multi-workspace web graph for the daemon: one server serving every registered
+/// workspace, selected via `?workspace=<canonical-root>`.
 pub async fn run_multi(registries: super::WorkspaceRegistries, preferred_port: u16) -> Result<()> {
     let listener = bind_localhost(preferred_port).await?;
     let addr = listener.local_addr()?;
-    info!("Axon multi-crate web graph available at http://{}", addr);
+    info!(
+        "Axon multi-workspace web graph available at http://{}",
+        addr
+    );
 
     loop {
         let (stream, _) = listener.accept().await?;
@@ -81,27 +84,33 @@ async fn handle_connection_multi(
             )
             .await
         }
-        "/api/crates" => {
+        "/api/workspaces" => {
             let map = registries.lock().await;
-            let body = serde_json::to_string_pretty(&build_crate_inventory_json(&map))?;
+            let body = serde_json::to_string_pretty(&build_workspace_inventory_json(&map))?;
             respond(&mut stream, "200 OK", "application/json", &body).await
         }
-        "/api/graph" => {
-            let entries = {
-                let map = registries.lock().await;
-                collect_selected_graph_crates(&map, query)
-            };
-            let body = serde_json::to_string_pretty(&build_graph_json_for_crates(&entries))?;
-            respond(&mut stream, "200 OK", "application/json", &body).await
-        }
-        "/api/health" => {
-            let entries = {
-                let map = registries.lock().await;
-                collect_selected_graph_crates(&map, query)
-            };
-            let body = serde_json::to_string_pretty(&build_health_json_for_crates(&entries))?;
-            respond(&mut stream, "200 OK", "application/json", &body).await
-        }
+        "/api/graph" => match select_registry(&registries, query).await {
+            Some(registry) => {
+                let body = serde_json::to_string_pretty(&build_graph_json(&registry))?;
+                respond(&mut stream, "200 OK", "application/json", &body).await
+            }
+            None => {
+                respond(
+                    &mut stream,
+                    "200 OK",
+                    "application/json",
+                    r#"{"crates":[],"nodes":[],"edges":[]}"#,
+                )
+                .await
+            }
+        },
+        "/api/health" => match select_registry(&registries, query).await {
+            Some(registry) => {
+                let body = serde_json::to_string_pretty(&build_health_json(&registry))?;
+                respond(&mut stream, "200 OK", "application/json", &body).await
+            }
+            None => respond(&mut stream, "200 OK", "application/json", "{}").await,
+        },
         _ => {
             respond(
                 &mut stream,
@@ -112,6 +121,22 @@ async fn handle_connection_multi(
             .await
         }
     }
+}
+
+/// Resolve the registry for a request: the `workspace` query param if it names a
+/// registered workspace, else the first one so a single-workspace daemon works
+/// without a selector.
+async fn select_registry(
+    registries: &super::WorkspaceRegistries,
+    query: &str,
+) -> Option<Arc<CrateRegistry>> {
+    let map = registries.lock().await;
+    if let Some(registry) =
+        query_param(query, "workspace").and_then(|workspace| map.get(&workspace))
+    {
+        return Some(Arc::clone(registry));
+    }
+    map.values().next().map(Arc::clone)
 }
 
 /// Extract and percent-decode a query-string parameter.
@@ -182,7 +207,7 @@ async fn handle_connection(mut stream: TcpStream, registry: Arc<CrateRegistry>) 
         .next()
         .and_then(|line| line.split_whitespace().nth(1))
         .unwrap_or("/");
-    let (path, query) = target.split_once('?').unwrap_or((target, ""));
+    let (path, _) = target.split_once('?').unwrap_or((target, ""));
 
     match path {
         "/" | "/index.html" => {
@@ -198,18 +223,11 @@ async fn handle_connection(mut stream: TcpStream, registry: Arc<CrateRegistry>) 
             .await
         }
         "/api/graph" => {
-            let entries = collect_selected_registry_graph_crates(&registry, query);
-            let body = serde_json::to_string_pretty(&build_graph_json_for_crates(&entries))?;
+            let body = serde_json::to_string_pretty(&build_graph_json(&registry))?;
             respond(&mut stream, "200 OK", "application/json", &body).await
         }
         "/api/health" => {
-            let entries = collect_selected_registry_graph_crates(&registry, query);
-            let body = serde_json::to_string_pretty(&build_health_json_for_crates(&entries))?;
-            respond(&mut stream, "200 OK", "application/json", &body).await
-        }
-        "/api/crates" => {
-            let body =
-                serde_json::to_string_pretty(&build_crate_inventory_json_for_registry(&registry))?;
+            let body = serde_json::to_string_pretty(&build_health_json(&registry))?;
             respond(&mut stream, "200 OK", "application/json", &body).await
         }
         _ => {
@@ -240,10 +258,81 @@ async fn respond(
 }
 
 pub fn build_graph_json(registry: &CrateRegistry) -> Value {
-    let entries = collect_registry_graph_crates(registry);
-    build_graph_json_for_crates(&entries)
+    let mut nodes = Vec::new();
+    let mut edges = Vec::new();
+    let mut crates = Vec::new();
+    let mut totals = GraphTotals::default();
+
+    let workspace_path = registry.workspace_root().to_string_lossy().to_string();
+    let workspace_label = registry
+        .workspace_root()
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| workspace_path.clone());
+    let workspace_id = node_id(["workspace", &workspace_path]);
+    nodes.push(json!({
+        "id": workspace_id,
+        "label": workspace_label,
+        "kind": "workspace",
+        "path": workspace_path,
+    }));
+    totals.workspaces = 1;
+
+    for entry in registry.crates() {
+        let crate_key = entry.crate_key();
+        let crate_id = node_id(["crate", &crate_key]);
+        nodes.push(json!({
+            "id": crate_id,
+            "label": entry.name,
+            "kind": "crate",
+            "key": crate_key,
+            "path": entry.root.to_string_lossy().to_string(),
+        }));
+        edges.push(edge(&workspace_id, &crate_id, "contains"));
+        totals.crates += 1;
+
+        let model = entry.store.load_actual(&crate_key).ok().flatten();
+        let mut crate_stats = GraphTotals::default();
+        if let Some(model) = model.as_ref() {
+            add_model_graph(
+                &crate_key,
+                &entry.name,
+                &crate_id,
+                model,
+                &mut nodes,
+                &mut edges,
+                &mut crate_stats,
+            );
+            totals.add(&crate_stats);
+        }
+
+        crates.push(json!({
+            "key": crate_key,
+            "name": entry.name,
+            "workspace": crate_key,
+            "root": entry.root.to_string_lossy().to_string(),
+            "has_model": model.is_some(),
+            "stats": crate_stats,
+        }));
+    }
+
+    json!({
+        "view": {
+            "name": "rust_architecture_overview",
+            "visible_node_kinds": ["workspace", "crate", "module", "struct"],
+            "visible_edge_kinds": ["contains", "declares", "imports", "calls"],
+            "complete_facts_stored": true,
+            "hidden_fact_kinds": ["source_file", "enum", "trait", "function", "method", "import_edge", "calls_symbol", "ast_edge"]
+        },
+        "workspace_root": registry.workspace_root().to_string_lossy(),
+        "crates": crates,
+        "nodes": nodes,
+        "edges": edges,
+        "stats": totals,
+    })
 }
 
+#[cfg(test)]
 fn build_graph_json_for_crates(entries: &[GraphCrate]) -> Value {
     let mut nodes = Vec::new();
     let mut edges = Vec::new();
@@ -300,94 +389,38 @@ fn build_graph_json_for_crates(entries: &[GraphCrate]) -> Value {
     })
 }
 
-fn build_health_json_for_crates(entries: &[GraphCrate]) -> Value {
-    let crates: Vec<Value> = entries
+fn build_health_json(registry: &CrateRegistry) -> Value {
+    let crates: Vec<Value> = registry
+        .crates()
         .iter()
         .map(|entry| {
-            let health = entry.store.model_health(&entry.key).ok();
+            let crate_key = entry.crate_key();
+            let health = entry.store.model_health(&crate_key).ok();
             json!({
-                "key": entry.key,
                 "crate": entry.name,
-                "root": entry.root,
+                "workspace": crate_key,
                 "health": health,
             })
         })
         .collect();
 
     json!({
+        "workspace_root": registry.workspace_root().to_string_lossy(),
         "crates": crates,
     })
 }
 
+#[cfg(test)]
 #[derive(Clone)]
 struct GraphCrate {
     key: String,
     name: String,
     root: String,
-    store: Arc<Store>,
+    store: Arc<crate::store::Store>,
 }
 
-fn collect_selected_graph_crates(
-    registries: &HashMap<String, Arc<CrateRegistry>>,
-    query: &str,
-) -> Vec<GraphCrate> {
-    let selected = selected_crate_keys(query);
-    let mut entries = Vec::new();
-
-    for registry in registries.values() {
-        entries.extend(
-            collect_registry_graph_crates(registry)
-                .into_iter()
-                .filter(|entry| selected.is_empty() || selected.contains(&entry.key)),
-        );
-    }
-
-    sort_graph_crates(&mut entries);
-    entries
-}
-
-fn collect_selected_registry_graph_crates(
-    registry: &CrateRegistry,
-    query: &str,
-) -> Vec<GraphCrate> {
-    let selected = selected_crate_keys(query);
-    let mut entries: Vec<GraphCrate> = collect_registry_graph_crates(registry)
-        .into_iter()
-        .filter(|entry| selected.is_empty() || selected.contains(&entry.key))
-        .collect();
-    sort_graph_crates(&mut entries);
-    entries
-}
-
-fn selected_crate_keys(query: &str) -> BTreeSet<String> {
-    let mut selected: BTreeSet<String> = query_params(query, "crate")
-        .into_iter()
-        .filter(|value| !value.is_empty())
-        .collect();
-    if selected.is_empty()
-        && let Some(csv) = query_param(query, "crates")
-    {
-        selected.extend(
-            csv.split(',')
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(ToOwned::to_owned),
-        );
-    }
-    selected
-}
-
-fn collect_registry_graph_crates(registry: &CrateRegistry) -> Vec<GraphCrate> {
-    let mut entries: Vec<GraphCrate> = registry
-        .crates()
-        .iter()
-        .map(graph_crate_from_entry)
-        .collect();
-    sort_graph_crates(&mut entries);
-    entries
-}
-
-fn graph_crate_from_entry(entry: &CrateEntry) -> GraphCrate {
+#[cfg(test)]
+fn graph_crate_from_entry(entry: &crate::store::CrateEntry) -> GraphCrate {
     GraphCrate {
         key: entry.crate_key(),
         name: entry.name.clone(),
@@ -396,42 +429,22 @@ fn graph_crate_from_entry(entry: &CrateEntry) -> GraphCrate {
     }
 }
 
-fn sort_graph_crates(entries: &mut [GraphCrate]) {
-    entries.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.key.cmp(&b.key)));
-}
-
-fn build_crate_inventory_json(registries: &HashMap<String, Arc<CrateRegistry>>) -> Value {
-    let mut entries: Vec<GraphCrate> = registries
-        .values()
-        .flat_map(|registry| collect_registry_graph_crates(registry))
-        .collect();
-    sort_graph_crates(&mut entries);
-
-    json!({
-        "crates": crate_inventory_items(&entries),
-    })
-}
-
-fn build_crate_inventory_json_for_registry(registry: &CrateRegistry) -> Value {
-    let entries = collect_registry_graph_crates(registry);
-    json!({
-        "crates": crate_inventory_items(&entries),
-    })
-}
-
-fn crate_inventory_items(entries: &[GraphCrate]) -> Vec<Value> {
-    entries
+fn build_workspace_inventory_json(registries: &HashMap<String, Arc<CrateRegistry>>) -> Value {
+    let mut items: Vec<Value> = registries
         .iter()
-        .map(|entry| {
-            let has_model = entry.store.load_actual(&entry.key).ok().flatten().is_some();
+        .map(|(key, registry)| {
             json!({
-                "key": entry.key,
-                "name": entry.name,
-                "root": entry.root,
-                "has_model": has_model,
+                "workspace": key,
+                "name": std::path::Path::new(key)
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+                    .unwrap_or_else(|| key.clone()),
+                "crates": registry.crates().len(),
             })
         })
-        .collect()
+        .collect();
+    items.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+    json!({ "workspaces": items })
 }
 
 fn add_model_graph(
@@ -949,6 +962,7 @@ fn struct_id_for_call(
 
 #[derive(Default, serde::Serialize)]
 struct GraphTotals {
+    workspaces: usize,
     crates: usize,
     contexts: usize,
     context_dependencies: usize,
@@ -974,6 +988,7 @@ struct GraphTotals {
 
 impl GraphTotals {
     fn add(&mut self, other: &GraphTotals) {
+        self.workspaces += other.workspaces;
         self.crates += other.crates;
         self.contexts += other.contexts;
         self.context_dependencies += other.context_dependencies;
@@ -1097,10 +1112,12 @@ mod tests {
         let graph = build_graph_json(&registry);
         assert_eq!(graph["view"]["name"], "rust_architecture_overview");
         assert_eq!(graph["view"]["complete_facts_stored"], true);
+        assert_eq!(graph["stats"]["workspaces"], 1);
         assert_eq!(graph["stats"]["crates"], 1);
-        assert!(graph["stats"].get("workspaces").is_none());
-        assert!(graph["workspace_root"].is_null());
-        assert!(graph["workspace_roots"].is_null());
+        assert_eq!(
+            graph["workspace_root"],
+            registry.workspace_root().to_string_lossy().as_ref()
+        );
         assert_eq!(graph["stats"]["contexts"], 0);
         assert!(graph["stats"]["modules"].as_u64().unwrap() >= 2);
         assert!(graph["stats"]["submodules"].as_u64().unwrap() >= 1);
@@ -1108,11 +1125,12 @@ mod tests {
         assert_eq!(graph["stats"]["symbols"], 1);
         assert_eq!(graph["stats"]["structs"], 1);
         assert_eq!(graph["stats"]["semantic_labels"], 1);
-        assert!(
-            graph["nodes"].as_array().unwrap().iter().all(|node| {
-                matches!(node["kind"].as_str(), Some("crate" | "module" | "struct"))
-            })
-        );
+        assert!(graph["nodes"].as_array().unwrap().iter().all(|node| {
+            matches!(
+                node["kind"].as_str(),
+                Some("workspace" | "crate" | "module" | "struct")
+            )
+        }));
         assert!(graph["nodes"].as_array().unwrap().iter().any(|node| {
             node["kind"] == "struct"
                 && node["label"] == "Invoice"
@@ -1173,6 +1191,8 @@ mod tests {
 
     #[test]
     fn graph_json_uses_crate_keys_for_duplicate_crate_names() {
+        use std::collections::BTreeSet;
+
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -1208,7 +1228,7 @@ mod tests {
             .collect();
 
         assert_eq!(graph["stats"]["crates"], 2);
-        assert!(graph["stats"].get("workspaces").is_none());
+        assert_eq!(graph["stats"]["workspaces"], 0);
         assert_eq!(crate_ids.len(), 2);
         assert_eq!(graph["crates"].as_array().unwrap().len(), 2);
 
@@ -1219,16 +1239,15 @@ mod tests {
     #[test]
     fn web_page_contains_graph_bootstrap() {
         assert!(WEB_HTML.contains("/api/graph"));
-        assert!(WEB_HTML.contains("/api/crates"));
+        assert!(WEB_HTML.contains("/api/workspaces"));
         assert!(WEB_HTML.contains("Live Rust architecture overview"));
         assert!(WEB_HTML.contains("cytoscape"));
         assert!(WEB_HTML.contains("/cytoscape.bundle.js"));
-        assert!(WEB_HTML.contains("id=\"crate-toggle\""));
+        assert!(WEB_HTML.contains("id=\"workspace-field\""));
         assert!(WEB_HTML.contains("id=\"layout-mode\""));
         assert!(WEB_HTML.contains("grid-template-columns: 1fr;"));
-        assert!(!WEB_HTML.contains("id=\"workspace-field\""));
-        assert!(!WEB_HTML.contains("/api/workspaces"));
-        assert!(!WEB_HTML.to_ascii_lowercase().contains("workspace"));
+        assert!(!WEB_HTML.contains("id=\"crate-toggle\""));
+        assert!(!WEB_HTML.contains("/api/crates"));
         assert!(!WEB_HTML.contains("<h2>Legend</h2>"));
         assert!(!WEB_HTML.contains("class=\"legend\""));
         assert!(!WEB_HTML.contains("Source file"));

@@ -58,6 +58,54 @@ pub(crate) fn handle_request_with_registry(
     success_response(req, result)
 }
 
+pub(crate) fn handle_global_request(req: &JsonRpcRequest) -> Option<JsonRpcResponse> {
+    match req.method.as_str() {
+        "initialize" => {
+            let client_version = req
+                .params
+                .as_ref()
+                .and_then(|p| p.get("protocolVersion"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("2024-11-05");
+
+            let result = InitializeResult {
+                protocol_version: client_version.into(),
+                capabilities: ServerCapabilities {
+                    tools: Some(ToolsCapability {}),
+                    resources: Some(ResourcesCapability {}),
+                    prompts: Some(PromptsCapability {}),
+                },
+                server_info: ServerInfo {
+                    name: "axon".into(),
+                    version: crate::VERSION.into(),
+                },
+            };
+            Some(success_response(req, result))
+        }
+        "notifications/initialized" | "initialized" => Some(success_response(req, json!({}))),
+        "tools/list" => {
+            let mut all_tools = tools::list_tools();
+            all_tools.extend(write_tools::list_write_tools());
+            let result = ToolsListResult { tools: all_tools };
+            Some(success_response(req, result))
+        }
+        "prompts/list" => {
+            let result = PromptsListResult {
+                prompts: prompts::list_prompts(),
+            };
+            Some(success_response(req, result))
+        }
+        "ping" => Some(success_response(req, json!({}))),
+        _ => None,
+    }
+}
+
+pub(crate) fn parse_tool_call_params(
+    req: &JsonRpcRequest,
+) -> std::result::Result<ToolCallParams, JsonRpcResponse> {
+    parse_params(req).map_err(|response| *response)
+}
+
 fn select_tool_entry<'a>(
     registry: &'a CrateRegistry,
     args: &serde_json::Value,
@@ -73,7 +121,27 @@ fn select_tool_entry<'a>(
             .ok_or_else(|| format!("Unknown crate: {crate_name}"));
     }
 
-    for key in ["path", "file_path", "workspace", "workspace_path"] {
+    for key in ["workspace", "workspace_path"] {
+        if let Some(path) = args
+            .get(key)
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.is_empty())
+        {
+            let route_path = route_path(registry, path);
+            if route_path == registry.workspace_root() {
+                return Ok(registry.primary());
+            }
+            return registry.for_path(&route_path).ok_or_else(|| {
+                format!(
+                    "No discovered crate owns {} route: {}",
+                    key,
+                    route_path.display()
+                )
+            });
+        }
+    }
+
+    for key in ["path", "file_path"] {
         if let Some(path) = args
             .get(key)
             .and_then(|value| value.as_str())

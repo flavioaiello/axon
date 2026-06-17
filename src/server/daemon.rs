@@ -7,10 +7,11 @@
 //!
 //! Transport is a Unix domain socket speaking the same newline-delimited
 //! JSON-RPC as the stdio server; each connection begins with a one-line
-//! `{"workspace": "<path>"}` handshake that scopes the rest of the session.
+//! handshake. The handshake may include a legacy default `workspace`, but normal
+//! daemon routing uses workspace context supplied on each tool call.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -22,13 +23,14 @@ use tracing::{info, warn};
 
 use super::WorkspaceRegistries as Registries;
 use super::watcher::ActualStateWatcher;
-use crate::mcp::handle_request_with_registry;
 use crate::mcp::protocol::{JsonRpcRequest, JsonRpcResponse};
+use crate::mcp::{handle_global_request, handle_request_with_registry, parse_tool_call_params};
 use crate::store::{CrateRegistry, canonicalize_path};
 
 #[derive(Deserialize)]
 struct Handshake {
-    workspace: String,
+    #[serde(default)]
+    workspace: Option<String>,
 }
 
 /// Run the daemon, listening on `socket_path` until the process is stopped.
@@ -81,25 +83,16 @@ async fn handle_connection(stream: UnixStream, registries: Registries) -> Result
     let (read_half, mut write_half) = stream.into_split();
     let mut lines = BufReader::new(read_half).lines();
 
-    // First line scopes the session to a workspace.
+    // First line is a transport handshake. `workspace` is an optional legacy
+    // default; normal routing is resolved from each tool call's arguments.
     let Some(first) = lines.next_line().await? else {
         return Ok(());
     };
     let handshake: Handshake = serde_json::from_str(first.trim())
-        .context("daemon: first line must be a {\"workspace\": ...} handshake")?;
-    let registry = match ensure_registry(&registries, &handshake.workspace).await {
-        Ok(registry) => registry,
-        Err(error) => {
-            serve_workspace_registration_error(
-                &mut lines,
-                &mut write_half,
-                &handshake.workspace,
-                &error,
-            )
-            .await?;
-            return Ok(());
-        }
-    };
+        .context("daemon: first line must be a JSON handshake object")?;
+    let default_workspace = handshake
+        .workspace
+        .filter(|workspace| !workspace.is_empty());
 
     while let Some(line) = lines.next_line().await? {
         let line = line.trim();
@@ -116,7 +109,8 @@ async fn handle_connection(stream: UnixStream, registries: Registries) -> Result
         };
         // CozoDB work is synchronous but fast; the heavy save happens off the
         // request path in the watcher. Notifications (no id) get no response.
-        let response = handle_request_with_registry(&registry, &request);
+        let response =
+            handle_daemon_request(&registries, default_workspace.as_deref(), &request).await;
         if request.id.is_some() {
             send_line(&mut write_half, &response).await?;
         }
@@ -124,38 +118,146 @@ async fn handle_connection(stream: UnixStream, registries: Registries) -> Result
     Ok(())
 }
 
-async fn serve_workspace_registration_error(
-    lines: &mut tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
-    write_half: &mut tokio::net::unix::OwnedWriteHalf,
-    workspace: &str,
-    error: &anyhow::Error,
-) -> Result<()> {
-    let message = format!(
-        "Workspace registration failed for '{}': {error:#}. Configure axon serve with \
-         `--workspace /path/to/rust/workspace` or set the MCP server cwd to a Rust workspace.",
-        workspace
-    );
+async fn handle_daemon_request(
+    registries: &Registries,
+    default_workspace: Option<&str>,
+    request: &JsonRpcRequest,
+) -> JsonRpcResponse {
+    if let Some(response) = handle_global_request(request) {
+        return response;
+    }
 
-    while let Some(line) = lines.next_line().await? {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let request: JsonRpcRequest = match serde_json::from_str(line) {
-            Ok(r) => r,
-            Err(e) => {
-                let resp = JsonRpcResponse::error(None, -32700, format!("Parse error: {e}"));
-                send_line(write_half, &resp).await?;
-                continue;
-            }
+    let workspace = if request.method == "tools/call" {
+        let params = match parse_tool_call_params(request) {
+            Ok(params) => params,
+            Err(response) => return response,
         };
-        if request.id.is_some() {
-            let resp = JsonRpcResponse::error(request.id, -32000, message.clone());
-            send_line(write_half, &resp).await?;
+        match workspace_for_tool_call(&params.arguments, default_workspace) {
+            Ok(workspace) => workspace,
+            Err(message) => return JsonRpcResponse::error(request.id.clone(), -32602, message),
+        }
+    } else if let Some(workspace) = default_workspace {
+        canonicalize_path(workspace)
+    } else {
+        return JsonRpcResponse::error(
+            request.id.clone(),
+            -32602,
+            format!(
+                "Workspace context required for {}. Pass workspace_path or file_path in tool arguments.",
+                request.method
+            ),
+        );
+    };
+
+    let registry = match ensure_registry(registries, &workspace).await {
+        Ok(registry) => registry,
+        Err(error) => {
+            return JsonRpcResponse::error(
+                request.id.clone(),
+                -32000,
+                format!(
+                    "Workspace registration failed for '{}': {error:#}. Pass a valid workspace_path or file_path with the tool call.",
+                    workspace
+                ),
+            );
+        }
+    };
+    handle_request_with_registry(&registry, request)
+}
+
+fn workspace_for_tool_call(
+    args: &serde_json::Value,
+    default_workspace: Option<&str>,
+) -> std::result::Result<String, String> {
+    for key in ["workspace_path", "workspace"] {
+        if let Some(workspace) = string_arg(args, key) {
+            return Ok(canonicalize_path(workspace));
         }
     }
 
-    Ok(())
+    for key in ["file_path", "path"] {
+        if let Some(path) = string_arg(args, key) {
+            let route_path = route_context_path(path, default_workspace)?;
+            if let Some(workspace) = infer_workspace_from_path(&route_path) {
+                return Ok(workspace.to_string_lossy().into_owned());
+            }
+            return Err(format!(
+                "Could not infer a Cargo workspace from {}: {}. Pass workspace_path with the tool call.",
+                key,
+                route_path.display()
+            ));
+        }
+    }
+
+    default_workspace
+        .map(canonicalize_path)
+        .ok_or_else(|| "Workspace context required for tools/call. Pass workspace_path or file_path in arguments.".to_string())
+}
+
+fn string_arg<'a>(args: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    args.get(key)
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+}
+
+fn route_context_path(
+    path: &str,
+    default_workspace: Option<&str>,
+) -> std::result::Result<PathBuf, String> {
+    let path = PathBuf::from(path);
+    let path = if path.is_absolute() {
+        path
+    } else if let Some(workspace) = default_workspace {
+        Path::new(workspace).join(path)
+    } else {
+        return Err("Relative file_path/path requires workspace_path when no session default workspace is set.".to_string());
+    };
+    Ok(path.canonicalize().unwrap_or(path))
+}
+
+fn infer_workspace_from_path(start: &Path) -> Option<PathBuf> {
+    let start = if start.is_file() || (start.extension().is_some() && !start.is_dir()) {
+        start.parent()?
+    } else {
+        start
+    };
+    let mut package_root = None;
+
+    for candidate in start.ancestors() {
+        if candidate.parent().is_none() {
+            break;
+        }
+
+        let cargo_toml = candidate.join("Cargo.toml");
+        if !cargo_toml.is_file() {
+            continue;
+        }
+
+        if cargo_toml_declares_workspace(&cargo_toml) {
+            return Some(canonicalize_or_self(candidate));
+        }
+
+        if package_root.is_none() && candidate.join("src").is_dir() {
+            package_root = Some(canonicalize_or_self(candidate));
+        }
+    }
+
+    package_root
+}
+
+fn cargo_toml_declares_workspace(cargo_toml: &Path) -> bool {
+    let Ok(contents) = std::fs::read_to_string(cargo_toml) else {
+        return false;
+    };
+
+    contents.lines().any(|line| {
+        let line = line.split('#').next().unwrap_or_default().trim();
+        line == "[workspace]" || line.starts_with("[workspace.")
+    })
+}
+
+fn canonicalize_or_self(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// Return the registry for `workspace`, building, scanning, and starting a
@@ -257,7 +359,7 @@ mod tests {
         let (read_half, mut write_half) = stream.into_split();
         let mut lines = BufReader::new(read_half).lines();
 
-        let handshake = serde_json::json!({ "workspace": root.to_string_lossy() }).to_string();
+        let handshake = serde_json::json!({}).to_string();
         write_half.write_all(handshake.as_bytes()).await.unwrap();
         write_half.write_all(b"\n").await.unwrap();
         write_half
@@ -282,8 +384,9 @@ mod tests {
         let mut warmed_status = None;
         for id in 2..=21 {
             let request = format!(
-                r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"rust_status","arguments":{{"detail":"full"}}}}}}
-"#
+                r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"rust_status","arguments":{{"workspace_path":{},"detail":"full"}}}}}}
+"#,
+                serde_json::to_string(&root.to_string_lossy()).unwrap()
             );
             write_half.write_all(request.as_bytes()).await.unwrap();
             write_half.flush().await.unwrap();
@@ -358,7 +461,7 @@ mod tests {
         let (read_half, mut write_half) = stream.into_split();
         let mut lines = BufReader::new(read_half).lines();
 
-        let handshake = serde_json::json!({ "workspace": root.to_string_lossy() }).to_string();
+        let handshake = serde_json::json!({}).to_string();
         write_half.write_all(handshake.as_bytes()).await.unwrap();
         write_half.write_all(b"\n").await.unwrap();
         write_half
@@ -369,19 +472,85 @@ mod tests {
 
         let line = tokio::time::timeout(Duration::from_secs(5), lines.next_line())
             .await
-            .expect("daemon error response timed out")
+            .expect("daemon initialize response timed out")
             .unwrap()
-            .expect("daemon closed without error response");
+            .expect("daemon closed without initialize response");
         let resp: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(resp["jsonrpc"], "2.0");
         assert_eq!(resp["id"], 1);
+        assert!(
+            resp.get("result").is_some(),
+            "initialize should be global: {line}"
+        );
+
+        let missing_context_request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "rust_status",
+                "arguments": {
+                    "detail": "full"
+                }
+            }
+        })
+        .to_string();
+        write_half
+            .write_all(missing_context_request.as_bytes())
+            .await
+            .unwrap();
+        write_half.write_all(b"\n").await.unwrap();
+        write_half.flush().await.unwrap();
+
+        let line = tokio::time::timeout(Duration::from_secs(5), lines.next_line())
+            .await
+            .expect("daemon missing-context response timed out")
+            .unwrap()
+            .expect("daemon closed without missing-context response");
+        let resp: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(resp["jsonrpc"], "2.0");
+        assert_eq!(resp["id"], 2);
+        assert_eq!(resp["error"]["code"], -32602);
+        assert!(
+            resp["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("workspace_path"),
+            "missing-context error should explain per-call workspace context: {line}"
+        );
+
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "rust_status",
+                "arguments": {
+                    "workspace_path": root.to_string_lossy(),
+                    "detail": "full"
+                }
+            }
+        })
+        .to_string();
+        write_half.write_all(request.as_bytes()).await.unwrap();
+        write_half.write_all(b"\n").await.unwrap();
+        write_half.flush().await.unwrap();
+
+        let line = tokio::time::timeout(Duration::from_secs(5), lines.next_line())
+            .await
+            .expect("daemon tool error response timed out")
+            .unwrap()
+            .expect("daemon closed without tool error response");
+        let resp: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(resp["jsonrpc"], "2.0");
+        assert_eq!(resp["id"], 3);
         assert_eq!(resp["error"]["code"], -32000);
         assert!(
             resp["error"]["message"]
                 .as_str()
                 .unwrap()
-                .contains("--workspace"),
-            "error should explain how to configure a workspace: {line}"
+                .contains("workspace_path"),
+            "error should explain per-call workspace context: {line}"
         );
 
         let _ = std::fs::remove_file(&socket);
@@ -393,7 +562,7 @@ mod tests {
         // Connecting to a non-existent socket must signal absence, not error.
         let missing = std::env::temp_dir().join("axon_no_such_daemon.sock");
         let _ = std::fs::remove_file(&missing);
-        let bridged = super::super::bridge::try_bridge(&missing, "/tmp/whatever")
+        let bridged = super::super::bridge::try_bridge(&missing, Some("/tmp/whatever"))
             .await
             .expect("try_bridge should not error when daemon is absent");
         assert!(

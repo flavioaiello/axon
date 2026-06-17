@@ -44,7 +44,7 @@ struct Cli {
 enum Commands {
     /// Start the MCP stdio server (default when no subcommand given)
     Serve {
-        /// Workspace path (defaults to the nearest Cargo workspace/package ancestor)
+        /// Legacy default workspace fallback. Daemon-mode tools should pass workspace_path/file_path per call.
         #[arg(short, long)]
         workspace: Option<String>,
 
@@ -131,8 +131,9 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        // Default: serve from cwd, bridging to the shared daemon (daemon-only).
-        None => serve_via_daemon_or_workspace_error(None).await?,
+        // Default: global stdio bridge to the shared daemon. Tool calls provide
+        // workspace context through workspace_path or file_path arguments.
+        None => serve_via_daemon(None).await?,
 
         Some(Commands::Serve {
             workspace,
@@ -143,7 +144,10 @@ async fn main() -> Result<()> {
                 let workspace = resolve_workspace(workspace)?;
                 run_standalone(workspace, web_port).await?;
             } else {
-                serve_via_daemon_or_workspace_error(workspace).await?;
+                let default_workspace = workspace
+                    .map(|workspace| resolve_workspace(Some(workspace)))
+                    .transpose()?;
+                serve_via_daemon(default_workspace).await?;
             }
         }
 
@@ -399,11 +403,11 @@ fn daemon_socket_path() -> std::path::PathBuf {
 /// editor respawns us against the fresh daemon. If no daemon is reachable, we
 /// retry briefly to ride out a restart window, then error with guidance rather
 /// than silently degrading to standalone.
-async fn serve_via_daemon(workspace: String) -> Result<()> {
+async fn serve_via_daemon(default_workspace: Option<String>) -> Result<()> {
     let socket = daemon_socket_path();
     // ~10s of 200ms retries to ride out a daemon restart before giving up.
     for _ in 0..50 {
-        match server::bridge::try_bridge(&socket, &workspace).await {
+        match server::bridge::try_bridge(&socket, default_workspace.as_deref()).await {
             // The bridge ran until the editor or the daemon closed the session.
             Ok(true) => return Ok(()),
             // No daemon listening yet — wait and retry.
@@ -419,65 +423,6 @@ async fn serve_via_daemon(workspace: String) -> Result<()> {
          or run `axon serve --standalone` for an in-process server",
         socket.display()
     )
-}
-
-async fn serve_via_daemon_or_workspace_error(workspace: Option<String>) -> Result<()> {
-    match resolve_workspace(workspace) {
-        Ok(workspace) => serve_via_daemon(workspace).await,
-        Err(error) => serve_workspace_resolution_error(error).await,
-    }
-}
-
-async fn serve_workspace_resolution_error(error: anyhow::Error) -> Result<()> {
-    tracing::warn!(
-        "workspace resolution failed before MCP daemon bridge startup: {error:#}; serving JSON-RPC errors until the client closes stdin"
-    );
-    let stdin = tokio::io::BufReader::new(tokio::io::stdin());
-    let mut stdout = tokio::io::stdout();
-    serve_static_workspace_error(stdin, &mut stdout, format!("{error:#}")).await
-}
-
-async fn serve_static_workspace_error<R, W>(
-    mut reader: R,
-    writer: &mut W,
-    error_message: String,
-) -> Result<()>
-where
-    R: tokio::io::AsyncBufRead + Unpin,
-    W: tokio::io::AsyncWrite + Unpin,
-{
-    while let Some(mcp_message) = server::stdio::read_message(&mut reader).await? {
-        let body = mcp_message.body.trim();
-        if body.is_empty() {
-            continue;
-        }
-
-        let request: axon::mcp::protocol::JsonRpcRequest = match serde_json::from_str(body) {
-            Ok(request) => request,
-            Err(error) => {
-                let response = axon::mcp::protocol::JsonRpcResponse::error(
-                    None,
-                    -32700,
-                    format!("Parse error: {error}"),
-                );
-                let response = serde_json::to_string(&response)?;
-                server::stdio::write_message(writer, &response, mcp_message.format).await?;
-                continue;
-            }
-        };
-
-        if request.id.is_some() {
-            let response = axon::mcp::protocol::JsonRpcResponse::error(
-                request.id,
-                -32000,
-                error_message.clone(),
-            );
-            let response = serde_json::to_string(&response)?;
-            server::stdio::write_message(writer, &response, mcp_message.format).await?;
-        }
-    }
-
-    Ok(())
 }
 
 /// The original single-workspace in-process server: builds a registry, starts a
@@ -565,32 +510,5 @@ mod tests {
         assert_eq!(infer_workspace_from(&nested), None);
 
         let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn workspace_resolution_error_is_reported_over_stdio() {
-        let body = r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#;
-        let input = format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
-        let mut output = Vec::new();
-
-        serve_static_workspace_error(
-            tokio::io::BufReader::new(input.as_bytes()),
-            &mut output,
-            "no Cargo workspace".into(),
-        )
-        .await
-        .unwrap();
-
-        let output = String::from_utf8(output).unwrap();
-        let (_, response) = output.split_once("\r\n\r\n").unwrap();
-        let response: serde_json::Value = serde_json::from_str(response).unwrap();
-
-        assert_eq!(response["error"]["code"], -32000);
-        assert!(
-            response["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("no Cargo workspace")
-        );
     }
 }

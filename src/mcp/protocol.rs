@@ -185,6 +185,50 @@ pub fn with_reasoning_context(
     payload
 }
 
+pub fn with_workspace_context_schema(mut schema: Value) -> Value {
+    if !schema.is_object() {
+        schema = json!({ "type": "object", "properties": {} });
+    }
+
+    let Some(object) = schema.as_object_mut() else {
+        return schema;
+    };
+    object
+        .entry("type")
+        .or_insert_with(|| Value::String("object".into()));
+    let properties = object.entry("properties").or_insert_with(|| json!({}));
+    let Some(properties) = properties.as_object_mut() else {
+        return schema;
+    };
+
+    properties.entry("workspace_path").or_insert_with(|| {
+        json!({
+            "type": "string",
+            "description": "Absolute path to the Cargo workspace/package root for this tool call. In daemon mode this is the preferred routing context."
+        })
+    });
+    properties.entry("file_path").or_insert_with(|| {
+        json!({
+            "type": "string",
+            "description": "Absolute path to a file inside the target workspace; Axon infers the Cargo workspace from it."
+        })
+    });
+    properties.entry("crate").or_insert_with(|| {
+        json!({
+            "type": "string",
+            "description": "Crate name within the selected workspace for multi-crate workspaces. Requires workspace_path, file_path, or a legacy session default."
+        })
+    });
+    properties.entry("crate_name").or_insert_with(|| {
+        json!({
+            "type": "string",
+            "description": "Alias for crate."
+        })
+    });
+
+    schema
+}
+
 // ─── Resources ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize)]

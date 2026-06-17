@@ -11,7 +11,7 @@ use crate::domain::rust_facts::{RustFeatureSelection, RustScanOptions, RustScanS
 use crate::domain::to_snake;
 use crate::mcp::protocol::{
     ToolCallResult, ToolDefinition, error_tool_result, json_error_tool_result, json_tool_result,
-    text_tool_result, with_reasoning_context,
+    text_tool_result, with_reasoning_context, with_workspace_context_schema,
 };
 use crate::reasoning::ReasoningKernel;
 use crate::store::{PersistedReasoningClaim, ReasoningFactRef, Store};
@@ -21,6 +21,12 @@ const RUNTIME_CONSTRAINT_WARNING: &str = "Architecture constraint changes are ru
 /// Returns the list of write tools the Axon server exposes.
 pub fn list_write_tools() -> Vec<ToolDefinition> {
     rust_native_write_tools()
+        .into_iter()
+        .map(|mut tool| {
+            tool.input_schema = with_workspace_context_schema(tool.input_schema);
+            tool
+        })
+        .collect()
 }
 
 fn feature_selector_schema(description: &str) -> Value {
@@ -2746,6 +2752,20 @@ mod tests {
         assert!(!names.contains(&"scan_model"));
         assert!(!names.contains(&"refactor_model"));
         assert!(!names.contains(&"assert_model"));
+        for tool in &tools {
+            let properties = tool
+                .input_schema
+                .get("properties")
+                .and_then(|value| value.as_object())
+                .unwrap_or_else(|| panic!("{} should have object properties", tool.name));
+            for key in ["workspace_path", "file_path", "crate", "crate_name"] {
+                assert!(
+                    properties.contains_key(key),
+                    "{} schema should advertise {key}",
+                    tool.name
+                );
+            }
+        }
 
         let rust_scan = tools
             .iter()

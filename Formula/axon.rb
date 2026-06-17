@@ -34,16 +34,17 @@ class Axon < Formula
 
       It listens on ~/.axon/daemon.sock and holds each workspace's model
       separately in memory. Every editor still launches `axon serve` (stdio),
-      which bridges to the daemon. Start the service first; `serve` will report
-      an error instead of silently falling back to a split in-process model.
-      So .mcp.json is unchanged:
+      which bridges to the daemon. Tool calls route by their workspace_path or
+      file_path arguments. Start the service first; `serve` will report an
+      error instead of silently falling back to a split in-process model.
+      MCP registration is global:
 
         {
           "servers": {
             "axon": {
               "type": "stdio",
               "command": "axon",
-              "args": ["serve", "--workspace", "${workspaceFolder}"]
+              "args": ["serve"]
             }
           }
         }
