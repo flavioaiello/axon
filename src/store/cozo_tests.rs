@@ -927,8 +927,8 @@ fn optimization_recommendations_surface_shape_candidates() {
         "expected port/adapter candidate: {result}"
     );
     assert!(
-        kinds.contains("thin_module_surface"),
-        "expected thin lib.rs/mod.rs surface candidate: {result}"
+        kinds.contains("facade_surface_hardening"),
+        "expected facade hardening candidate for lib.rs/mod.rs: {result}"
     );
     assert!(
         kinds.contains("import_graph_reduction"),
@@ -936,13 +936,14 @@ fn optimization_recommendations_surface_shape_candidates() {
     );
     assert!(
         recommendations.iter().any(|recommendation| {
-            recommendation["kind"] == "thin_module_surface"
+            recommendation["kind"] == "facade_surface_hardening"
                 && recommendation["target"] == "src/domain/mod.rs"
+                && recommendation["evidence"]["facade_role"] == "existing_rust_surface"
                 && recommendation["proposed_shape"]
                     .as_str()
                     .is_some_and(|text| text.contains("pub use"))
         }),
-        "thin surface recommendation should advise explicit re-exports: {result}"
+        "facade hardening recommendation should advise explicit re-exports: {result}"
     );
     let graph_reduction = recommendations
         .iter()

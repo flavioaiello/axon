@@ -151,7 +151,7 @@ fn read_tool_specs() -> Vec<ReadToolSpec> {
         },
         ReadToolSpec {
             name: "rust_optimize".into(),
-            description: "Find graph-derived refactoring and optimization candidates in the actual Rust graph: import graph reduction, thin module surfaces, facade/API surfaces, call fan-in, move/facade, rename, and port/adapter review. Equivalent to rust_impact with analysis=optimize, but easier for MCP clients to discover.".into(),
+            description: "Find graph-derived refactoring and optimization candidates in the actual Rust graph: import graph reduction, facade surface hardening for lib.rs/mod.rs, facade/API surfaces, call fan-in, move/facade, rename, and port/adapter review. Equivalent to rust_impact with analysis=optimize, but easier for MCP clients to discover.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -322,7 +322,7 @@ pub fn call_tool(store: &Store, workspace_path: &str, name: &str, args: &Value) 
             optimize_args.insert("analysis".into(), json!("optimize"));
             let kernel = ReasoningKernel::new(store);
             match kernel.impact(workspace_path, &Value::Object(optimize_args)) {
-                Ok(claim) => stored_claim_result(store, workspace_path, &claim),
+                Ok(claim) => stored_optimize_result(store, workspace_path, &claim),
                 Err(e) => error_result(format!("rust_optimize failed: {e}")),
             }
         }
@@ -1101,6 +1101,41 @@ fn stored_claim_result(
 ) -> ToolCallResult {
     let mut envelope = with_reasoning_context(
         claim.payload.clone(),
+        claim.proof_json(),
+        claim.evidence_json(),
+        claim.limitation_texts(),
+        serde_json::to_value(&claim.provenance).ok(),
+    );
+
+    if let Some(object) = envelope.as_object_mut() {
+        object.insert("claim_id".into(), json!(claim.claim_id));
+        object.insert("claim_kind".into(), json!(claim.claim_kind));
+        object.insert("claim_stale".into(), json!(claim.stale));
+        let assumptions = claim.assumption_texts();
+        if !assumptions.is_empty() {
+            object.insert("assumptions".into(), json!(assumptions));
+        }
+        object.insert(
+            "truth_maintenance".into(),
+            truth_maintenance_json(store, workspace_path),
+        );
+    }
+
+    json_result(envelope)
+}
+
+fn stored_optimize_result(
+    store: &Store,
+    workspace_path: &str,
+    claim: &PersistedReasoningClaim,
+) -> ToolCallResult {
+    let optimize_payload = claim
+        .payload
+        .get("result")
+        .cloned()
+        .unwrap_or_else(|| claim.payload.clone());
+    let mut envelope = with_reasoning_context(
+        json!({ "rust_optimize": optimize_payload }),
         claim.proof_json(),
         claim.evidence_json(),
         claim.limitation_texts(),
@@ -2320,8 +2355,11 @@ mod tests {
         assert_eq!(result.is_error, None);
         let ContentBlock::Text { text } = &result.content[0];
         let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
-        assert_eq!(parsed["result"]["analysis"], "optimize");
-        let recommendations = parsed["result"]["recommendations"].as_array().unwrap();
+        assert_eq!(parsed["rust_optimize"]["analysis"], "optimize");
+        assert!(parsed.get("result").is_none());
+        let recommendations = parsed["rust_optimize"]["recommendations"]
+            .as_array()
+            .unwrap();
         assert!(
             recommendations
                 .iter()

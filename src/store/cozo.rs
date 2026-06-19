@@ -6789,9 +6789,9 @@ impl Store {
 
         let mut recommendations = Vec::new();
 
-        // Thin lib.rs/mod.rs surfaces: files that mostly route module exposure.
-        // These are good places to keep the public API explicit through narrow
-        // `pub use` re-exports while hiding implementation modules.
+        // lib.rs/mod.rs are already Rust facade surfaces. Optimization here is
+        // hardening: tighten child-module visibility, make re-exports explicit,
+        // and route deep import bypasses back through the facade.
         let mut symbols_by_file: BTreeMap<String, Vec<serde_json::Value>> = BTreeMap::new();
         for row in &symbols.rows {
             let name = dv_str(&row[0]);
@@ -6904,23 +6904,25 @@ impl Store {
                 continue;
             }
             recommendations.push(json!({
-                "kind": "thin_module_surface",
+                "kind": "facade_surface_hardening",
                 "target": file_path,
                 "score": usize_to_i64(public_modules.len())
                     + usize_to_i64(surface_imports.len())
                     + usize_to_i64(deep_importers.len()),
                 "confidence": if deep_importers.len() >= 2 { "medium" } else { "low" },
-                "rationale": "This lib.rs/mod.rs looks like a thin routing surface; keep it narrow and make public exposure deliberate instead of letting child modules become the API by default.",
-                "proposed_shape": "Prefer private or pub(crate) child modules plus explicit pub use re-exports for the intended API surface; have downstream imports target the surface rather than deep implementation modules.",
+                "rationale": "This lib.rs/mod.rs is already a Rust facade surface; harden it so public exposure is deliberate instead of letting child modules become the API by default.",
+                "proposed_shape": "Prefer private or pub(crate) child modules plus explicit pub use re-exports for the intended API surface; have downstream imports target this facade rather than deep implementation modules.",
                 "evidence": {
+                    "facade_role": "existing_rust_surface",
                     "surface_kind": surface_kind,
                     "declared_modules": declared_modules.into_iter().map(|(module, public)| json!({ "module": module, "public": public })).collect::<Vec<_>>(),
                     "public_declared_modules": public_modules,
                     "surface_imports_or_reexports": surface_imports.into_iter().collect::<Vec<_>>(),
                     "deep_importing_files": deep_importers.into_iter().collect::<Vec<_>>(),
                     "local_symbols": surface_symbols,
+                    "hardening_actions": ["tighten_visibility", "explicit_pub_use", "route_deep_imports_through_facade"],
                 },
-                "validation": ["Inspect the lib.rs/mod.rs surface", "Replace broad pub mod exposure with explicit pub use where appropriate", "Run cargo test and rust_graph neighborhood for the surface module"],
+                "validation": ["Inspect the lib.rs/mod.rs facade", "Replace broad pub mod exposure with explicit pub use where appropriate", "Run cargo test and rust_graph neighborhood for the facade module"],
             }));
         }
 
@@ -7130,8 +7132,8 @@ impl Store {
                 "target": "module import graph",
                 "score": usize_to_i64(reduction_score.max(module_import_edges.len())),
                 "confidence": if redundant_direct_edge_count > 0 || !cycle_clusters.is_empty() { "medium" } else { "low" },
-                "rationale": "The normalized import graph can be reduced with graph techniques: condense strongly-connected module clusters, remove direct imports already implied by alternate paths, identify high-betweenness pressure edges, and aggregate deep imports behind explicit module surfaces or separator modules.",
-                "proposed_shape": "Map raw imports to module edges, reduce SCCs to boundary seams, remove transitive direct imports where an owned path already exists, turn high-betweenness or separator modules into explicit ports/facades, and expose deliberate pub use re-exports from thin lib.rs/mod.rs surfaces.",
+                "rationale": "The normalized import graph can be reduced with graph techniques: condense strongly-connected module clusters, remove direct imports already implied by alternate paths, identify high-betweenness pressure edges, and aggregate deep imports behind explicit facade surfaces or separator modules.",
+                "proposed_shape": "Map raw imports to module edges, reduce SCCs to boundary seams, remove transitive direct imports where an owned path already exists, turn high-betweenness or separator modules into explicit ports/facades, and expose deliberate pub use re-exports from existing lib.rs/mod.rs facade surfaces.",
                 "evidence": {
                     "techniques": ["scc_condensation", "transitive_reduction", "surface_reexport_aggregation", "edge_betweenness", "separator_analysis"],
                     "module_nodes": module_import_nodes.len(),
