@@ -393,6 +393,7 @@ mod tests {
         assert!(names.contains(&"rust_status"));
         assert!(names.contains(&"rust_readiness"));
         assert!(names.contains(&"rust_impact"));
+        assert!(names.contains(&"rust_optimize"));
         assert!(names.contains(&"rust_scan"));
         assert!(names.contains(&"rust_diagnose"));
         assert!(names.contains(&"rust_history"));

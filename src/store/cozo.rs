@@ -7529,7 +7529,7 @@ impl Store {
         recommendations.truncate(20);
 
         Ok(json!({
-            "analysis": "optimization_recommendations",
+            "analysis": "optimize",
             "scope": requested_scope.as_str(),
             "recommendations": recommendations,
             "count": recommendations.len(),

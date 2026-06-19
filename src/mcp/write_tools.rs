@@ -1969,7 +1969,7 @@ fn semantic_resolution_degradation(error: &str) -> Value {
         "analyses_degraded": [
             "call_graph_stats resolved_project_callee sections",
             "call_graph_callers/callees when same-named symbols make syntactic edges ambiguous",
-            "optimization_recommendations move_or_facade precision",
+            "rust_optimize move_or_facade precision",
             "delete-safety and impact reviews that rely on exact inbound calls"
         ],
         "recovery": "Fix the cargo/rustc/rust-analyzer workspace loading error, then rerun rust_scan for this workspace."

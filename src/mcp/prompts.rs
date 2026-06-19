@@ -93,7 +93,7 @@ Axon tracks the **implemented Rust architecture**: source-extracted Rust facts a
 2. **Refresh from source** → call `rust_scan` after code changes; the watcher usually does this automatically
 3. **Use the overview correctly** → the web graph intentionally shows only crate/module/submodule/struct; MCP keeps source files, symbols, imports, and calls available for precision
 4. **Enrich missing semantics** → call `rust_annotations` only when static extraction needs DDD/policy labels or ownership context
-5. **Analyze impact** → call `rust_impact` with module/struct/symbol aliases and analysis type (dependency_graph, call_graph_callers, call_graph_reachability, optimization_recommendations, practice_findings, etc.)
+5. **Analyze impact** → call `rust_impact` with module/struct/symbol aliases and analysis type (dependency_graph, call_graph_callers, call_graph_reachability, practice_findings, etc.); call `rust_optimize` for optimization advice
 6. **Review history** → call `rust_history` with `mode: "latest_diff"` to compare recent actual graph snapshots
 7. **Constrain architecture** → call `rust_constraints` to declare runtime layers, forbidden dependencies, and accepted deviations
 

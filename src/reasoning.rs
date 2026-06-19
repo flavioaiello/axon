@@ -773,10 +773,11 @@ impl<'a> ReasoningKernel<'a> {
         data: &MaterializedReasoningData,
         computed_at_us: i64,
     ) -> Result<PersistedReasoningClaim> {
-        let analysis = args["analysis"]
+        let requested_analysis = args["analysis"]
             .as_str()
             .filter(|value| !value.is_empty())
             .context("'analysis' parameter is required")?;
+        let analysis = canonical_impact_analysis(requested_analysis);
         let canonical = canonicalize_path(workspace_path);
         let subject = normalized_impact_subject(args);
 
@@ -1221,7 +1222,7 @@ impl<'a> ReasoningKernel<'a> {
                         "actual",
                     )
                 }
-                "optimization_recommendations" => {
+                "optimize" => {
                     let scope = scoped_impact_arg(args, "production");
                     let result = self
                         .store
@@ -1272,9 +1273,9 @@ impl<'a> ReasoningKernel<'a> {
                         "actual",
                     )
                 }
-                other => anyhow::bail!(
-                    "Unknown analysis type: '{}'. Valid types: transitive_deps, circular_deps, layer_violations, impact_analysis, aggregate_quality, dependency_graph, field_usage, method_search, shared_fields, pagerank, community_detection, betweenness_centrality, degree_centrality, topological_order, call_graph_callers, call_graph_callees, call_graph_reachability, call_graph_stats, optimization_recommendations, practice_findings",
-                    other
+                _ => anyhow::bail!(
+                    "Unknown analysis type: '{}'. Valid types: transitive_deps, circular_deps, layer_violations, impact_analysis, aggregate_quality, dependency_graph, field_usage, method_search, shared_fields, pagerank, community_detection, betweenness_centrality, degree_centrality, topological_order, call_graph_callers, call_graph_callees, call_graph_reachability, call_graph_stats, optimize, optimization_recommendations, practice_findings",
+                    requested_analysis
                 ),
             };
 
@@ -3465,9 +3466,9 @@ fn search_claim_id(query: &str, limit: usize) -> String {
 }
 
 fn normalized_impact_subject(args: &Value) -> Value {
-    let analysis = args["analysis"].as_str().unwrap_or("");
+    let analysis = canonical_impact_analysis(args["analysis"].as_str().unwrap_or(""));
     let default_scope = match analysis {
-        "optimization_recommendations" | "practice_findings" => "production",
+        "optimize" | "practice_findings" => "production",
         _ => "",
     };
     json!({
@@ -3479,6 +3480,13 @@ fn normalized_impact_subject(args: &Value) -> Value {
         "method_name": args["method_name"].as_str().unwrap_or(""),
         "scope": args["scope"].as_str().unwrap_or(default_scope),
     })
+}
+
+fn canonical_impact_analysis(analysis: &str) -> &str {
+    match analysis {
+        "optimization_recommendations" => "optimize",
+        other => other,
+    }
 }
 
 fn scoped_impact_arg(args: &Value, default: &str) -> String {
@@ -4017,7 +4025,7 @@ fn build_rust_ontology_contract_json(store: &Store, workspace: &str, state: &str
         "structs": structs,
         "query_guidance": {
             "overview": "Use architecture/get_model for the Rust ontology summary.",
-            "connectivity": "Use impact with dependency_graph, call_graph_callers, call_graph_callees, call_graph_reachability, call_graph_stats, optimization_recommendations, or practice_findings.",
+            "connectivity": "Use impact with dependency_graph, call_graph_callers, call_graph_callees, call_graph_reachability, call_graph_stats, or practice_findings; use rust_optimize for optimization advice.",
             "deletion": "Use safe_to_delete with module + struct/symbol aliases.",
             "refresh": "Use sync after code changes if the watcher has not already updated the graph."
         }
@@ -4365,7 +4373,7 @@ fn default_justifications_for_claim(
                     &["calls_symbol"],
                 ));
             }
-            "optimization_recommendations" => {
+            "optimize" => {
                 justifications.extend(actual_relation_justifications(
                     &data.basis,
                     &[

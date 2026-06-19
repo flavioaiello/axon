@@ -132,7 +132,7 @@ fn read_tool_specs() -> Vec<ReadToolSpec> {
                                  "shared_fields", "pagerank", "community_detection", "betweenness_centrality",
                                  "degree_centrality", "topological_order",
                                  "call_graph_callers", "call_graph_callees", "call_graph_reachability", "call_graph_stats",
-                                 "optimization_recommendations", "practice_findings"],
+                                 "optimize", "optimization_recommendations", "practice_findings"],
                         "description": "The specific actual-state Rust analysis to run"
                     },
                     "module": { "type": "string", "description": "Rust module name/path for dependency analyses" },
@@ -143,10 +143,25 @@ fn read_tool_specs() -> Vec<ReadToolSpec> {
                     "scope": {
                         "type": "string",
                         "enum": ["production", "test", "all"],
-                        "description": "Fact scope for advice analyses. practice_findings and optimization_recommendations default to production; pass all to include tests."
+                        "description": "Fact scope for advice analyses. optimize/practice_findings default to production; pass all to include tests."
                     }
                 },
                 "required": ["analysis"]
+            }),
+        },
+        ReadToolSpec {
+            name: "rust_optimize".into(),
+            description: "Find graph-derived refactoring and optimization candidates in the actual Rust graph: import graph reduction, thin module surfaces, facade/API surfaces, call fan-in, move/facade, rename, and port/adapter review. Equivalent to rust_impact with analysis=optimize, but easier for MCP clients to discover.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "scope": {
+                        "type": "string",
+                        "enum": ["production", "test", "all"],
+                        "description": "Fact scope for optimization advice (default: production; pass all to include tests)."
+                    }
+                },
+                "required": []
             }),
         },
         ReadToolSpec {
@@ -299,6 +314,16 @@ pub fn call_tool(store: &Store, workspace_path: &str, name: &str, args: &Value) 
             match kernel.impact(workspace_path, args) {
                 Ok(claim) => stored_claim_result(store, workspace_path, &claim),
                 Err(e) => error_result(format!("rust_impact failed: {e}")),
+            }
+        }
+
+        "rust_optimize" => {
+            let mut optimize_args = args.as_object().cloned().unwrap_or_default();
+            optimize_args.insert("analysis".into(), json!("optimize"));
+            let kernel = ReasoningKernel::new(store);
+            match kernel.impact(workspace_path, &Value::Object(optimize_args)) {
+                Ok(claim) => stored_claim_result(store, workspace_path, &claim),
+                Err(e) => error_result(format!("rust_optimize failed: {e}")),
             }
         }
 
@@ -549,7 +574,7 @@ pub(crate) fn build_graph_confidence_report(store: &Store, workspace_path: &str)
                     "when_missing": {
                         "fallback": "Axon keeps source files, symbols, imports, references, AST decorators, and syntactic calls_symbol edges.",
                         "capability_lost": ["exact receiver/trait/alias/inference-sensitive call targets", "resolved call-site provenance", "compiler-resolved move/facade evidence"],
-                        "analyses_degraded": ["call_graph_stats resolved_project_callee sections", "call_graph_callers/callees when relying on aliases", "optimization_recommendations move_or_facade precision", "delete-safety and impact reviews that need exact inbound calls"],
+                        "analyses_degraded": ["call_graph_stats resolved_project_callee sections", "call_graph_callers/callees when relying on aliases", "rust_optimize move_or_facade precision", "delete-safety and impact reviews that need exact inbound calls"],
                     },
                 },
                 "truth_maintenance": {
@@ -1508,7 +1533,7 @@ fn build_rust_ontology_overview(store: &Store, workspace: &str, state: &str) -> 
         "structs": structs,
         "query_guidance": {
             "overview": "Use architecture/get_model for the Rust ontology summary.",
-            "connectivity": "Use impact with dependency_graph, call_graph_callers, call_graph_callees, call_graph_reachability, call_graph_stats, optimization_recommendations, or practice_findings.",
+            "connectivity": "Use rust_impact with dependency_graph, call_graph_callers, call_graph_callees, call_graph_reachability, call_graph_stats, or practice_findings; use rust_optimize for optimization advice.",
             "deletion": "Use safe_to_delete with module + struct/symbol aliases.",
             "refresh": "Use sync after code changes if the watcher has not already updated the graph."
         }
@@ -1588,13 +1613,14 @@ mod tests {
     #[test]
     fn test_list_tools_count() {
         let tools = list_tools();
-        assert_eq!(tools.len(), 9);
+        assert_eq!(tools.len(), 10);
         let names: Vec<_> = tools.iter().map(|tool| tool.name.as_str()).collect();
         for expected in [
             "rust_status",
             "rust_graph",
             "rust_readiness",
             "rust_impact",
+            "rust_optimize",
             "rust_delete_safety",
             "rust_invariants",
             "rust_explain",
@@ -2290,15 +2316,11 @@ mod tests {
         ];
         store.save_actual(&ws, &model).unwrap();
 
-        let result = call_tool(
-            &store,
-            &ws,
-            "rust_impact",
-            &json!({"analysis": "optimization_recommendations"}),
-        );
+        let result = call_tool(&store, &ws, "rust_optimize", &json!({}));
         assert_eq!(result.is_error, None);
         let ContentBlock::Text { text } = &result.content[0];
         let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["result"]["analysis"], "optimize");
         let recommendations = parsed["result"]["recommendations"].as_array().unwrap();
         assert!(
             recommendations
@@ -2309,6 +2331,23 @@ mod tests {
         let derived_from = parsed["proof"]["derived_from"].as_array().unwrap();
         assert!(derived_from.iter().any(|item| item == "import_edge"));
         assert!(derived_from.iter().any(|item| item == "symbol"));
+
+        let impact_alias = call_tool(&store, &ws, "rust_impact", &json!({"analysis": "optimize"}));
+        assert_eq!(impact_alias.is_error, None);
+        let ContentBlock::Text { text } = &impact_alias.content[0];
+        let impact_alias_parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(impact_alias_parsed["result"]["analysis"], "optimize");
+
+        let legacy = call_tool(
+            &store,
+            &ws,
+            "rust_impact",
+            &json!({"analysis": "optimization_recommendations"}),
+        );
+        assert_eq!(legacy.is_error, None);
+        let ContentBlock::Text { text } = &legacy.content[0];
+        let legacy_parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(legacy_parsed["result"]["analysis"], "optimize");
     }
 
     #[test]
