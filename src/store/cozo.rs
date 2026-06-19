@@ -1427,6 +1427,9 @@ impl Store {
             )?;
 
             for dep in &bc.dependencies {
+                if same_context_name(&bc.name, dep) {
+                    continue;
+                }
                 self.run_script(
                     "?[workspace, from_ctx, to_ctx, state] <- [[$ws, $from, $to, $st]] :put context_dep { workspace, from_ctx, to_ctx, state }",
                     params_map(&[("ws", workspace), ("from", &bc.name), ("to", dep), ("st", state)]),
@@ -2948,6 +2951,9 @@ impl Store {
             format!("retract context dependencies for {name}"),
         )?;
         for dep in dependencies {
+            if same_context_name(name, dep) {
+                continue;
+            }
             self.run_script(
                 "?[workspace, from_ctx, to_ctx, state] <- [[$ws, $from, $to, 'actual']] :put context_dep { workspace, from_ctx, to_ctx, state }",
                 params_map(&[("ws", &ws), ("from", name), ("to", dep)]),
@@ -5478,6 +5484,9 @@ impl Store {
                     for row in &rows.rows {
                         let from = dv_str(&row[0]);
                         let to = dv_str(&row[1]);
+                        if same_context_name(&from, &to) {
+                            continue;
+                        }
                         if !filter_context.is_empty()
                             && !text_matches(&from, &filter_context)
                             && !text_matches(&to, &filter_context)
@@ -5997,7 +6006,7 @@ impl Store {
             ),
             (
                 "context_dep",
-                "?[count(from_ctx)] := *context_dep{workspace: $ws, from_ctx, state: 'actual' @ 'NOW'}",
+                "?[count(from_ctx)] := *context_dep{workspace: $ws, from_ctx, to_ctx, state: 'actual' @ 'NOW'}, from_ctx != to_ctx",
             ),
             (
                 "import_edge",
@@ -6692,6 +6701,13 @@ impl Store {
                 ScriptMutability::Immutable,
             )
             .map_err(|e| anyhow::anyhow!("optimization source_files: {:?}", e))?;
+        let modules = self
+            .run_script(
+                "?[context, name, path, public, file_path] := *module{workspace: $ws, context, name, state: 'actual', path, public, file_path @ 'NOW'}",
+                params.clone(),
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| anyhow::anyhow!("optimization modules: {:?}", e))?;
         let symbols = self
             .run_script(
                 "?[name, kind, context, file_path, visibility] := *symbol{workspace: $ws, name, state: 'actual', kind, context, file_path, visibility @ 'NOW'}",
@@ -6763,6 +6779,118 @@ impl Store {
         }
 
         let mut recommendations = Vec::new();
+
+        // Thin lib.rs/mod.rs surfaces: files that mostly route module exposure.
+        // These are good places to keep the public API explicit through narrow
+        // `pub use` re-exports while hiding implementation modules.
+        let mut symbols_by_file: BTreeMap<String, Vec<serde_json::Value>> = BTreeMap::new();
+        for row in &symbols.rows {
+            let name = dv_str(&row[0]);
+            let file_path = dv_str(&row[3]);
+            if !rust_fact_allowed(requested_scope, &file_path, &name, "") {
+                continue;
+            }
+            symbols_by_file
+                .entry(file_path.clone())
+                .or_default()
+                .push(json!({
+                    "name": name,
+                    "kind": dv_str(&row[1]),
+                    "context": dv_str(&row[2]),
+                    "visibility": dv_str(&row[4]),
+                }));
+        }
+        let mut modules_by_decl_file: BTreeMap<String, Vec<(String, bool)>> = BTreeMap::new();
+        for row in &modules.rows {
+            let module_path = dv_str(&row[2]);
+            let file_path = dv_str(&row[4]);
+            if !rust_fact_allowed(requested_scope, &file_path, &module_path, "") {
+                continue;
+            }
+            modules_by_decl_file
+                .entry(file_path)
+                .or_default()
+                .push((module_path, matches!(&row[3], cozo::DataValue::Bool(true))));
+        }
+        let mut resolved_imports_by_file: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut deep_importers_by_module: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for row in &imports.rows {
+            let from_file = dv_str(&row[0]);
+            let to_module = dv_str(&row[1]);
+            if !rust_fact_allowed(requested_scope, &from_file, "", &to_module) {
+                continue;
+            }
+            let from_module = file_module_path(&from_file);
+            let Some(target_module) =
+                resolve_internal_module(&to_module, &from_module, &known_modules)
+            else {
+                continue;
+            };
+            resolved_imports_by_file
+                .entry(from_file.clone())
+                .or_default()
+                .insert(target_module.clone());
+            if from_module != target_module && !is_ancestor(&target_module, &from_module) {
+                deep_importers_by_module
+                    .entry(target_module)
+                    .or_default()
+                    .insert(from_file);
+            }
+        }
+        for row in &source_files.rows {
+            let file_path = dv_str(&row[0]);
+            if !rust_fact_allowed(requested_scope, &file_path, "", "") {
+                continue;
+            }
+            let Some(surface_kind) = rust_surface_file_kind(&file_path) else {
+                continue;
+            };
+            let declared_modules = modules_by_decl_file
+                .get(&file_path)
+                .cloned()
+                .unwrap_or_default();
+            let public_modules = declared_modules
+                .iter()
+                .filter_map(|(module, public)| public.then_some(module.clone()))
+                .collect::<Vec<_>>();
+            let surface_imports = resolved_imports_by_file
+                .get(&file_path)
+                .cloned()
+                .unwrap_or_default();
+            let mut deep_importers = BTreeSet::new();
+            for module in public_modules.iter().chain(surface_imports.iter()) {
+                if let Some(importers) = deep_importers_by_module.get(module) {
+                    deep_importers
+                        .extend(importers.iter().filter(|path| *path != &file_path).cloned());
+                }
+            }
+            let surface_symbols = symbols_by_file.get(&file_path).cloned().unwrap_or_default();
+            if surface_symbols.len() > 1 {
+                continue;
+            }
+            if public_modules.len() < 2 && surface_imports.is_empty() && deep_importers.len() < 2 {
+                continue;
+            }
+            recommendations.push(json!({
+                "kind": "thin_module_surface",
+                "target": file_path,
+                "score": usize_to_i64(public_modules.len())
+                    + usize_to_i64(surface_imports.len())
+                    + usize_to_i64(deep_importers.len()),
+                "confidence": if deep_importers.len() >= 2 { "medium" } else { "low" },
+                "rationale": "This lib.rs/mod.rs looks like a thin routing surface; keep it narrow and make public exposure deliberate instead of letting child modules become the API by default.",
+                "proposed_shape": "Prefer private or pub(crate) child modules plus explicit pub use re-exports for the intended API surface; have downstream imports target the surface rather than deep implementation modules.",
+                "evidence": {
+                    "surface_kind": surface_kind,
+                    "declared_modules": declared_modules.into_iter().map(|(module, public)| json!({ "module": module, "public": public })).collect::<Vec<_>>(),
+                    "public_declared_modules": public_modules,
+                    "surface_imports_or_reexports": surface_imports.into_iter().collect::<Vec<_>>(),
+                    "deep_importing_files": deep_importers.into_iter().collect::<Vec<_>>(),
+                    "local_symbols": surface_symbols,
+                },
+                "validation": ["Inspect the lib.rs/mod.rs surface", "Replace broad pub mod exposure with explicit pub use where appropriate", "Run cargo test and rust_graph neighborhood for the surface module"],
+            }));
+        }
 
         // Facade candidates: several consumers import the same internal module directly.
         let mut imports_by_target: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
@@ -7149,6 +7277,7 @@ impl Store {
             "count": recommendations.len(),
             "fact_counts": {
                 "source_files": source_files.rows.iter().filter(|row| rust_fact_allowed(requested_scope, &dv_str(&row[0]), "", "")).count(),
+                "modules": modules.rows.iter().filter(|row| rust_fact_allowed(requested_scope, &dv_str(&row[4]), &dv_str(&row[2]), "")).count(),
                 "symbols": symbols.rows.iter().filter(|row| rust_fact_allowed(requested_scope, &dv_str(&row[3]), &dv_str(&row[0]), "")).count(),
                 "import_edges": imports.rows.iter().filter(|row| rust_fact_allowed(requested_scope, &dv_str(&row[0]), "", &dv_str(&row[1]))).count(),
                 "call_edges": calls.rows.iter().filter(|row| rust_fact_allowed(requested_scope, &dv_str(&row[2]), &dv_str(&row[0]), &dv_str(&row[1]))).count(),
@@ -8722,6 +8851,12 @@ fn rust_fact_allowed(
     requested.allows(rust_fact_scope(file_path, symbol, marker))
 }
 
+fn same_context_name(left: &str, right: &str) -> bool {
+    let left = left.trim();
+    let right = right.trim();
+    !left.is_empty() && left.eq_ignore_ascii_case(right)
+}
+
 fn is_test_fact(file_path: &str, symbol: &str, marker: &str) -> bool {
     let path = file_path.replace('\\', "/");
     let symbol = symbol.trim();
@@ -8733,9 +8868,16 @@ fn is_test_fact(file_path: &str, symbol: &str, marker: &str) -> bool {
         || symbol.starts_with("test_")
         || symbol.contains("::tests::")
         || marker == "test"
-        || marker == "cfg(test)"
+        || cfg_marker_contains_test(marker)
         || marker.starts_with("tokio::test")
         || marker.starts_with("async_std::test")
+}
+
+fn cfg_marker_contains_test(marker: &str) -> bool {
+    marker.trim().starts_with("cfg(")
+        && marker
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .any(|token| token == "test")
 }
 
 /// True if `short` equals `long`, or `short` is a suffix of `long` at a
@@ -8771,6 +8913,17 @@ fn file_module_path(path: &str) -> String {
         mods.push(seg);
     }
     mods.join("::")
+}
+
+fn rust_surface_file_kind(path: &str) -> Option<&'static str> {
+    let normalized = path.replace('\\', "/");
+    if normalized == "src/lib.rs" || normalized.ends_with("/src/lib.rs") {
+        Some("crate_root")
+    } else if normalized == "mod.rs" || normalized.ends_with("/mod.rs") {
+        Some("module_root")
+    } else {
+        None
+    }
 }
 
 /// Resolve an import `to_module` use-path to an internal module path, relative to

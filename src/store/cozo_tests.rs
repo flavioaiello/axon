@@ -601,7 +601,56 @@ fn optimization_recommendations_surface_shape_candidates() {
     let store = temp_store();
     let ws = "/tmp/shape_ws";
     let mut model = DomainModel::empty(ws);
+    model.bounded_contexts = vec![BoundedContext {
+        api_endpoints: vec![],
+        name: "domain".into(),
+        description: String::new(),
+        module_path: "src/domain".into(),
+        ownership: Ownership::default(),
+        aggregates: vec![],
+        policies: vec![],
+        read_models: vec![],
+        entities: vec![],
+        value_objects: vec![],
+        services: vec![],
+        repositories: vec![],
+        events: vec![],
+        modules: vec![
+            Module {
+                name: "domain".into(),
+                path: "domain".into(),
+                public: true,
+                file_path: "src/lib.rs".into(),
+                description: String::new(),
+            },
+            Module {
+                name: "rust_syn".into(),
+                path: "domain::rust_syn".into(),
+                public: true,
+                file_path: "src/domain/mod.rs".into(),
+                description: String::new(),
+            },
+            Module {
+                name: "ports".into(),
+                path: "domain::ports".into(),
+                public: true,
+                file_path: "src/domain/mod.rs".into(),
+                description: String::new(),
+            },
+        ],
+        dependencies: vec![],
+    }];
     model.source_files = vec![
+        SourceFile {
+            path: "src/lib.rs".into(),
+            context: "domain".into(),
+            language: "rust".into(),
+        },
+        SourceFile {
+            path: "src/domain/mod.rs".into(),
+            context: "domain".into(),
+            language: "rust".into(),
+        },
         SourceFile {
             path: "src/store/cozo.rs".into(),
             context: "store".into(),
@@ -668,6 +717,21 @@ fn optimization_recommendations_surface_shape_candidates() {
         },
     ];
     model.import_edges = vec![
+        ImportEdge {
+            from_file: "src/lib.rs".into(),
+            to_module: "crate::domain::RustSynScanner".into(),
+            context: "domain".into(),
+        },
+        ImportEdge {
+            from_file: "src/domain/mod.rs".into(),
+            to_module: "crate::domain::rust_syn::RustSynScanner".into(),
+            context: "domain".into(),
+        },
+        ImportEdge {
+            from_file: "src/domain/mod.rs".into(),
+            to_module: "crate::domain::ports::RepositoryPort".into(),
+            context: "domain".into(),
+        },
         ImportEdge {
             from_file: "src/mcp/tools.rs".into(),
             to_module: "crate::domain::rust_syn::RustSynScanner".into(),
@@ -829,6 +893,20 @@ fn optimization_recommendations_surface_shape_candidates() {
     assert!(
         kinds.contains("port_adapter_review"),
         "expected port/adapter candidate: {result}"
+    );
+    assert!(
+        kinds.contains("thin_module_surface"),
+        "expected thin lib.rs/mod.rs surface candidate: {result}"
+    );
+    assert!(
+        recommendations.iter().any(|recommendation| {
+            recommendation["kind"] == "thin_module_surface"
+                && recommendation["target"] == "src/domain/mod.rs"
+                && recommendation["proposed_shape"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("pub use"))
+        }),
+        "thin surface recommendation should advise explicit re-exports: {result}"
     );
 
     assert!(
@@ -1257,6 +1335,64 @@ fn practice_findings_rank_rust_best_practice_signals() {
         )
         .unwrap();
     assert_eq!(production_test_edges["count"], 0);
+
+    let mut cfg_model = test_model("CfgDecorators");
+    cfg_model.ast_edges = vec![ASTEdge {
+        from_node: "Fixture".into(),
+        to_node: "cfg(any(test, feature = \"fixtures\"))".into(),
+        edge_type: "decorators".into(),
+        file_path: "src/fixtures.rs".into(),
+        line: 3,
+    }];
+    store
+        .save_actual("/tmp/cfg-decorator-scope", &cfg_model)
+        .unwrap();
+
+    let production_cfg_edges = store
+        .query_rust_graph(
+            "/tmp/cfg-decorator-scope",
+            &json!({ "view": "edges", "relation": "ast_edge", "scope": "production" }),
+        )
+        .unwrap();
+    assert_eq!(production_cfg_edges["count"], 0);
+}
+
+#[test]
+fn rust_graph_excludes_same_context_dependency_edges() {
+    let store = temp_store();
+    let ws = "/tmp/self-context-dep";
+    let mut model = full_model();
+    model.bounded_contexts[0].dependencies = vec!["Identity".into(), "Billing".into()];
+    store.save_actual(ws, &model).unwrap();
+    store
+        .run_script(
+            "?[workspace, from_ctx, to_ctx, state] <- [[$ws, 'Identity', 'Identity', 'actual']] :put context_dep { workspace, from_ctx, to_ctx, state }",
+            params_map(&[("ws", ws)]),
+            cozo::ScriptMutability::Mutable,
+        )
+        .unwrap();
+
+    let edges = store
+        .query_rust_graph(
+            ws,
+            &json!({ "view": "edges", "relation": "context_dep", "scope": "all" }),
+        )
+        .unwrap();
+    let rows = edges["edges"].as_array().unwrap();
+    assert!(
+        rows.iter().all(|edge| !same_context_name(
+            edge["from"].as_str().unwrap(),
+            edge["to"].as_str().unwrap()
+        )),
+        "same-context edges should be suppressed: {edges}"
+    );
+    assert!(
+        rows.iter()
+            .any(|edge| edge["from"] == "Identity" && edge["to"] == "Billing"),
+        "cross-context edge should remain: {edges}"
+    );
+    let counts = store.rust_graph_relation_counts(ws).unwrap();
+    assert_eq!(counts.get("context_dep"), Some(&2));
 }
 
 #[test]
