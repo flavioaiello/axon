@@ -637,6 +637,13 @@ fn optimization_recommendations_surface_shape_candidates() {
                 file_path: "src/domain/mod.rs".into(),
                 description: String::new(),
             },
+            Module {
+                name: "model".into(),
+                path: "domain::model".into(),
+                public: true,
+                file_path: "src/domain/mod.rs".into(),
+                description: String::new(),
+            },
         ],
         dependencies: vec![],
     }];
@@ -686,6 +693,11 @@ fn optimization_recommendations_surface_shape_candidates() {
             context: "domain".into(),
             language: "rust".into(),
         },
+        SourceFile {
+            path: "src/domain/model.rs".into(),
+            context: "domain".into(),
+            language: "rust".into(),
+        },
     ];
     model.symbols = vec![
         SymbolDef {
@@ -730,6 +742,26 @@ fn optimization_recommendations_surface_shape_candidates() {
         ImportEdge {
             from_file: "src/domain/mod.rs".into(),
             to_module: "crate::domain::ports::RepositoryPort".into(),
+            context: "domain".into(),
+        },
+        ImportEdge {
+            from_file: "src/domain/ports.rs".into(),
+            to_module: "crate::domain::rust_syn::RustSynScanner".into(),
+            context: "domain".into(),
+        },
+        ImportEdge {
+            from_file: "src/domain/rust_syn.rs".into(),
+            to_module: "crate::domain::model::DomainModel".into(),
+            context: "domain".into(),
+        },
+        ImportEdge {
+            from_file: "src/domain/model.rs".into(),
+            to_module: "crate::domain::ports::RepositoryPort".into(),
+            context: "domain".into(),
+        },
+        ImportEdge {
+            from_file: "src/domain/ports.rs".into(),
+            to_module: "crate::domain::model::DomainModel".into(),
             context: "domain".into(),
         },
         ImportEdge {
@@ -899,6 +931,10 @@ fn optimization_recommendations_surface_shape_candidates() {
         "expected thin lib.rs/mod.rs surface candidate: {result}"
     );
     assert!(
+        kinds.contains("import_graph_reduction"),
+        "expected import graph reduction candidate: {result}"
+    );
+    assert!(
         recommendations.iter().any(|recommendation| {
             recommendation["kind"] == "thin_module_surface"
                 && recommendation["target"] == "src/domain/mod.rs"
@@ -907,6 +943,90 @@ fn optimization_recommendations_surface_shape_candidates() {
                     .is_some_and(|text| text.contains("pub use"))
         }),
         "thin surface recommendation should advise explicit re-exports: {result}"
+    );
+    let graph_reduction = recommendations
+        .iter()
+        .find(|recommendation| recommendation["kind"] == "import_graph_reduction")
+        .expect("import graph reduction recommendation");
+    assert_eq!(graph_reduction["target"], "module import graph");
+    assert!(
+        graph_reduction["evidence"]["techniques"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|technique| technique == "transitive_reduction"),
+        "graph reduction should disclose transitive reduction: {graph_reduction}"
+    );
+    assert!(
+        graph_reduction["evidence"]["techniques"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|technique| technique == "edge_betweenness"),
+        "graph reduction should disclose edge betweenness: {graph_reduction}"
+    );
+    assert!(
+        graph_reduction["evidence"]["techniques"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|technique| technique == "separator_analysis"),
+        "graph reduction should disclose separator analysis: {graph_reduction}"
+    );
+    assert!(
+        graph_reduction["evidence"]["cycle_clusters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|cluster| {
+                cluster
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|module| module == "domain::model")
+                    && cluster
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|module| module == "domain::ports")
+            }),
+        "graph reduction should report SCC condensation evidence: {graph_reduction}"
+    );
+    assert!(
+        graph_reduction["evidence"]["redundant_direct_edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|edge| edge["from"] == "domain::ports" && edge["to"] == "domain::model"),
+        "graph reduction should report transitive direct import evidence: {graph_reduction}"
+    );
+    assert!(
+        !graph_reduction["evidence"]["top_edge_betweenness"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "graph reduction should report edge betweenness pressure points: {graph_reduction}"
+    );
+    assert!(
+        graph_reduction["evidence"]["separator_modules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|separator| separator["module"] == "domain::rust_syn"),
+        "graph reduction should report separator modules: {graph_reduction}"
+    );
+    assert!(
+        !graph_reduction["evidence"]["separator_edges"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "graph reduction should report separator edges: {graph_reduction}"
+    );
+    assert!(
+        graph_reduction["proposed_shape"]
+            .as_str()
+            .is_some_and(|text| text.contains("pub use")),
+        "graph reduction should advise re-export aggregation: {graph_reduction}"
     );
 
     assert!(

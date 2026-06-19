@@ -6766,6 +6766,15 @@ impl Store {
                 known_modules.insert(module);
             }
         }
+        for row in &modules.rows {
+            let module_path = dv_str(&row[2]);
+            let file_path = dv_str(&row[4]);
+            if !module_path.is_empty()
+                && rust_fact_allowed(requested_scope, &file_path, &module_path, "")
+            {
+                known_modules.insert(module_path);
+            }
+        }
         let mut project_call_aliases: BTreeSet<String> = BTreeSet::new();
         for row in &symbols.rows {
             let name = dv_str(&row[0]);
@@ -6814,6 +6823,12 @@ impl Store {
         }
         let mut resolved_imports_by_file: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         let mut deep_importers_by_module: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut module_import_nodes: BTreeSet<String> = BTreeSet::new();
+        let mut module_import_edges: BTreeSet<(String, String)> = BTreeSet::new();
+        let mut import_files_by_edge: BTreeMap<(String, String), BTreeSet<String>> =
+            BTreeMap::new();
+        let mut import_paths_by_edge: BTreeMap<(String, String), BTreeSet<String>> =
+            BTreeMap::new();
         for row in &imports.rows {
             let from_file = dv_str(&row[0]);
             let to_module = dv_str(&row[1]);
@@ -6832,9 +6847,26 @@ impl Store {
                 .insert(target_module.clone());
             if from_module != target_module && !is_ancestor(&target_module, &from_module) {
                 deep_importers_by_module
-                    .entry(target_module)
+                    .entry(target_module.clone())
+                    .or_default()
+                    .insert(from_file.clone());
+            }
+            if from_module != target_module
+                && !is_ancestor(&target_module, &from_module)
+                && !is_ancestor(&from_module, &target_module)
+            {
+                module_import_nodes.insert(from_module.clone());
+                module_import_nodes.insert(target_module.clone());
+                let edge = (from_module, target_module);
+                module_import_edges.insert(edge.clone());
+                import_files_by_edge
+                    .entry(edge.clone())
                     .or_default()
                     .insert(from_file);
+                import_paths_by_edge
+                    .entry(edge)
+                    .or_default()
+                    .insert(to_module);
             }
         }
         for row in &source_files.rows {
@@ -6889,6 +6921,232 @@ impl Store {
                     "local_symbols": surface_symbols,
                 },
                 "validation": ["Inspect the lib.rs/mod.rs surface", "Replace broad pub mod exposure with explicit pub use where appropriate", "Run cargo test and rust_graph neighborhood for the surface module"],
+            }));
+        }
+
+        // Import graph reduction: normalize concrete imports to module edges,
+        // then look for graph rewrites that reduce coupling without changing
+        // runtime behavior: SCC condensation, transitive reduction, and surface
+        // re-export/facade aggregation.
+        let mut adjacency: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for (from, to) in &module_import_edges {
+            adjacency
+                .entry(from.clone())
+                .or_default()
+                .insert(to.clone());
+        }
+        let cycle_clusters = strongly_connected_module_components(
+            module_import_nodes.iter().cloned().collect::<Vec<_>>(),
+            &module_import_edges,
+        );
+        let mut redundant_direct_edges = Vec::new();
+        for (from, to) in &module_import_edges {
+            if module_path_reachable_without_edge(&adjacency, from, to) {
+                let edge = (from.clone(), to.clone());
+                redundant_direct_edges.push(json!({
+                    "from": from,
+                    "to": to,
+                    "importing_files": import_files_by_edge
+                        .get(&edge)
+                        .cloned()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .collect::<Vec<_>>(),
+                    "import_paths": import_paths_by_edge
+                        .get(&edge)
+                        .cloned()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .collect::<Vec<_>>(),
+                }));
+            }
+        }
+        redundant_direct_edges.sort_by(|left, right| {
+            left["from"]
+                .as_str()
+                .unwrap_or("")
+                .cmp(right["from"].as_str().unwrap_or(""))
+                .then_with(|| {
+                    left["to"]
+                        .as_str()
+                        .unwrap_or("")
+                        .cmp(right["to"].as_str().unwrap_or(""))
+                })
+        });
+        let redundant_direct_edge_count = redundant_direct_edges.len();
+        redundant_direct_edges.truncate(10);
+
+        let mut surface_children: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut surface_import_files: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut surface_edges: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for ((from, target), files) in &import_files_by_edge {
+            let Some(surface) = module_parent_path(target) else {
+                continue;
+            };
+            if !known_modules.contains(&surface) || *from == surface {
+                continue;
+            }
+            surface_children
+                .entry(surface.clone())
+                .or_default()
+                .insert(target.clone());
+            surface_import_files
+                .entry(surface.clone())
+                .or_default()
+                .extend(files.iter().cloned());
+            surface_edges
+                .entry(surface)
+                .or_default()
+                .insert(format!("{from}->{target}"));
+        }
+        let mut surface_opportunities = surface_children
+            .into_iter()
+            .filter_map(|(surface, children)| {
+                let importing_files = surface_import_files.remove(&surface).unwrap_or_default();
+                let edges = surface_edges.remove(&surface).unwrap_or_default();
+                if importing_files.len() < 3 && children.len() < 2 {
+                    return None;
+                }
+                let score = importing_files.len() + children.len() + edges.len();
+                Some((
+                    score,
+                    json!({
+                        "surface": surface,
+                        "child_targets": children.into_iter().collect::<Vec<_>>(),
+                        "importing_files": importing_files.into_iter().collect::<Vec<_>>(),
+                        "collapsible_edges": edges.into_iter().collect::<Vec<_>>(),
+                        "candidate_rewrite_count": score,
+                    }),
+                ))
+            })
+            .collect::<Vec<_>>();
+        surface_opportunities.sort_by(|left, right| {
+            right.0.cmp(&left.0).then_with(|| {
+                left.1["surface"]
+                    .as_str()
+                    .unwrap_or("")
+                    .cmp(right.1["surface"].as_str().unwrap_or(""))
+            })
+        });
+        let surface_opportunity_score = surface_opportunities
+            .iter()
+            .map(|(score, _)| *score)
+            .sum::<usize>();
+        let surface_reexport_opportunities = surface_opportunities
+            .into_iter()
+            .take(5)
+            .map(|(_, opportunity)| opportunity)
+            .collect::<Vec<_>>();
+
+        let edge_betweenness =
+            module_import_edge_betweenness(&module_import_nodes, &module_import_edges);
+        let edge_betweenness_score = edge_betweenness
+            .iter()
+            .filter(|(_, score)| *score >= 2.0)
+            .count();
+        let top_edge_betweenness = edge_betweenness
+            .iter()
+            .take(10)
+            .map(|((from, to), score)| {
+                let edge = (from.clone(), to.clone());
+                json!({
+                    "from": from,
+                    "to": to,
+                    "score": score,
+                    "importing_files": import_files_by_edge
+                        .get(&edge)
+                        .cloned()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .collect::<Vec<_>>(),
+                    "import_paths": import_paths_by_edge
+                        .get(&edge)
+                        .cloned()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .collect::<Vec<_>>(),
+                })
+            })
+            .collect::<Vec<_>>();
+        let separator_modules =
+            module_articulation_separators(&module_import_nodes, &module_import_edges)
+                .into_iter()
+                .map(|(module, separated_components)| {
+                    json!({
+                        "module": module,
+                        "component_count_after_removal": separated_components.len(),
+                        "separated_components": separated_components,
+                    })
+                })
+                .collect::<Vec<_>>();
+        let separator_module_count = separator_modules.len();
+        let separator_edges = module_bridge_separators(&module_import_nodes, &module_import_edges)
+            .into_iter()
+            .map(|((left, right), separated_components)| {
+                let forward_edge = (left.clone(), right.clone());
+                let reverse_edge = (right.clone(), left.clone());
+                let mut importing_files = BTreeSet::new();
+                if let Some(files) = import_files_by_edge.get(&forward_edge) {
+                    importing_files.extend(files.iter().cloned());
+                }
+                if let Some(files) = import_files_by_edge.get(&reverse_edge) {
+                    importing_files.extend(files.iter().cloned());
+                }
+                let mut import_paths = BTreeSet::new();
+                if let Some(paths) = import_paths_by_edge.get(&forward_edge) {
+                    import_paths.extend(paths.iter().cloned());
+                }
+                if let Some(paths) = import_paths_by_edge.get(&reverse_edge) {
+                    import_paths.extend(paths.iter().cloned());
+                }
+                json!({
+                    "between": [left, right],
+                    "component_count_after_removal": separated_components.len(),
+                    "separated_components": separated_components,
+                    "importing_files": importing_files.into_iter().collect::<Vec<_>>(),
+                    "import_paths": import_paths.into_iter().collect::<Vec<_>>(),
+                })
+            })
+            .collect::<Vec<_>>();
+        let separator_edge_count = separator_edges.len();
+
+        let import_instance_count = import_files_by_edge
+            .values()
+            .map(BTreeSet::len)
+            .sum::<usize>();
+        let reduction_score = redundant_direct_edge_count * 2
+            + cycle_clusters.iter().map(Vec::len).sum::<usize>() * 3
+            + surface_opportunity_score
+            + edge_betweenness_score
+            + separator_module_count * 3
+            + separator_edge_count * 2;
+        if !module_import_edges.is_empty()
+            && (reduction_score >= 3
+                || module_import_edges.len() >= 6
+                || import_instance_count >= 8)
+        {
+            recommendations.push(json!({
+                "kind": "import_graph_reduction",
+                "target": "module import graph",
+                "score": usize_to_i64(reduction_score.max(module_import_edges.len())),
+                "confidence": if redundant_direct_edge_count > 0 || !cycle_clusters.is_empty() { "medium" } else { "low" },
+                "rationale": "The normalized import graph can be reduced with graph techniques: condense strongly-connected module clusters, remove direct imports already implied by alternate paths, identify high-betweenness pressure edges, and aggregate deep imports behind explicit module surfaces or separator modules.",
+                "proposed_shape": "Map raw imports to module edges, reduce SCCs to boundary seams, remove transitive direct imports where an owned path already exists, turn high-betweenness or separator modules into explicit ports/facades, and expose deliberate pub use re-exports from thin lib.rs/mod.rs surfaces.",
+                "evidence": {
+                    "techniques": ["scc_condensation", "transitive_reduction", "surface_reexport_aggregation", "edge_betweenness", "separator_analysis"],
+                    "module_nodes": module_import_nodes.len(),
+                    "unique_module_edges": module_import_edges.len(),
+                    "import_instances": import_instance_count,
+                    "estimated_unique_edges_after_transitive_reduction": module_import_edges.len().saturating_sub(redundant_direct_edge_count),
+                    "cycle_clusters": cycle_clusters,
+                    "redundant_direct_edge_count": redundant_direct_edge_count,
+                    "redundant_direct_edges": redundant_direct_edges,
+                    "surface_reexport_opportunities": surface_reexport_opportunities,
+                    "top_edge_betweenness": top_edge_betweenness,
+                    "separator_modules": separator_modules,
+                    "separator_edges": separator_edges,
+                },
+                "validation": ["Inspect rust_graph relation=import_edge for the listed modules", "Introduce explicit pub use exports at the proposed surfaces", "Run cargo test and compare rust_history mode=latest_diff"],
             }));
         }
 
@@ -8986,6 +9244,302 @@ fn is_ancestor(ancestor: &str, descendant: &str) -> bool {
         return !descendant.is_empty();
     }
     descendant.starts_with(&format!("{ancestor}::"))
+}
+
+fn module_parent_path(module: &str) -> Option<String> {
+    module
+        .rsplit_once("::")
+        .map(|(parent, _)| parent.to_string())
+}
+
+fn module_path_reachable_without_edge(
+    adjacency: &BTreeMap<String, BTreeSet<String>>,
+    from: &str,
+    to: &str,
+) -> bool {
+    let mut seen = BTreeSet::new();
+    let mut queue = VecDeque::new();
+    if let Some(next_modules) = adjacency.get(from) {
+        for next in next_modules {
+            if next != to {
+                queue.push_back(next.clone());
+            }
+        }
+    }
+    while let Some(current) = queue.pop_front() {
+        if current == to {
+            return true;
+        }
+        if !seen.insert(current.clone()) {
+            continue;
+        }
+        if let Some(next_modules) = adjacency.get(&current) {
+            for next in next_modules {
+                if !seen.contains(next) {
+                    queue.push_back(next.clone());
+                }
+            }
+        }
+    }
+    false
+}
+
+fn strongly_connected_module_components(
+    nodes: Vec<String>,
+    edges: &BTreeSet<(String, String)>,
+) -> Vec<Vec<String>> {
+    let nodes = nodes
+        .into_iter()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let index = nodes
+        .iter()
+        .enumerate()
+        .map(|(idx, node)| (node.as_str(), idx))
+        .collect::<HashMap<_, _>>();
+    let mut adjacency = vec![Vec::new(); nodes.len()];
+    for (from, to) in edges {
+        let (Some(&from_idx), Some(&to_idx)) = (index.get(from.as_str()), index.get(to.as_str()))
+        else {
+            continue;
+        };
+        adjacency[from_idx].push(to_idx);
+    }
+    let mut reach = vec![BTreeSet::new(); nodes.len()];
+    for start in 0..nodes.len() {
+        let mut queue = VecDeque::from(adjacency[start].clone());
+        while let Some(current) = queue.pop_front() {
+            if reach[start].insert(current) {
+                queue.extend(adjacency[current].iter().copied());
+            }
+        }
+    }
+    let mut visited = vec![false; nodes.len()];
+    let mut components = Vec::new();
+    for node_idx in 0..nodes.len() {
+        if visited[node_idx] {
+            continue;
+        }
+        visited[node_idx] = true;
+        let mut component = vec![node_idx];
+        for other_idx in (node_idx + 1)..nodes.len() {
+            if !visited[other_idx]
+                && reach[node_idx].contains(&other_idx)
+                && reach[other_idx].contains(&node_idx)
+            {
+                visited[other_idx] = true;
+                component.push(other_idx);
+            }
+        }
+        if component.len() > 1 {
+            components.push(
+                component
+                    .into_iter()
+                    .map(|idx| nodes[idx].clone())
+                    .collect::<Vec<_>>(),
+            );
+        }
+    }
+    components.sort();
+    components
+}
+
+fn module_import_edge_betweenness(
+    nodes: &BTreeSet<String>,
+    edges: &BTreeSet<(String, String)>,
+) -> Vec<((String, String), f64)> {
+    let nodes = nodes.iter().cloned().collect::<Vec<_>>();
+    let index = nodes
+        .iter()
+        .enumerate()
+        .map(|(idx, node)| (node.as_str(), idx))
+        .collect::<HashMap<_, _>>();
+    let mut adjacency = vec![Vec::new(); nodes.len()];
+    for (from, to) in edges {
+        let (Some(&from_idx), Some(&to_idx)) = (index.get(from.as_str()), index.get(to.as_str()))
+        else {
+            continue;
+        };
+        adjacency[from_idx].push(to_idx);
+    }
+
+    let mut edge_scores: BTreeMap<(usize, usize), f64> = BTreeMap::new();
+    for start in 0..nodes.len() {
+        let mut stack = Vec::new();
+        let mut predecessors = vec![Vec::new(); nodes.len()];
+        let mut sigma = vec![0.0_f64; nodes.len()];
+        sigma[start] = 1.0;
+        let mut distance = vec![-1_i64; nodes.len()];
+        distance[start] = 0;
+        let mut queue = VecDeque::new();
+        queue.push_back(start);
+        while let Some(current) = queue.pop_front() {
+            stack.push(current);
+            for &next in &adjacency[current] {
+                if distance[next] < 0 {
+                    distance[next] = distance[current] + 1;
+                    queue.push_back(next);
+                }
+                if distance[next] == distance[current] + 1 {
+                    sigma[next] += sigma[current];
+                    predecessors[next].push(current);
+                }
+            }
+        }
+
+        let mut dependency = vec![0.0_f64; nodes.len()];
+        while let Some(target) = stack.pop() {
+            if sigma[target] == 0.0 {
+                continue;
+            }
+            for &predecessor in &predecessors[target] {
+                let contribution =
+                    (sigma[predecessor] / sigma[target]) * (1.0 + dependency[target]);
+                *edge_scores.entry((predecessor, target)).or_default() += contribution;
+                dependency[predecessor] += contribution;
+            }
+        }
+    }
+
+    let mut ranked = edge_scores
+        .into_iter()
+        .map(|((from_idx, to_idx), score)| {
+            ((nodes[from_idx].clone(), nodes[to_idx].clone()), score)
+        })
+        .collect::<Vec<_>>();
+    ranked.sort_by(|left, right| {
+        right
+            .1
+            .partial_cmp(&left.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.0.0.cmp(&right.0.0))
+            .then_with(|| left.0.1.cmp(&right.0.1))
+    });
+    ranked
+}
+
+fn undirected_module_adjacency(
+    nodes: &BTreeSet<String>,
+    edges: &BTreeSet<(String, String)>,
+) -> BTreeMap<String, BTreeSet<String>> {
+    let mut adjacency = BTreeMap::new();
+    for node in nodes {
+        adjacency.entry(node.clone()).or_insert_with(BTreeSet::new);
+    }
+    for (from, to) in edges {
+        if from == to {
+            continue;
+        }
+        adjacency
+            .entry(from.clone())
+            .or_default()
+            .insert(to.clone());
+        adjacency
+            .entry(to.clone())
+            .or_default()
+            .insert(from.clone());
+    }
+    adjacency
+}
+
+fn module_components_without(
+    adjacency: &BTreeMap<String, BTreeSet<String>>,
+    removed_node: Option<&str>,
+    removed_edge: Option<(&str, &str)>,
+) -> Vec<Vec<String>> {
+    let mut visited = BTreeSet::new();
+    let mut components = Vec::new();
+    for node in adjacency.keys() {
+        if removed_node == Some(node.as_str()) || visited.contains(node) {
+            continue;
+        }
+        let mut component = Vec::new();
+        let mut queue = VecDeque::from([node.clone()]);
+        while let Some(current) = queue.pop_front() {
+            if removed_node == Some(current.as_str()) || !visited.insert(current.clone()) {
+                continue;
+            }
+            component.push(current.clone());
+            if let Some(next_modules) = adjacency.get(&current) {
+                for next in next_modules {
+                    if removed_node == Some(next.as_str()) {
+                        continue;
+                    }
+                    if let Some((left, right)) = removed_edge {
+                        if (current == left && next == right) || (current == right && next == left)
+                        {
+                            continue;
+                        }
+                    }
+                    if !visited.contains(next) {
+                        queue.push_back(next.clone());
+                    }
+                }
+            }
+        }
+        if !component.is_empty() {
+            component.sort();
+            components.push(component);
+        }
+    }
+    components.sort();
+    components
+}
+
+fn module_articulation_separators(
+    nodes: &BTreeSet<String>,
+    edges: &BTreeSet<(String, String)>,
+) -> Vec<(String, Vec<Vec<String>>)> {
+    let adjacency = undirected_module_adjacency(nodes, edges);
+    let baseline = module_components_without(&adjacency, None, None).len();
+    let mut separators = adjacency
+        .keys()
+        .filter_map(|node| {
+            let components = module_components_without(&adjacency, Some(node), None);
+            (components.len() > baseline).then(|| (node.clone(), components))
+        })
+        .collect::<Vec<_>>();
+    separators.sort_by(|left, right| {
+        right
+            .1
+            .len()
+            .cmp(&left.1.len())
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    separators
+}
+
+fn module_bridge_separators(
+    nodes: &BTreeSet<String>,
+    edges: &BTreeSet<(String, String)>,
+) -> Vec<((String, String), Vec<Vec<String>>)> {
+    let adjacency = undirected_module_adjacency(nodes, edges);
+    let baseline = module_components_without(&adjacency, None, None).len();
+    let mut undirected_edges = BTreeSet::new();
+    for (from, to) in edges {
+        if from <= to {
+            undirected_edges.insert((from.clone(), to.clone()));
+        } else {
+            undirected_edges.insert((to.clone(), from.clone()));
+        }
+    }
+    let mut separators = undirected_edges
+        .into_iter()
+        .filter_map(|(left, right)| {
+            let components = module_components_without(&adjacency, None, Some((&left, &right)));
+            (components.len() > baseline).then_some(((left, right), components))
+        })
+        .collect::<Vec<_>>();
+    separators.sort_by(|left, right| {
+        right
+            .1
+            .len()
+            .cmp(&left.1.len())
+            .then_with(|| left.0.0.cmp(&right.0.0))
+            .then_with(|| left.0.1.cmp(&right.0.1))
+    });
+    separators
 }
 
 fn is_root_facade_import(to_module: &str, target_module: &str) -> bool {
